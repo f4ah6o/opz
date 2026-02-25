@@ -99,8 +99,9 @@ fn resolve_git_commit_attr() -> String {
 pub fn sanitize_for_trace(input: &str) -> String {
     let masked_op = op_reference_regex().replace_all(input, "op://***");
     let masked_keys = secret_key_value_regex().replace_all(&masked_op, "$1***");
+    let masked_auth = auth_header_regex().replace_all(&masked_keys, "$1***");
 
-    let mut out = masked_keys.into_owned();
+    let mut out = masked_auth.into_owned();
     if out.len() > TRACE_TEXT_LIMIT {
         out.truncate(TRACE_TEXT_LIMIT);
         out.push_str("...[truncated]");
@@ -121,6 +122,14 @@ fn secret_key_value_regex() -> &'static Regex {
             r"(?i)((?:^|[?&\s,;])(?:token|password|passwd|secret|apikey|api_key|access_key|client_secret)=)[^\s&]+",
         )
         .expect("valid secret key regex")
+    })
+}
+
+fn auth_header_regex() -> &'static Regex {
+    static AUTH_HEADER_REGEX: OnceLock<Regex> = OnceLock::new();
+    AUTH_HEADER_REGEX.get_or_init(|| {
+        Regex::new(r"(?i)((?:^|\s)Authorization:\s*(?:Bearer|Token|Basic|Digest|AWS4-HMAC-SHA256)\s+)\S+")
+            .expect("valid auth header regex")
     })
 }
 
@@ -152,5 +161,23 @@ mod tests {
         let sanitized = sanitize_for_trace(&long);
         assert!(sanitized.ends_with("...[truncated]"));
         assert!(sanitized.len() > 512);
+    }
+
+    #[test]
+    fn test_sanitize_for_trace_masks_bearer_token() {
+        let sanitized = sanitize_for_trace("Authorization: Bearer eyJhbGciOiJSUzI1NiJ9.secret");
+        assert_eq!(sanitized, "Authorization: Bearer ***");
+    }
+
+    #[test]
+    fn test_sanitize_for_trace_masks_token_auth_header() {
+        let sanitized = sanitize_for_trace("Authorization: Token abc123def456");
+        assert_eq!(sanitized, "Authorization: Token ***");
+    }
+
+    #[test]
+    fn test_sanitize_for_trace_masks_basic_auth_header() {
+        let sanitized = sanitize_for_trace("Authorization: Basic dXNlcjpwYXNz");
+        assert_eq!(sanitized, "Authorization: Basic ***");
     }
 }

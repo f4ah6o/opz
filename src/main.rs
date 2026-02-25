@@ -960,7 +960,7 @@ fn expand_vars(s: &str, env_vars: &HashMap<String, String>) -> String {
                     chars.next(); // consume '}'
                 } else {
                     // Invalid ${ syntax, treat as literal
-                    result.push_str("$\\{");
+                    result.push_str("${");
                     result.push_str(&var_name);
                     continue;
                 }
@@ -1284,7 +1284,10 @@ fn item_list_cached(vault: Option<&str>) -> Result<Vec<ItemListEntry>> {
                     cache_path.display().to_string(),
                 )],
                 || {
-                    fs::create_dir_all(cache_path.parent().unwrap())?;
+                    let cache_parent = cache_path.parent().ok_or_else(|| {
+                        anyhow!("cache path has no parent directory: {}", cache_path.display())
+                    })?;
+                    fs::create_dir_all(cache_parent)?;
                     fs::write(&cache_path, serde_json::to_vec(&items)?)?;
                     Ok(())
                 },
