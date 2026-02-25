@@ -1030,11 +1030,22 @@ fn run_with_items(
     });
 
     telemetry_span::with_span_result("write_outputs.command_exec", vec![], || {
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c");
-        cmd.arg("exec \"$@\"");
-        cmd.arg("sh");
-        cmd.args(&expanded_args);
+        #[cfg(unix)]
+        let mut cmd = {
+            let mut c = Command::new("sh");
+            c.arg("-c");
+            c.arg("exec \"$@\"");
+            c.arg("sh");
+            c.args(&expanded_args);
+            c
+        };
+
+        #[cfg(windows)]
+        let mut cmd = {
+            let mut c = Command::new(&expanded_args[0]);
+            c.args(&expanded_args[1..]);
+            c
+        };
 
         // Set environment variables for the child process
         for (key, value) in &env_vars {
