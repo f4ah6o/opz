@@ -14,6 +14,7 @@
 * Run commands with secrets from 1Password items as environment variables
 * Generate env files with `gen` subcommand (appends to existing, overwrites duplicates)
 * Create 1Password items from `.env` files or private config files with `create` subcommand
+* Emit bundled Agent Skills catalog XML with `skills` subcommand
 * Item list caching for faster repeated runs
 * Fuzzy matching when exact title match is not found
 
@@ -65,6 +66,16 @@ opz show foo bar
 # Include item header sections
 opz show --with-item foo bar
 ```
+
+### Emit Agent Skills Catalog
+
+Print the bundled `opz` Agent Skills catalog as `<available_skills>` XML:
+
+```bash
+opz skills
+```
+
+The output includes absolute `SKILL.md` locations so agents can load the bundled skill instructions and their relative resources on demand.
 
 ### Run Commands with Secrets
 
