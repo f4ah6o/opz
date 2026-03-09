@@ -9,7 +9,7 @@
 * 1Password アイテムの secret を環境変数としてコマンド実行
 * `gen` サブコマンドで env ファイル生成（既存ファイルに追記、重複キーは上書き）
 * `create` サブコマンドで `.env` または private 設定ファイルからアイテムを作成
-* `skills` サブコマンドで bundled Agent Skills catalog XML を出力
+* `skills` サブコマンドで `opz` 用の bundled Agent Skills `SKILL.md` を出力
 * 繰り返し実行を高速化するアイテムリストのキャッシュ
 * 完全一致がない場合のファジーマッチ
 
@@ -62,15 +62,15 @@ opz show foo bar
 opz show --with-item foo bar
 ```
 
-### Agent Skills Catalog を出力
+### Agent Skill を出力
 
-bundled された `opz` コンテキストを `<available_skills>` XML として出力します:
+`opz` 用の bundled Agent Skills `SKILL.md` を出力します:
 
 ```bash
 opz skills
 ```
 
-出力には絶対パスの `SKILL.md` location が含まれるため、agent 側は必要な skill 本体と相対 resource をオンデマンドで読み込めます。
+これにより、他の agent や tool は Agent Skills 標準形式で `opz` の利用コンテキストをそのまま読み込めます。
 
 ### Secret 付きでコマンド実行
 

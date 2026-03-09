@@ -4,7 +4,6 @@ mod telemetry_span;
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use directories::ProjectDirs;
-use include_dir::{include_dir, Dir};
 use opentelemetry::KeyValue;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -48,7 +47,7 @@ enum Cmd {
     /// Find items by keyword (title contains)
     Find { query: String },
 
-    /// Print Agent Skills catalog XML for bundled opz context
+    /// Print bundled Agent Skills SKILL.md for opz
     Skills,
 
     /// Show valid env labels from 1Password items
@@ -129,20 +128,7 @@ struct ItemField {
     value: Option<serde_json::Value>,
 }
 
-#[derive(Deserialize, Debug)]
-struct SkillFrontmatter {
-    name: String,
-    description: String,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct SkillCatalogEntry {
-    name: String,
-    description: String,
-    location: PathBuf,
-}
-
-static BUNDLED_SKILLS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/skills");
+static OPZ_SKILL: &str = include_str!("../.agents/skills/opz/SKILL.md");
 
 fn main() -> Result<()> {
     if std::env::var_os("OTEL_EXPORTER_OTLP_ENDPOINT").is_some() {
@@ -228,7 +214,7 @@ fn run_cli(args: &[OsString]) -> Result<()> {
             });
             Ok(())
         }
-        Some(Cmd::Skills) => print_bundled_skills_catalog(),
+        Some(Cmd::Skills) => print_bundled_skill(),
         Some(Cmd::Show { with_item, items }) => show_item_labels(&cli, items, *with_item),
         Some(Cmd::Gen { items, env_file }) => generate_env_output(&cli, items, env_file.as_deref()),
         Some(Cmd::Create { item, source_file }) => {
@@ -311,155 +297,12 @@ fn detect_command_hint(args: &[OsString]) -> &'static str {
     "run"
 }
 
-fn print_bundled_skills_catalog() -> Result<()> {
-    let entries = telemetry_span::with_span_result("load_inputs", vec![], || {
-        let root = prepare_bundled_skills_root()?;
-        discover_skill_catalog_entries(&root)
-    })?;
-    let rendered =
-        telemetry_span::with_span("main_operation", vec![], || render_skills_catalog(&entries));
-    telemetry_span::with_span(
-        "write_outputs",
-        vec![KeyValue::new("skill.count", entries.len() as i64)],
-        || {
-            print!("{rendered}");
-        },
-    );
+fn print_bundled_skill() -> Result<()> {
+    telemetry_span::with_span("main_operation", vec![], || ());
+    telemetry_span::with_span("write_outputs", vec![], || {
+        print!("{OPZ_SKILL}");
+    });
     Ok(())
-}
-
-fn prepare_bundled_skills_root() -> Result<PathBuf> {
-    let proj = ProjectDirs::from("dev", "opz", "opz").ok_or_else(|| anyhow!("no data dir"))?;
-    let root = proj
-        .data_local_dir()
-        .join("agent-skills")
-        .join(env!("CARGO_PKG_VERSION"));
-    extract_embedded_dir(&BUNDLED_SKILLS_DIR, &root)?;
-    Ok(root)
-}
-
-fn extract_embedded_dir(dir: &Dir<'_>, root: &Path) -> Result<()> {
-    fs::create_dir_all(root).with_context(|| format!("create {}", root.display()))?;
-
-    for file in dir.files() {
-        let path = root.join(file.path());
-        let parent = path
-            .parent()
-            .ok_or_else(|| anyhow!("embedded file has no parent: {}", path.display()))?;
-        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-        fs::write(&path, file.contents()).with_context(|| format!("write {}", path.display()))?;
-    }
-
-    for child in dir.dirs() {
-        extract_embedded_dir(child, root)?;
-    }
-
-    Ok(())
-}
-
-fn discover_skill_catalog_entries(skills_root: &Path) -> Result<Vec<SkillCatalogEntry>> {
-    let mut entries = Vec::new();
-
-    for entry in
-        fs::read_dir(skills_root).with_context(|| format!("read {}", skills_root.display()))?
-    {
-        let entry = entry?;
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-
-        let skill_md = path.join("SKILL.md");
-        if !skill_md.is_file() {
-            continue;
-        }
-
-        let content = fs::read_to_string(&skill_md)
-            .with_context(|| format!("read {}", skill_md.display()))?;
-        let frontmatter = parse_skill_frontmatter(&content)
-            .with_context(|| format!("parse {}", skill_md.display()))?;
-        entries.push(SkillCatalogEntry {
-            name: frontmatter.name,
-            description: frontmatter.description,
-            location: skill_md
-                .canonicalize()
-                .with_context(|| format!("canonicalize {}", skill_md.display()))?,
-        });
-    }
-
-    entries.sort_by(|left, right| left.name.cmp(&right.name));
-
-    if entries.is_empty() {
-        return Err(anyhow!(
-            "no bundled skills found in {}",
-            skills_root.display()
-        ));
-    }
-
-    Ok(entries)
-}
-
-fn parse_skill_frontmatter(content: &str) -> Result<SkillFrontmatter> {
-    let mut lines = content.lines();
-    if lines.next() != Some("---") {
-        return Err(anyhow!("SKILL.md must start with YAML frontmatter"));
-    }
-
-    let mut frontmatter = Vec::new();
-    let mut found_end = false;
-    for line in lines {
-        if line == "---" {
-            found_end = true;
-            break;
-        }
-        frontmatter.push(line);
-    }
-
-    if !found_end {
-        return Err(anyhow!("SKILL.md frontmatter is missing closing ---"));
-    }
-
-    let parsed: SkillFrontmatter =
-        serde_yaml::from_str(&frontmatter.join("\n")).context("invalid YAML frontmatter")?;
-    if parsed.name.trim().is_empty() {
-        return Err(anyhow!("SKILL.md field `name` must be non-empty"));
-    }
-    if parsed.description.trim().is_empty() {
-        return Err(anyhow!("SKILL.md field `description` must be non-empty"));
-    }
-
-    Ok(SkillFrontmatter {
-        name: parsed.name.trim().to_string(),
-        description: parsed.description.trim().to_string(),
-    })
-}
-
-fn render_skills_catalog(entries: &[SkillCatalogEntry]) -> String {
-    let mut lines = vec!["<available_skills>".to_string()];
-
-    for entry in entries {
-        lines.push("<skill>".to_string());
-        lines.push("<name>".to_string());
-        lines.push(xml_escape(&entry.name));
-        lines.push("</name>".to_string());
-        lines.push("<description>".to_string());
-        lines.push(xml_escape(&entry.description));
-        lines.push("</description>".to_string());
-        lines.push("<location>".to_string());
-        lines.push(xml_escape(&entry.location.display().to_string()));
-        lines.push("</location>".to_string());
-        lines.push("</skill>".to_string());
-    }
-
-    lines.push("</available_skills>".to_string());
-    lines.join("\n")
-}
-
-fn xml_escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
 }
 
 fn collect_item_env_sections(cli: &Cli, items: &[String]) -> Result<Vec<(String, Vec<String>)>> {
@@ -1562,18 +1405,6 @@ mod tests {
         item_to_valid_labels(item).unwrap()
     }
 
-    fn write_skill(root: &Path, name: &str, description: &str) -> PathBuf {
-        let skill_dir = root.join(name);
-        fs::create_dir_all(&skill_dir).unwrap();
-        let skill_md = skill_dir.join("SKILL.md");
-        fs::write(
-            &skill_md,
-            format!("---\nname: {name}\ndescription: {description}\n---\n\n# {name}\n"),
-        )
-        .unwrap();
-        skill_md
-    }
-
     #[test]
     fn test_item_to_env_lines_basic() {
         let item = make_item(vec![
@@ -2308,92 +2139,6 @@ SINGLE='value # kept'
     }
 
     #[test]
-    fn test_parse_skill_frontmatter_basic() {
-        let parsed = parse_skill_frontmatter(
-            "---\nname: jaeger-trace-compare\ndescription: Compare Jaeger traces\n---\n\n# Body\n",
-        )
-        .unwrap();
-        assert_eq!(parsed.name, "jaeger-trace-compare");
-        assert_eq!(parsed.description, "Compare Jaeger traces");
-    }
-
-    #[test]
-    fn test_parse_skill_frontmatter_requires_description() {
-        let err = parse_skill_frontmatter("---\nname: missing-description\n---\n").unwrap_err();
-        assert!(!err.to_string().is_empty());
-    }
-
-    #[test]
-    fn test_discover_skill_catalog_entries_ignores_non_skill_dirs() {
-        let tmp_dir = TempDir::new().unwrap();
-        let root = tmp_dir.path();
-        let expected = write_skill(root, "alpha-skill", "Alpha skill");
-
-        let ignored = root.join("notes");
-        fs::create_dir_all(&ignored).unwrap();
-        fs::write(ignored.join("README.md"), "# not a skill\n").unwrap();
-        fs::write(root.join("top-level.md"), "# ignore\n").unwrap();
-
-        let entries = discover_skill_catalog_entries(root).unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].name, "alpha-skill");
-        assert_eq!(entries[0].description, "Alpha skill");
-        assert_eq!(entries[0].location, expected.canonicalize().unwrap());
-    }
-
-    #[test]
-    fn test_discover_skill_catalog_entries_sorts_by_name() {
-        let tmp_dir = TempDir::new().unwrap();
-        let root = tmp_dir.path();
-        write_skill(root, "zeta-skill", "Zeta");
-        write_skill(root, "alpha-skill", "Alpha");
-
-        let entries = discover_skill_catalog_entries(root).unwrap();
-        assert_eq!(
-            entries
-                .iter()
-                .map(|entry| entry.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["alpha-skill", "zeta-skill"]
-        );
-    }
-
-    #[test]
-    fn test_render_skills_catalog_xml() {
-        let entries = vec![SkillCatalogEntry {
-            name: "skill<&>".to_string(),
-            description: "desc & <xml>".to_string(),
-            location: PathBuf::from("/tmp/skill<&>/SKILL.md"),
-        }];
-
-        let rendered = render_skills_catalog(&entries);
-        assert_eq!(
-            rendered,
-            "<available_skills>\n<skill>\n<name>\nskill&lt;&amp;&gt;\n</name>\n<description>\ndesc &amp; &lt;xml&gt;\n</description>\n<location>\n/tmp/skill&lt;&amp;&gt;/SKILL.md\n</location>\n</skill>\n</available_skills>"
-        );
-    }
-
-    #[test]
-    fn test_bundled_skill_catalog_contains_jaeger_trace_compare() {
-        let tmp_dir = TempDir::new().unwrap();
-        extract_embedded_dir(&BUNDLED_SKILLS_DIR, tmp_dir.path()).unwrap();
-
-        let entries = discover_skill_catalog_entries(tmp_dir.path()).unwrap();
-        assert!(entries.iter().any(|entry| {
-            entry.name == "jaeger-trace-compare"
-                && entry.description.contains("Jaeger traces")
-                && entry
-                    .location
-                    .ends_with(Path::new("jaeger-trace-compare/SKILL.md"))
-        }));
-    }
-
-    #[test]
-    fn test_xml_escape() {
-        assert_eq!(xml_escape("a&<b>"), "a&amp;&lt;b&gt;");
-    }
-
-    #[test]
     fn test_cli_parse_show_multiple_items() {
         let cli = Cli::try_parse_from(["opz", "show", "foo", "bar"]).unwrap();
         match cli.cmd {
@@ -2412,6 +2157,18 @@ SINGLE='value # kept'
             Some(Cmd::Skills) => {}
             _ => panic!("expected skills command"),
         }
+    }
+
+    #[test]
+    fn test_bundled_skill_has_expected_metadata() {
+        assert!(OPZ_SKILL.starts_with("---\nname: opz\n"));
+        assert!(OPZ_SKILL.contains("\ndescription: "));
+        assert!(OPZ_SKILL.contains("opz find <query>"));
+        assert!(OPZ_SKILL.contains("opz show [OPTIONS] <ITEM>..."));
+        assert!(OPZ_SKILL.contains("opz gen [OPTIONS] <ITEM>..."));
+        assert!(OPZ_SKILL.contains("opz create <ITEM> [ENV]"));
+        assert!(OPZ_SKILL.contains("opz run [OPTIONS] <ITEM>... -- <COMMAND>..."));
+        assert!(OPZ_SKILL.contains("opz skills"));
     }
 
     #[test]
