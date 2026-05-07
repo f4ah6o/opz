@@ -8,6 +8,7 @@ use opentelemetry::KeyValue;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::cmp::Reverse;
 use std::{
     collections::HashMap,
     ffi::OsString,
@@ -17,7 +18,6 @@ use std::{
     process::{Command, Stdio},
     time::{Duration, SystemTime},
 };
-use std::cmp::Reverse;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
@@ -665,10 +665,14 @@ fn run_op_item_create(args: &[String]) -> Result<()> {
                 std::io::stdout()
                     .write_all(&output.stdout)
                     .context("failed to write `op item create` stdout")?;
-                return Err(anyhow!("op item create failed with status: {}", output.status));
+                return Err(anyhow!(
+                    "op item create failed with status: {}",
+                    output.status
+                ));
             }
 
-            let masked_stdout = mask_create_stdout(&String::from_utf8_lossy(&output.stdout), &sensitive_values);
+            let masked_stdout =
+                mask_create_stdout(&String::from_utf8_lossy(&output.stdout), &sensitive_values);
             std::io::stdout()
                 .write_all(masked_stdout.as_bytes())
                 .context("failed to write masked `op item create` stdout")?;
@@ -1965,10 +1969,14 @@ SINGLE='value # kept'
 
     #[test]
     fn test_mask_create_stdout_masks_only_sensitive_values() {
-        let args = build_create_item_args(Some("Private"), "my-item", &[
-            ("API_KEY".to_string(), "secret".to_string()),
-            ("DB_HOST".to_string(), "localhost".to_string()),
-        ]);
+        let args = build_create_item_args(
+            Some("Private"),
+            "my-item",
+            &[
+                ("API_KEY".to_string(), "secret".to_string()),
+                ("DB_HOST".to_string(), "localhost".to_string()),
+            ],
+        );
 
         let masked = mask_create_stdout(
             "ID: abc123\nTitle: my-item\nAPI_KEY: secret\nDB_HOST: localhost\n",
