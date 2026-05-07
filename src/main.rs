@@ -646,7 +646,7 @@ fn run_op_item_create(args: &[String]) -> Result<()> {
         "write_outputs.op_item_create",
         vec![KeyValue::new("op.arg_count", args.len() as i64)],
         || {
-            let sensitive_values = collect_sensitive_create_values(args);
+            let sensitive_fields = collect_sensitive_create_fields(args);
             let mut cmd = Command::new("op");
             cmd.args(args);
 
@@ -672,7 +672,7 @@ fn run_op_item_create(args: &[String]) -> Result<()> {
             }
 
             let masked_stdout =
-                mask_create_stdout(&String::from_utf8_lossy(&output.stdout), &sensitive_values);
+                mask_create_stdout(&String::from_utf8_lossy(&output.stdout), &sensitive_fields);
             std::io::stdout()
                 .write_all(masked_stdout.as_bytes())
                 .context("failed to write masked `op item create` stdout")?;
@@ -682,29 +682,53 @@ fn run_op_item_create(args: &[String]) -> Result<()> {
     )
 }
 
-fn collect_sensitive_create_values(args: &[String]) -> Vec<String> {
-    let mut values = args
+const CREATE_TEXT_FIELD_SUFFIX: &str = "[text]";
+const CREATE_SECURE_NOTE_FIELD: &str = "notesPlain";
+
+fn collect_sensitive_create_fields(args: &[String]) -> Vec<(String, String)> {
+    let mut fields = args
         .iter()
         .filter_map(|arg| {
             let (field_name, value) = arg.split_once('=')?;
-            if field_name.ends_with("[text]") || field_name == "notesPlain" {
-                Some(value.to_string())
-            } else {
-                None
+            let display_name =
+                if let Some(label) = field_name.strip_suffix(CREATE_TEXT_FIELD_SUFFIX) {
+                    label
+                } else if field_name == CREATE_SECURE_NOTE_FIELD {
+                    field_name
+                } else {
+                    return None;
+                };
+
+            if value.is_empty() {
+                return None;
             }
+
+            Some((display_name.to_string(), value.to_string()))
         })
-        .filter(|value| !value.is_empty())
         .collect::<Vec<_>>();
 
-    values.sort_by_key(|value| Reverse(value.len()));
-    values.dedup();
-    values
+    fields.sort_by_key(|(_, value)| Reverse(value.len()));
+    fields.dedup();
+    fields
 }
 
-fn mask_create_stdout(stdout: &str, sensitive_values: &[String]) -> String {
+fn mask_create_stdout(stdout: &str, sensitive_fields: &[(String, String)]) -> String {
     let mut masked = stdout.to_string();
-    for value in sensitive_values {
-        masked = masked.replace(value, "***");
+    for (field_name, value) in sensitive_fields {
+        let pattern = format!(
+            "{}(^\\s*{}(?:\\s*\\[[^\\]]+\\])?\\s*[:=]\\s*){}(\\s*$)",
+            if value.contains('\n') {
+                "(?ms)"
+            } else {
+                "(?m)"
+            },
+            regex::escape(field_name),
+            regex::escape(value)
+        );
+        let Ok(regex) = Regex::new(&pattern) else {
+            continue;
+        };
+        masked = regex.replace_all(&masked, "$1***$2").into_owned();
     }
     masked
 }
@@ -1944,7 +1968,7 @@ SINGLE='value # kept'
     }
 
     #[test]
-    fn test_collect_sensitive_create_values_from_create_args() {
+    fn test_collect_sensitive_create_fields_from_create_args() {
         let args = vec![
             "item".to_string(),
             "create".to_string(),
@@ -1955,14 +1979,17 @@ SINGLE='value # kept'
             "notesPlain=```app.conf\nTOKEN=abc\n```".to_string(),
         ];
 
-        let values = collect_sensitive_create_values(&args);
+        let fields = collect_sensitive_create_fields(&args);
 
         assert_eq!(
-            values,
+            fields,
             vec![
-                "```app.conf\nTOKEN=abc\n```".to_string(),
-                "localhost".to_string(),
-                "secret".to_string()
+                (
+                    "notesPlain".to_string(),
+                    "```app.conf\nTOKEN=abc\n```".to_string()
+                ),
+                ("DB_HOST".to_string(), "localhost".to_string()),
+                ("API_KEY".to_string(), "secret".to_string())
             ]
         );
     }
@@ -1980,13 +2007,23 @@ SINGLE='value # kept'
 
         let masked = mask_create_stdout(
             "ID: abc123\nTitle: my-item\nAPI_KEY: secret\nDB_HOST: localhost\n",
-            &collect_sensitive_create_values(&args),
+            &collect_sensitive_create_fields(&args),
         );
 
         assert_eq!(
             masked,
             "ID: abc123\nTitle: my-item\nAPI_KEY: ***\nDB_HOST: ***\n"
         );
+    }
+
+    #[test]
+    fn test_mask_create_stdout_does_not_mask_unrelated_substrings() {
+        let masked = mask_create_stdout(
+            "Title: my-secret-item\nAPI_KEY: secret\n",
+            &[("API_KEY".to_string(), "secret".to_string())],
+        );
+
+        assert_eq!(masked, "Title: my-secret-item\nAPI_KEY: ***\n");
     }
 
     #[test]
