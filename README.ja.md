@@ -150,7 +150,7 @@ opz [OPTIONS] create <ITEM> [ENV]
 * `[ENV]` が厳密に `.env` の場合:
   * カテゴリ `API Credential` でアイテムを作成
   * タイトルは `<ITEM>` を使用
-  * 各 `KEY=VALUE` を `KEY[text]=VALUE` のカスタムテキストフィールドとして追加
+  * 各 `KEY=VALUE` を `KEY` という名前のカスタムテキストフィールドとして追加
   * `export KEY=...`、インラインコメント（`KEY=value # note`）をサポートし、クォート内の `#` は保持
   * 重複キーは後勝ち
 * `[ENV]` が `.env` 以外の場合:
