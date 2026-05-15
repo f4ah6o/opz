@@ -5,19 +5,18 @@
 [![CI](https://github.com/f4ah6o/opz/actions/workflows/publish.yaml/badge.svg)](https://github.com/f4ah6o/opz/actions/workflows/publish.yaml)
 <!-- bdg:end -->
 
-1Password CLI wrapper for seamless secret injection into commands.
+`opz` is a small wrapper around the 1Password CLI. It finds items, turns valid field labels into environment variables, and can run a command with those secrets injected.
 
 ## Features
 
-* Find items by keyword search
-* Show valid env labels from 1Password items with `show` subcommand
-* Run commands with secrets from 1Password items as environment variables
-* Generate env files with `gen` subcommand (appends to existing, overwrites duplicates)
-* Create 1Password items from `.env` files or private config files with `create` subcommand
-* Store valid 1Password item fields as GitHub repository secrets with `github-secret` subcommand
-* Emit bundled Agent Skills `SKILL.md` for `opz` with `skills` subcommand
-* Item list caching for faster repeated runs
-* Fuzzy matching when exact title match is not found
+* Search 1Password items by title keyword.
+* Show item field labels that are valid shell environment variable names.
+* Run a command with secrets from one or more 1Password items.
+* Generate env files containing `op://...` references, preserving unrelated existing lines.
+* Create 1Password items from `.env` files or save private config files as Secure Notes.
+* Store valid item fields as GitHub repository secrets.
+* Print the bundled `opz` Agent Skill.
+* Cache item lists for 60 seconds and fall back to title contains matching when exact lookup misses.
 
 ## Installation
 
@@ -28,14 +27,14 @@ cargo install opz
 ## Trusted publishing
 
 This repository is configured for [crates.io trusted publishing](https://crates.io/docs/trusted-publishing).
-Create a tag such as `v2025.12.0` and push it to trigger the `Publish to crates.io` workflow, which mints a short-lived token via OIDC and runs `cargo publish --locked`.
-You must enable trusted publishing for the `opz` crate in the crates.io UI (linked repository: `f4ah6o/opx`) before the workflow is allowed to request tokens.
+Create a tag such as `v2026.5.1` and push it to trigger the `Publish to crates.io` workflow, which mints a short-lived token through OIDC and runs `cargo publish --locked`.
+Enable trusted publishing for the `opz` crate in the crates.io UI before the workflow requests tokens. The linked repository should be `f4ah6o/opz`.
 
 ## Usage
 
 ### Find Items
 
-Search for 1Password items by keyword:
+Search item titles by keyword:
 
 ```bash
 opz find <query>
@@ -43,13 +42,13 @@ opz find <query>
 
 Example:
 ```bash
-opz find <query>
-# Output: item-1	item-2	item-3
+opz find github
+# Output: <item-id>    <vault-name>    github-token
 ```
 
 ### Show Item Labels
 
-Show valid env labels from item fields:
+Show field labels that can be used as environment variable names:
 
 ```bash
 opz show [OPTIONS] [--with-item] <ITEM>...
@@ -80,7 +79,7 @@ This lets other agents and tools load the current `opz` usage context directly i
 
 ### Run Commands with Secrets
 
-Run a command with secrets from a 1Password item as environment variables:
+Run a command with secrets from one or more 1Password items:
 
 ```bash
 opz run [OPTIONS] [--env-file <ENV>] <ITEM>... -- <COMMAND>...
@@ -89,12 +88,12 @@ opz [OPTIONS] [--env-file <ENV>] <ITEM>... -- <COMMAND>...
 
 Options:
 * `--vault <NAME>` - Vault name (optional, searches all vaults if omitted)
-* `--env-file <ENV>` - Output env file path (optional, no file generated if omitted)
+* `--env-file <ENV>` - Output env file path. If omitted, no file is written.
 
 Arguments:
-* `<ITEM>...` - One or more item titles to fetch secrets from
+* `<ITEM>...` - One or more item titles to fetch secrets from.
 
-When `--env-file` is specified, the env file is preserved after command execution. If the file already exists, new entries are appended and duplicate keys are overwritten. If duplicate keys exist across items, later items win (`opz run foo bar ...` prefers `bar` values).
+When `--env-file` is set, the file remains after the command exits. Existing files are merged: unrelated lines stay in place, duplicate keys are overwritten, and new keys are appended. If multiple items define the same key, later items win (`opz run foo bar ...` prefers values from `bar`).
 
 Examples:
 ```bash
@@ -110,13 +109,16 @@ opz run --env-file .env foo bar -- your-command
 # Top-level shorthand also supports multiple items
 opz --env-file .env.local foo bar -- your-command
 
+# Quote variables so your shell leaves them for opz to expand
+opz run my-service -- curl -H 'Authorization: Bearer $API_TOKEN' https://api.example.test
+
 # Specify vault
 opz run --vault Private foo bar -- your-command
 ```
 
 ### Generate Env File
 
-Generate env file only without running a command:
+Generate `op://...` env references without running a command:
 
 ```bash
 opz gen [OPTIONS] [--env-file <ENV>] <ITEM>...
@@ -137,33 +139,34 @@ opz gen --env-file .env.production foo bar
 opz --vault Private gen foo bar
 ```
 
-Stdout output includes per-item comment headers like `# --- item: <title> ---`; comments are ignored by `.env` parsers.
+Stdout uses per-item comment headers such as `# --- item: <title> ---`. File output writes the merged key list without those section comments.
 
 ### Create Item from `.env` or Private Config
 
-`create` has two modes depending on `[ENV]`:
+`create` has two modes, selected by the source file name:
 
 ```bash
 opz [OPTIONS] create <ITEM> [ENV]
 ```
 
 Arguments:
-* `<ITEM>` - New item title for `.env` mode
-* `[ENV]` - Source file path (optional, defaults to `.env`)
+* `<ITEM>` - New item title when `[ENV]` is exactly `.env`.
+* `[ENV]` - Source file path. The default is `.env`.
 
 Behavior:
 * If `[ENV]` is exactly `.env`:
-  * Creates an item in category `API Credential`
-  * Uses `<ITEM>` as title
-  * Adds each `KEY=VALUE` as a custom text field named `KEY`
-  * Supports `export KEY=...`, inline comments (`KEY=value # note`), and keeps `#` inside quotes
-  * For duplicate keys, the last entry wins
+  * Creates an `API_CREDENTIAL` item.
+  * Uses `<ITEM>` as the title.
+  * Adds each `KEY=VALUE` as a custom text field named `KEY`.
+  * Supports `export KEY=...`, inline comments (`KEY=value # note`), and `#` inside quotes.
+  * Skips invalid env keys and existing `op://...` values.
+  * For duplicate keys, the last entry wins.
 * If `[ENV]` is anything other than `.env`:
-  * Creates item(s) in category `Secure Note`
-  * Builds note body as ```` ```<file name>\n<content>\n``` ````
-  * Uses git remote repo name (`org/repo`) as item title
-  * If multiple remotes exist, creates one item per remote; duplicate titles get `-2`, `-3`, ...
-  * Fails if no parseable git remote is available
+  * Creates `SECURE_NOTE` item(s).
+  * Stores the file as a fenced note body: ```` ```<file name>\n<content>\n``` ````.
+  * Uses git remote repository names (`org/repo`) as item titles.
+  * If multiple remotes exist, creates one item per remote; duplicate titles get `-2`, `-3`, and so on.
+  * Fails if no parseable git remote is available.
 
 Examples:
 ```bash
@@ -179,7 +182,7 @@ opz --vault Private create my-service .env
 
 ### Store GitHub Repository Secrets
 
-Store valid 1Password item fields as GitHub repository secrets:
+Store valid item fields as GitHub repository secrets:
 
 ```bash
 opz github-secret [OPTIONS] <ITEM>...
@@ -202,17 +205,18 @@ opz github-secret my-service
 opz github-secret --repo owner/repo my-service shared-secrets
 ```
 
-`github-secret` uses the same valid field labels as `gen` and `run`. Duplicate names across multiple items use the later item. Secret values are resolved in memory and passed to `gh secret set` through stdin; values are not printed or passed as command arguments.
+`github-secret` uses the same valid field labels as `gen` and `run`. Duplicate names across multiple items use the later item. Secret values are resolved in memory and passed to `gh secret set` through stdin; values are not printed or passed as command arguments. Names starting with `GITHUB_` are rejected because GitHub reserves that prefix.
 
 ## How It Works
 
-1. Fetches item list from 1Password (cached for 60 seconds)
-2. Finds the matching item by title (exact or fuzzy match)
-3. Builds `op://<vault_id>/<item>/<field>` references for each field (uses vault ID to avoid special/non-ASCII name issues)
-4. If env file is specified, writes the file with references (appends to existing, overwrites duplicate keys); otherwise outputs to stdout
-5. Runs the command with secrets injected as environment variables
+1. Fetches the item list from 1Password and caches that metadata for 60 seconds.
+2. Finds one matching title. Exact match is tried first; title contains matching is used as a fallback.
+3. Fetches the matched item and builds `op://<vault_id>/<item_id>/<field>` references for fields with valid env labels.
+4. Writes an env file when requested, merging with any existing file.
+5. Resolves secrets with `op run --env-file <temp> -- sh -c 'env -0'`, falling back to `op read` per reference if batch resolution fails.
+6. Runs the command with resolved values in the environment. `$VAR` and `${VAR}` in command arguments are expanded only for variables resolved from the selected items.
 
-With `gen` and `show` subcommands, only steps 1-4 are executed (no command run).
+`gen` stops after writing references. `show` fetches items and prints valid labels without resolving secret values.
 
 ## `op` Command Usage
 
@@ -240,7 +244,7 @@ sequenceDiagram
     op-->>opz: Exit status
 ```
 
-**Security**: `opz` delegates all secret access and authentication to `op` CLI. Item list is cached (60s) with metadata only.
+Security: `opz` delegates secret access and authentication to the `op` CLI. The 60-second cache stores item-list metadata only, not secret values.
 
 ## Tracing (OpenTelemetry + Jaeger)
 
@@ -276,7 +280,7 @@ just trace-report <ref-or-version>
 just trace-compare <base-ref-or-version> <head-ref-or-version>
 ```
 
-`<ref-or-version>` accepts commit hash, git tag (for example `v2026.2.5`), or `service.version` (for example `2026.2.5`).
+`<ref-or-version>` accepts commit hash, git tag (for example `v2026.5.1`), or `service.version` (for example `2026.5.1`).
 Both commands print markdown tables (duration and top child span) for easy copy into PRs.
 
 For less noisy comparisons, aggregate multiple runs and ignore failed traces:

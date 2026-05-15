@@ -1,18 +1,17 @@
 # opz
 
-1Password CLI ラッパー - コマンドへのシームレスな secret 注入のためのツール
+`opz` は 1Password CLI の小さなラッパーです。アイテムを探し、有効なフィールド名を環境変数に変換し、その secret を入れた状態でコマンドを実行できます。
 
 ## 機能
 
-* キーワード検索でアイテムを検索
-* `show` サブコマンドでアイテムの env 有効ラベル名を表示
-* 1Password アイテムの secret を環境変数としてコマンド実行
-* `gen` サブコマンドで env ファイル生成（既存ファイルに追記、重複キーは上書き）
-* `create` サブコマンドで `.env` または private 設定ファイルからアイテムを作成
-* `github-secret` サブコマンドで 1Password item の有効フィールドを GitHub repository secrets に保存
-* `skills` サブコマンドで `opz` 用の bundled Agent Skills `SKILL.md` を出力
-* 繰り返し実行を高速化するアイテムリストのキャッシュ
-* 完全一致がない場合のファジーマッチ
+* タイトルのキーワードで 1Password アイテムを検索します。
+* shell の環境変数名として使えるフィールドラベルを表示します。
+* 1 つ以上の 1Password アイテムから secret を取得してコマンドを実行します。
+* `op://...` 参照を含む env ファイルを生成し、既存ファイルの無関係な行は残します。
+* `.env` から 1Password アイテムを作成し、private 設定ファイルは Secure Note として保存します。
+* 有効なアイテムフィールドを GitHub repository secrets に保存します。
+* bundled `opz` Agent Skill を出力します。
+* アイテムリストを 60 秒キャッシュし、完全一致がない場合はタイトルの部分一致で探します。
 
 ## インストール
 
@@ -23,14 +22,14 @@ cargo install opz
 ## Trusted publishing
 
 このリポジトリは [crates.io trusted publishing](https://crates.io/docs/trusted-publishing) に対応しています。
-`v2025.12.0` のようなタグを作成してプッシュすると、`Publish to crates.io` ワークフローがトリガーされ、OIDC経由で短期間有効なトークンを取得し、`cargo publish --locked` を実行します。
-ワークフローがトークンをリクエストできるようにするには、crates.io UI で `opz` クレートに対して trusted publishing を有効にする必要があります（リンクされたリポジトリ: `f4ah6o/opx`）。
+`v2026.5.1` のようなタグを作成してプッシュすると、`Publish to crates.io` ワークフローがトリガーされ、OIDC 経由で短期間有効なトークンを取得し、`cargo publish --locked` を実行します。
+ワークフローがトークンをリクエストできるようにするには、crates.io UI で `opz` クレートの trusted publishing を有効にします。リンク先 repository は `f4ah6o/opz` です。
 
 ## 使い方
 
 ### アイテム検索
 
-キーワードで 1Password アイテムを検索:
+タイトルのキーワードで 1Password アイテムを検索します:
 
 ```bash
 opz find <query>
@@ -38,13 +37,13 @@ opz find <query>
 
 例:
 ```bash
-opz find baz
-# 出力: foo   bar     baz
+opz find github
+# 出力: <item-id>    <vault-name>    github-token
 ```
 
 ### アイテムラベル表示
 
-アイテムのフィールドから env 変数として有効なラベル名を表示:
+環境変数名として使えるフィールドラベルを表示します:
 
 ```bash
 opz show [OPTIONS] [--with-item] <ITEM>...
@@ -75,7 +74,7 @@ opz skills
 
 ### Secret 付きでコマンド実行
 
-1Password アイテムの secret を環境変数としてコマンドを実行:
+1 つ以上の 1Password アイテムから secret を取得してコマンドを実行します:
 
 ```bash
 opz run [OPTIONS] [--env-file <ENV>] <ITEM>... -- <COMMAND>...
@@ -84,12 +83,12 @@ opz [OPTIONS] [--env-file <ENV>] <ITEM>... -- <COMMAND>...
 
 オプション:
 * `--vault <NAME>` - Vault 名（省略時はすべての Vault を検索）
-* `--env-file <ENV>` - 出力 env ファイルパス（省略時はファイル生成なし）
+* `--env-file <ENV>` - 出力 env ファイルパス。省略時はファイルを書きません。
 
 引数:
-* `<ITEM>...` - secret を取得する 1 つ以上のアイテムタイトル
+* `<ITEM>...` - secret を取得する 1 つ以上のアイテムタイトル。
 
-`--env-file` を指定した場合、env ファイルはコマンド実行後も保持されます。既存ファイルがある場合は追記され、重複キーは上書きされます。複数アイテム間で同名キーがある場合は後勝ちです（`opz run foo bar ...` では `bar` が優先）。
+`--env-file` を指定すると、env ファイルはコマンド終了後も残ります。既存ファイルはマージされ、無関係な行は残り、重複キーは上書きされ、新しいキーは末尾に追加されます。複数アイテムで同じキーがある場合は後勝ちです（`opz run foo bar ...` では `bar` の値が優先）。
 
 例:
 ```bash
@@ -105,13 +104,16 @@ opz run --env-file .env foo bar -- your-command
 # 短縮形でも複数アイテム対応
 opz --env-file .env.local foo bar -- your-command
 
+# shell ではなく opz に展開させるため、変数を quote する
+opz run my-service -- curl -H 'Authorization: Bearer $API_TOKEN' https://api.example.test
+
 # Vault を指定
 opz run --vault Private foo bar -- your-command
 ```
 
 ### Env ファイル生成
 
-コマンド実行なしで env ファイルのみを生成:
+コマンドを実行せず、`op://...` の env 参照を生成します:
 
 ```bash
 opz gen [OPTIONS] [--env-file <ENV>] <ITEM>...
@@ -132,33 +134,34 @@ opz gen --env-file .env.production foo bar
 opz --vault Private gen foo bar
 ```
 
-標準出力は `# --- item: <title> ---` のコメント見出し付きです（コメント行は `.env` パーサで無視されます）。
+標準出力では `# --- item: <title> ---` のようなコメント見出しを付けます。ファイル出力では、セクションコメントなしのマージ済みキー一覧を書きます。
 
 ### `.env` または private 設定ファイルからアイテム作成
 
-`create` は `[ENV]` によって2つのモードで動作します:
+`create` は読み込むファイル名で 2 つのモードを切り替えます:
 
 ```bash
 opz [OPTIONS] create <ITEM> [ENV]
 ```
 
 引数:
-* `<ITEM>` - `.env` モードで作成する 1Password アイテムタイトル
-* `[ENV]` - 読み込むファイルパス（省略時は `.env`）
+* `<ITEM>` - `[ENV]` が厳密に `.env` のときに使う 1Password アイテムタイトル。
+* `[ENV]` - 読み込むファイルパス。省略時は `.env`。
 
 挙動:
 * `[ENV]` が厳密に `.env` の場合:
-  * カテゴリ `API Credential` でアイテムを作成
-  * タイトルは `<ITEM>` を使用
-  * 各 `KEY=VALUE` を `KEY` という名前のカスタムテキストフィールドとして追加
-  * `export KEY=...`、インラインコメント（`KEY=value # note`）をサポートし、クォート内の `#` は保持
-  * 重複キーは後勝ち
+  * `API_CREDENTIAL` アイテムを作成します。
+  * タイトルは `<ITEM>` です。
+  * 各 `KEY=VALUE` を `KEY` という名前のカスタムテキストフィールドとして追加します。
+  * `export KEY=...`、インラインコメント（`KEY=value # note`）、クォート内の `#` に対応します。
+  * 無効な env キーと既存の `op://...` 値はスキップします。
+  * 重複キーは後勝ちです。
 * `[ENV]` が `.env` 以外の場合:
-  * カテゴリ `Secure Note` でアイテムを作成
-  * 本文フォーマットは ```` ```<file name>\n<content>\n``` ````
-  * タイトルは git remote URL から抽出した `org/repo` を使用
-  * remote が複数ある場合は remote ごとに作成し、同名時は `-2`, `-3`... を付与
-  * 解釈可能な git remote がない場合はエラー終了
+  * `SECURE_NOTE` アイテムを作成します。
+  * 本文は ```` ```<file name>\n<content>\n``` ```` の形で保存します。
+  * タイトルには git remote URL から抽出した `org/repo` を使います。
+  * remote が複数ある場合は remote ごとに作成し、同名時は `-2`, `-3` のように番号を付けます。
+  * 解釈できる git remote がない場合はエラー終了します。
 
 例:
 ```bash
@@ -174,7 +177,7 @@ opz --vault Private create my-service .env
 
 ### GitHub Repository Secrets に保存
 
-1Password item の有効フィールドを GitHub repository secrets に保存:
+有効なアイテムフィールドを GitHub repository secrets に保存します:
 
 ```bash
 opz github-secret [OPTIONS] <ITEM>...
@@ -197,17 +200,18 @@ opz github-secret my-service
 opz github-secret --repo owner/repo my-service shared-secrets
 ```
 
-`github-secret` は `gen` や `run` と同じ有効フィールドラベルを使います。複数 item で同名がある場合は後勝ちです。Secret 値はメモリ上で解決し、`gh secret set` の stdin に渡します。値を表示したりコマンド引数に載せたりしません。
+`github-secret` は `gen` や `run` と同じ有効フィールドラベルを使います。複数 item で同名がある場合は後勝ちです。Secret 値はメモリ上で解決し、`gh secret set` の stdin に渡します。値を表示したりコマンド引数に載せたりしません。GitHub が予約しているため、`GITHUB_` で始まる名前は拒否します。
 
 ## 仕組み
 
-1. 1Password からアイテムリストを取得（60秒間キャッシュ）
-2. タイトルで一致するアイテムを検索（完全一致またはファジーマッチ）
-3. 各フィールドについて `op://<vault_id>/<item>/<field>` 参照を生成（Vault 名に特殊文字・非ASCIIが含まれても失敗しないよう Vault ID を使用）
-4. env ファイルパスが指定されている場合はファイルに書き込み（既存ファイルにマージ、重複キーは上書き）；指定がない場合は標準出力に出力
-5. 環境変数として secret を注入してコマンドを実行
+1. 1Password からアイテムリストを取得し、そのメタデータを 60 秒キャッシュします。
+2. タイトルで一致するアイテムを 1 件探します。まず完全一致、見つからなければタイトルの部分一致を使います。
+3. 一致したアイテムを取得し、有効な env ラベルを持つフィールドから `op://<vault_id>/<item_id>/<field>` 参照を作ります。
+4. env ファイル指定があれば、既存ファイルとマージして書き込みます。
+5. `op run --env-file <temp> -- sh -c 'env -0'` で secret をまとめて解決し、失敗した場合は参照ごとに `op read` へフォールバックします。
+6. 解決済みの値を環境変数に入れてコマンドを実行します。コマンド引数内の `$VAR` と `${VAR}` は、選択したアイテムから解決できた変数だけ展開します。
 
-`gen` と `show` サブコマンドの場合、ステップ 1-4 のみ実行されます（コマンド実行なし）。
+`gen` は参照を書いたところで終了します。`show` は secret 値を解決せず、有効なラベルだけを表示します。
 
 ## `op` コマンドの利用
 
@@ -235,7 +239,7 @@ sequenceDiagram
     op-->>opz: 終了ステータス
 ```
 
-**セキュリティ**: `opz` は secret へのアクセスと認証をすべて `op` CLI に委任します。アイテムリストはメタデータのみを 60 秒間キャッシュします。
+セキュリティ: `opz` は secret へのアクセスと認証を `op` CLI に任せます。60 秒キャッシュするのはアイテムリストのメタデータだけで、secret 値は保存しません。
 
 ## Tracing（OpenTelemetry + Jaeger）
 
@@ -271,7 +275,7 @@ just trace-report <ref-or-version>
 just trace-compare <base-ref-or-version> <head-ref-or-version>
 ```
 
-`<ref-or-version>` には commit hash、git tag（例: `v2026.2.5`）、`service.version`（例: `2026.2.5`）を指定できます。
+`<ref-or-version>` には commit hash、git tag（例: `v2026.5.1`）、`service.version`（例: `2026.5.1`）を指定できます。
 どちらも markdown テーブル（duration と最長 child span）を標準出力します。
 
 比較ノイズを減らすには、複数サンプル集計＋失敗トレース除外を使います:

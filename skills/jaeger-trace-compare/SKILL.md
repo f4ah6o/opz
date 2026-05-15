@@ -46,11 +46,11 @@ just trace-compare-samples <base-ref-or-version> <head-ref-or-version> samples=5
 
 ## Troubleshooting
 
-- If no traces are found: increase fetch limit with `limit=1000`.
-- If ref not matched: pass a longer commit prefix or explicit tag.
-- If service differs: pass `service=<name>`.
-- If failures skew results: set `status=ok`.
+If no traces are found, increase the fetch limit with `limit=1000`.
+If a ref is not matched, pass a longer commit prefix or an explicit tag.
+If the service name differs, pass `service=<name>`.
+If failures skew the numbers, set `status=ok`.
 
 ## Reference
 
-- Jaeger API details: `references/jaeger-api.md`
+Jaeger API details live in `references/jaeger-api.md`.
