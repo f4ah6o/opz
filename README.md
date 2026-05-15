@@ -14,6 +14,7 @@
 * Run commands with secrets from 1Password items as environment variables
 * Generate env files with `gen` subcommand (appends to existing, overwrites duplicates)
 * Create 1Password items from `.env` files or private config files with `create` subcommand
+* Store valid 1Password item fields as GitHub repository secrets with `github-secret` subcommand
 * Emit bundled Agent Skills `SKILL.md` for `opz` with `skills` subcommand
 * Item list caching for faster repeated runs
 * Fuzzy matching when exact title match is not found
@@ -175,6 +176,33 @@ opz create ignored-item app.conf
 # Create item in specific vault
 opz --vault Private create my-service .env
 ```
+
+### Store GitHub Repository Secrets
+
+Store valid 1Password item fields as GitHub repository secrets:
+
+```bash
+opz github-secret [OPTIONS] <ITEM>...
+```
+
+Options:
+* `--repo <OWNER/REPO>` - Target GitHub repository (defaults to the current `gh` repository)
+* `--dry-run` - Print the secret names that would be set without writing values
+* `--vault <NAME>` - Vault name (optional, searches all vaults if omitted)
+
+Examples:
+```bash
+# Preview secret names
+opz github-secret --dry-run my-service
+
+# Store secrets in the current repository
+opz github-secret my-service
+
+# Store secrets in a specific repository
+opz github-secret --repo owner/repo my-service shared-secrets
+```
+
+`github-secret` uses the same valid field labels as `gen` and `run`. Duplicate names across multiple items use the later item. Secret values are resolved in memory and passed to `gh secret set` through stdin; values are not printed or passed as command arguments.
 
 ## How It Works
 

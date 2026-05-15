@@ -9,6 +9,7 @@
 * 1Password アイテムの secret を環境変数としてコマンド実行
 * `gen` サブコマンドで env ファイル生成（既存ファイルに追記、重複キーは上書き）
 * `create` サブコマンドで `.env` または private 設定ファイルからアイテムを作成
+* `github-secret` サブコマンドで 1Password item の有効フィールドを GitHub repository secrets に保存
 * `skills` サブコマンドで `opz` 用の bundled Agent Skills `SKILL.md` を出力
 * 繰り返し実行を高速化するアイテムリストのキャッシュ
 * 完全一致がない場合のファジーマッチ
@@ -170,6 +171,33 @@ opz create ignored-item app.conf
 # Vault を指定して作成
 opz --vault Private create my-service .env
 ```
+
+### GitHub Repository Secrets に保存
+
+1Password item の有効フィールドを GitHub repository secrets に保存:
+
+```bash
+opz github-secret [OPTIONS] <ITEM>...
+```
+
+オプション:
+* `--repo <OWNER/REPO>` - 保存先 GitHub repository（省略時は現在の `gh` repository）
+* `--dry-run` - 値を書き込まず、保存対象の secret 名だけを表示
+* `--vault <NAME>` - Vault 名（省略時はすべての Vault を検索）
+
+例:
+```bash
+# secret 名を事前確認
+opz github-secret --dry-run my-service
+
+# 現在の repository に保存
+opz github-secret my-service
+
+# repository を指定して保存
+opz github-secret --repo owner/repo my-service shared-secrets
+```
+
+`github-secret` は `gen` や `run` と同じ有効フィールドラベルを使います。複数 item で同名がある場合は後勝ちです。Secret 値はメモリ上で解決し、`gh secret set` の stdin に渡します。値を表示したりコマンド引数に載せたりしません。
 
 ## 仕組み
 

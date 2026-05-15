@@ -1,6 +1,6 @@
 ---
 name: opz
-description: Use the opz CLI to search 1Password items, inspect valid env labels, generate env files, create items from local files, and run commands with secrets injected as environment variables.
+description: Use the opz CLI to search 1Password items, inspect valid env labels, generate env files, create items from local files, store GitHub repository secrets, and run commands with secrets injected as environment variables.
 ---
 
 # opz
@@ -62,6 +62,16 @@ opz run [OPTIONS] <ITEM>... -- <COMMAND>...
 opz [OPTIONS] <ITEM>... -- <COMMAND>...
 ```
 
+### `github-secret`
+
+Store valid item fields as GitHub repository secrets.
+
+```bash
+opz github-secret [OPTIONS] <ITEM>...
+opz github-secret --repo owner/repo <ITEM>...
+opz github-secret --dry-run <ITEM>...
+```
+
 ### `skills`
 
 Print this bundled Agent Skills `SKILL.md` to stdout.
@@ -73,6 +83,7 @@ opz skills
 ## Behavior Notes
 
 - When multiple items define the same env key, later items win.
+- `github-secret` also uses later-item-wins and passes values to `gh secret set` through stdin.
 - `gen` stdout uses `op://vault/item/key` references, not resolved secret values.
 - When `--env-file` points to an existing file, `opz` appends new keys and overwrites duplicate keys while preserving unrelated lines.
 - `show` only prints labels that are valid shell environment variable names.
@@ -82,4 +93,5 @@ opz skills
 1. Discover candidate items with `opz find`.
 2. Inspect available labels with `opz show`.
 3. Use `opz gen --env-file ...` when another tool needs `op://` references in a file.
-4. Use `opz run ... -- <COMMAND>` when you want to execute a command with injected secrets directly.
+4. Use `opz github-secret --dry-run ...` before writing GitHub repository secrets.
+5. Use `opz run ... -- <COMMAND>` when you want to execute a command with injected secrets directly.
