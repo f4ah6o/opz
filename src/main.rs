@@ -2329,8 +2329,12 @@ SINGLE='value # kept'
 
     #[test]
     fn test_bundled_skill_has_expected_metadata() {
-        assert!(OPZ_SKILL.starts_with("---\nname: opz\n"));
-        assert!(OPZ_SKILL.contains("\ndescription: "));
+        let skill_lines: Vec<&str> = OPZ_SKILL.lines().collect();
+        assert_eq!(skill_lines.first().copied(), Some("---"));
+        assert_eq!(skill_lines.get(1).copied(), Some("name: opz"));
+        assert!(skill_lines
+            .iter()
+            .any(|line| line.starts_with("description: ")));
         assert!(OPZ_SKILL.contains("opz find <query>"));
         assert!(OPZ_SKILL.contains("opz show [OPTIONS] <ITEM>..."));
         assert!(OPZ_SKILL.contains("opz gen [OPTIONS] <ITEM>..."));
