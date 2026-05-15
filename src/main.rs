@@ -98,6 +98,21 @@ enum Cmd {
         #[arg(last = true)]
         command: Vec<String>,
     },
+
+    /// Store valid fields from 1Password items as GitHub repository secrets
+    GithubSecret {
+        /// Repository in OWNER/REPO form (defaults to current gh repository)
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+
+        /// Print target secret names without storing values
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Item titles
+        #[arg(value_name = "ITEM", num_args = 1..)]
+        items: Vec<String>,
+    },
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -233,6 +248,11 @@ fn run_cli(args: &[OsString]) -> Result<()> {
             }
             run_with_items(&cli, items, env_file.as_deref(), command)
         }
+        Some(Cmd::GithubSecret {
+            repo,
+            dry_run,
+            items,
+        }) => set_github_secrets(&cli, repo.as_deref(), *dry_run, items),
         None => {
             if cli.items.is_empty() {
                 return Err(anyhow!(
@@ -290,6 +310,7 @@ fn detect_command_hint(args: &[OsString]) -> &'static str {
             "gen" => "gen",
             "create" => "create",
             "run" => "run",
+            "github-secret" => "github-secret",
             _ => "run",
         };
     }
@@ -939,6 +960,153 @@ fn generate_env_output(cli: &Cli, items: &[String], env_file: Option<&Path>) -> 
             Ok(())
         },
     )
+}
+
+fn set_github_secrets(
+    cli: &Cli,
+    repo: Option<&str>,
+    dry_run: bool,
+    items: &[String],
+) -> Result<()> {
+    let sections = telemetry_span::with_span_result(
+        "load_inputs",
+        vec![KeyValue::new("item.count", items.len() as i64)],
+        || collect_item_env_sections(cli, items),
+    )?;
+    let merged_env_lines =
+        telemetry_span::with_span("main_operation", vec![], || merge_env_lines(&sections));
+    let secret_names = validate_github_secret_lines(&merged_env_lines)?;
+    if secret_names.is_empty() {
+        return Err(anyhow!("No valid GitHub secret fields found"));
+    }
+
+    let resolved_repo =
+        telemetry_span::with_span_result("load_config.github_repo", vec![], || match repo {
+            Some(repo) => Ok(repo.to_string()),
+            None => resolve_current_github_repo(),
+        })?;
+
+    if dry_run {
+        return telemetry_span::with_span("write_outputs", vec![], || {
+            for name in secret_names {
+                println!("Would set GitHub secret {name} in {resolved_repo}");
+            }
+            Ok(())
+        });
+    }
+
+    let env_vars = telemetry_span::with_span_result("load_inputs", vec![], || {
+        resolve_env_vars(&merged_env_lines)
+    })?;
+
+    telemetry_span::with_span_result(
+        "write_outputs.github_secret_set",
+        vec![
+            KeyValue::new("github.repo", resolved_repo.clone()),
+            KeyValue::new("github.secret_count", secret_names.len() as i64),
+        ],
+        || {
+            for name in secret_names {
+                let value = env_vars
+                    .get(&name)
+                    .ok_or_else(|| anyhow!("resolved value missing for GitHub secret {name}"))?;
+                run_gh_secret_set(&resolved_repo, &name, value)?;
+                println!("Set GitHub secret {name} in {resolved_repo}");
+            }
+            Ok(())
+        },
+    )
+}
+
+fn validate_github_secret_lines(env_lines: &[String]) -> Result<Vec<String>> {
+    env_lines
+        .iter()
+        .filter_map(|line| parse_env_key(line).map(str::to_string))
+        .map(|name| {
+            validate_github_secret_name(&name)?;
+            Ok(name)
+        })
+        .collect()
+}
+
+fn validate_github_secret_name(name: &str) -> Result<()> {
+    let re = Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*$")?;
+    if !re.is_match(name) {
+        return Err(anyhow!("Invalid GitHub secret name: {name}"));
+    }
+    if name.to_ascii_uppercase().starts_with("GITHUB_") {
+        return Err(anyhow!(
+            "GitHub secret name cannot start with reserved prefix GITHUB_: {name}"
+        ));
+    }
+    Ok(())
+}
+
+fn build_gh_secret_set_args(repo: &str, name: &str) -> Vec<String> {
+    vec![
+        "secret".to_string(),
+        "set".to_string(),
+        name.to_string(),
+        "--repo".to_string(),
+        repo.to_string(),
+    ]
+}
+
+fn resolve_current_github_repo() -> Result<String> {
+    let out = Command::new("gh")
+        .args([
+            "repo",
+            "view",
+            "--json",
+            "nameWithOwner",
+            "--jq",
+            ".nameWithOwner",
+        ])
+        .output()
+        .context("failed to run `gh repo view`")?;
+
+    if !out.status.success() {
+        return Err(anyhow!(
+            "gh repo view failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+
+    let repo = String::from_utf8(out.stdout)
+        .context("gh repo view output was not valid UTF-8")?
+        .trim()
+        .to_string();
+    if repo.is_empty() {
+        return Err(anyhow!("gh repo view returned an empty repository name"));
+    }
+    Ok(repo)
+}
+
+fn run_gh_secret_set(repo: &str, name: &str, value: &str) -> Result<()> {
+    let args = build_gh_secret_set_args(repo, name);
+    let mut child = Command::new("gh")
+        .args(&args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .context("failed to run `gh secret set`")?;
+
+    {
+        let stdin = child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| anyhow!("failed to open stdin for `gh secret set`"))?;
+        stdin
+            .write_all(value.as_bytes())
+            .context("failed to write GitHub secret value to stdin")?;
+    }
+
+    let status = child.wait().context("failed to wait for `gh secret set`")?;
+    if !status.success() {
+        return Err(anyhow!("gh secret set failed with status: {}", status));
+    }
+    Ok(())
 }
 
 /// Expand $VAR and ${VAR} references in a string using provided environment variables.
@@ -2168,6 +2336,7 @@ SINGLE='value # kept'
         assert!(OPZ_SKILL.contains("opz gen [OPTIONS] <ITEM>..."));
         assert!(OPZ_SKILL.contains("opz create <ITEM> [ENV]"));
         assert!(OPZ_SKILL.contains("opz run [OPTIONS] <ITEM>... -- <COMMAND>..."));
+        assert!(OPZ_SKILL.contains("opz github-secret [OPTIONS] <ITEM>..."));
         assert!(OPZ_SKILL.contains("opz skills"));
     }
 
@@ -2234,6 +2403,84 @@ SINGLE='value # kept'
             }
             _ => panic!("expected gen command"),
         }
+    }
+
+    #[test]
+    fn test_cli_parse_github_secret() {
+        let cli = Cli::try_parse_from([
+            "opz",
+            "github-secret",
+            "--repo",
+            "owner/repo",
+            "--dry-run",
+            "foo",
+            "bar",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Some(Cmd::GithubSecret {
+                repo,
+                dry_run,
+                items,
+            }) => {
+                assert_eq!(repo.as_deref(), Some("owner/repo"));
+                assert!(dry_run);
+                assert_eq!(items, vec!["foo".to_string(), "bar".to_string()]);
+            }
+            _ => panic!("expected github-secret command"),
+        }
+    }
+
+    #[test]
+    fn test_validate_github_secret_name_rejects_reserved_prefix() {
+        validate_github_secret_name("API_TOKEN").unwrap();
+        validate_github_secret_name("_TOKEN").unwrap();
+        assert!(validate_github_secret_name("GITHUB_TOKEN").is_err());
+        assert!(validate_github_secret_name("github_token").is_err());
+    }
+
+    #[test]
+    fn test_validate_github_secret_lines_uses_merged_last_item_wins() {
+        let sections = vec![
+            (
+                "foo".to_string(),
+                vec![
+                    "API_TOKEN=op://vault1/item1/API_TOKEN".to_string(),
+                    "DB_URL=op://vault1/item1/DB_URL".to_string(),
+                ],
+            ),
+            (
+                "bar".to_string(),
+                vec!["API_TOKEN=op://vault2/item2/API_TOKEN".to_string()],
+            ),
+        ];
+
+        let merged = merge_env_lines(&sections);
+        let names = validate_github_secret_lines(&merged).unwrap();
+        assert_eq!(
+            merged,
+            vec![
+                "API_TOKEN=op://vault2/item2/API_TOKEN".to_string(),
+                "DB_URL=op://vault1/item1/DB_URL".to_string(),
+            ]
+        );
+        assert_eq!(names, vec!["API_TOKEN".to_string(), "DB_URL".to_string()]);
+    }
+
+    #[test]
+    fn test_build_gh_secret_set_args_excludes_secret_value() {
+        let args = build_gh_secret_set_args("owner/repo", "API_TOKEN");
+        assert_eq!(
+            args,
+            vec![
+                "secret".to_string(),
+                "set".to_string(),
+                "API_TOKEN".to_string(),
+                "--repo".to_string(),
+                "owner/repo".to_string(),
+            ]
+        );
+        assert!(!args.contains(&"super-secret-value".to_string()));
     }
 
     #[test]
