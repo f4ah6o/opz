@@ -19,7 +19,11 @@ fn run_checked(cmd: &mut Command, context: &str) -> String {
 }
 
 fn ensure_exists(path: &Path, context: &str) {
-    assert!(path.exists(), "{context}: {} does not exist", path.display());
+    assert!(
+        path.exists(),
+        "{context}: {} does not exist",
+        path.display()
+    );
 }
 
 #[test]
@@ -115,7 +119,10 @@ fn e2e_real_op_create_run_shorthand_gen_delete() {
 
     eprintln!("[e2e] step5: delete item '{item_title}'");
     run_checked(
-        Command::new("op").arg("item").arg("delete").arg(&item_title),
+        Command::new("op")
+            .arg("item")
+            .arg("delete")
+            .arg(&item_title),
         "step5 op item delete",
     );
     eprintln!("[e2e] done");

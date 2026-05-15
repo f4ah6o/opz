@@ -155,7 +155,7 @@ Behavior:
 * If `[ENV]` is exactly `.env`:
   * Creates an item in category `API Credential`
   * Uses `<ITEM>` as title
-  * Adds each `KEY=VALUE` as a custom text field `KEY[text]=VALUE`
+  * Adds each `KEY=VALUE` as a custom text field named `KEY`
   * Supports `export KEY=...`, inline comments (`KEY=value # note`), and keeps `#` inside quotes
   * For duplicate keys, the last entry wins
 * If `[ENV]` is anything other than `.env`:

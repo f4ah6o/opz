@@ -128,8 +128,10 @@ fn secret_key_value_regex() -> &'static Regex {
 fn auth_header_regex() -> &'static Regex {
     static AUTH_HEADER_REGEX: OnceLock<Regex> = OnceLock::new();
     AUTH_HEADER_REGEX.get_or_init(|| {
-        Regex::new(r"(?i)((?:^|\s)Authorization:\s*(?:Bearer|Token|Basic|Digest|AWS4-HMAC-SHA256)\s+)\S+")
-            .expect("valid auth header regex")
+        Regex::new(
+            r"(?i)((?:^|\s)Authorization:\s*(?:Bearer|Token|Basic|Digest|AWS4-HMAC-SHA256)\s+)\S+",
+        )
+        .expect("valid auth header regex")
     })
 }
 

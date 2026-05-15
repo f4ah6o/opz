@@ -143,6 +143,24 @@ struct ItemField {
     value: Option<serde_json::Value>,
 }
 
+#[derive(Serialize, Debug)]
+struct ItemCreateTemplate {
+    title: String,
+    category: String,
+    fields: Vec<ItemCreateField>,
+}
+
+#[derive(Serialize, Debug)]
+struct ItemCreateField {
+    id: String,
+    #[serde(rename = "type")]
+    field_type: String,
+    label: String,
+    value: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    purpose: Option<String>,
+}
+
 static OPZ_SKILL: &str = include_str!("../.agents/skills/opz/SKILL.md");
 
 fn main() -> Result<()> {
@@ -561,41 +579,51 @@ fn create_api_credential_item_from_env(cli: &Cli, item_title: &str, env_file: &P
         ));
     }
 
-    let args = telemetry_span::with_span("main_operation", vec![], || {
-        build_create_item_args(cli.vault.as_deref(), item_title, &env_pairs)
+    let (args, template) = telemetry_span::with_span("main_operation", vec![], || {
+        (
+            build_create_item_args(cli.vault.as_deref()),
+            build_api_credential_template(item_title, &env_pairs),
+        )
     });
     telemetry_span::with_span_result("write_outputs", vec![], || {
-        run_op_item_create(&args)?;
+        run_op_item_create(&args, &template)?;
         invalidate_item_list_cache_best_effort();
         Ok(())
     })
 }
 
-fn build_create_item_args(
-    vault: Option<&str>,
-    item_title: &str,
-    env_pairs: &[(String, String)],
-) -> Vec<String> {
-    let mut args = vec![
-        "item".to_string(),
-        "create".to_string(),
-        "--category".to_string(),
-        "API Credential".to_string(),
-        "--title".to_string(),
-        item_title.to_string(),
-    ];
+fn build_create_item_args(vault: Option<&str>) -> Vec<String> {
+    let mut args = vec!["item".to_string(), "create".to_string()];
 
     if let Some(v) = vault {
         args.push("--vault".to_string());
         args.push(v.to_string());
     }
 
-    // key[text]=value creates a custom text field where the field label is the key.
+    args.push("-".to_string());
+    args
+}
+
+fn build_api_credential_template(
+    item_title: &str,
+    env_pairs: &[(String, String)],
+) -> ItemCreateTemplate {
+    let mut fields = Vec::with_capacity(env_pairs.len());
     for (key, value) in env_pairs {
-        args.push(format!("{}[text]={}", key, value));
+        fields.push(ItemCreateField {
+            id: key.clone(),
+            field_type: "STRING".to_string(),
+            label: key.clone(),
+            value: value.clone(),
+            purpose: None,
+        });
     }
 
-    args
+    ItemCreateTemplate {
+        title: item_title.to_string(),
+        category: "API_CREDENTIAL".to_string(),
+        fields,
+    }
 }
 
 fn create_secure_notes_from_file(cli: &Cli, file_path: &Path) -> Result<()> {
@@ -624,8 +652,9 @@ fn create_secure_notes_from_file(cli: &Cli, file_path: &Path) -> Result<()> {
 
     telemetry_span::with_span_result("write_outputs", vec![], || {
         for item_title in item_titles {
-            let args = build_create_secure_note_args(cli.vault.as_deref(), &item_title, &body);
-            run_op_item_create(&args)?;
+            let args = build_create_item_args(cli.vault.as_deref());
+            let template = build_secure_note_template(&item_title, &body);
+            run_op_item_create(&args, &template)?;
         }
         invalidate_item_list_cache_best_effort();
         Ok(())
@@ -642,26 +671,21 @@ fn build_secure_note_body(file_name: &str, content: &str) -> String {
     body
 }
 
-fn build_create_secure_note_args(vault: Option<&str>, item_title: &str, body: &str) -> Vec<String> {
-    let mut args = vec![
-        "item".to_string(),
-        "create".to_string(),
-        "--category".to_string(),
-        "Secure Note".to_string(),
-        "--title".to_string(),
-        item_title.to_string(),
-    ];
-
-    if let Some(v) = vault {
-        args.push("--vault".to_string());
-        args.push(v.to_string());
+fn build_secure_note_template(item_title: &str, body: &str) -> ItemCreateTemplate {
+    ItemCreateTemplate {
+        title: item_title.to_string(),
+        category: "SECURE_NOTE".to_string(),
+        fields: vec![ItemCreateField {
+            id: "notesPlain".to_string(),
+            field_type: "STRING".to_string(),
+            label: "notesPlain".to_string(),
+            value: body.to_string(),
+            purpose: Some("NOTES".to_string()),
+        }],
     }
-
-    args.push(format!("notesPlain={}", body));
-    args
 }
 
-fn run_op_item_create(args: &[String]) -> Result<()> {
+fn run_op_item_create(args: &[String], template: &ItemCreateTemplate) -> Result<()> {
     telemetry_span::with_span_result(
         "write_outputs.op_item_create",
         vec![KeyValue::new("op.arg_count", args.len() as i64)],
@@ -669,13 +693,25 @@ fn run_op_item_create(args: &[String]) -> Result<()> {
             let mut cmd = Command::new("op");
             cmd.args(args);
 
-            let status = cmd
-                .stdin(Stdio::inherit())
+            let mut child = cmd
+                .stdin(Stdio::piped())
                 .stdout(Stdio::inherit())
                 .stderr(Stdio::inherit())
-                .status()
+                .spawn()
                 .context("failed to run `op item create`")?;
 
+            {
+                let mut stdin = child
+                    .stdin
+                    .take()
+                    .ok_or_else(|| anyhow!("failed to open stdin for `op item create`"))?;
+                serde_json::to_writer(&mut stdin, template)
+                    .context("failed to write `op item create` template to stdin")?;
+            }
+
+            let status = child
+                .wait()
+                .context("failed to wait for `op item create`")?;
             if !status.success() {
                 return Err(anyhow!("op item create failed with status: {}", status));
             }
@@ -1305,10 +1341,7 @@ fn parse_env_line_kv(line: &str) -> Option<(&str, &str)> {
     if trimmed.is_empty() || trimmed.starts_with('#') {
         return None;
     }
-    let mut parts = trimmed.splitn(2, '=');
-    let key = parts.next()?;
-    let value = parts.next()?;
-    Some((key, value))
+    trimmed.split_once('=')
 }
 
 /// Read a secret from 1Password using op read
@@ -2046,24 +2079,26 @@ SINGLE='value # kept'
     }
 
     #[test]
-    fn test_build_create_item_args_uses_api_credential_category_and_text_fields() {
+    fn test_build_create_item_uses_stdin_template_without_secret_args() {
         let env_pairs = vec![
             ("API_KEY".to_string(), "secret".to_string()),
             ("DB_HOST".to_string(), "localhost".to_string()),
         ];
 
-        let args = build_create_item_args(Some("Private"), "my-item", &env_pairs);
+        let args = build_create_item_args(Some("Private"));
+        let template = build_api_credential_template("my-item", &env_pairs);
 
-        assert_eq!(args[0], "item");
-        assert_eq!(args[1], "create");
-        assert!(args.contains(&"--category".to_string()));
-        assert!(args.contains(&"API Credential".to_string()));
-        assert!(args.contains(&"--title".to_string()));
-        assert!(args.contains(&"my-item".to_string()));
-        assert!(args.contains(&"--vault".to_string()));
-        assert!(args.contains(&"Private".to_string()));
-        assert!(args.contains(&"API_KEY[text]=secret".to_string()));
-        assert!(args.contains(&"DB_HOST[text]=localhost".to_string()));
+        assert_eq!(args, vec!["item", "create", "--vault", "Private", "-"]);
+        assert!(!args.iter().any(|arg| arg.contains("secret")));
+        assert_eq!(template.title, "my-item");
+        assert_eq!(template.category, "API_CREDENTIAL");
+        assert_eq!(template.fields.len(), 2);
+        assert_eq!(template.fields[0].id, "API_KEY");
+        assert_eq!(template.fields[0].label, "API_KEY");
+        assert_eq!(template.fields[0].field_type, "STRING");
+        assert_eq!(template.fields[0].value, "secret");
+        assert_eq!(template.fields[1].id, "DB_HOST");
+        assert_eq!(template.fields[1].value, "localhost");
     }
 
     #[test]
@@ -2118,18 +2153,19 @@ SINGLE='value # kept'
     }
 
     #[test]
-    fn test_build_create_secure_note_args() {
-        let args = build_create_secure_note_args(Some("Private"), "f4ah6o/opz", "```a\nb\n```");
+    fn test_build_secure_note_uses_stdin_template_without_body_args() {
+        let args = build_create_item_args(Some("Private"));
+        let template = build_secure_note_template("f4ah6o/opz", "```a\nb\n```");
 
-        assert_eq!(args[0], "item");
-        assert_eq!(args[1], "create");
-        assert!(args.contains(&"--category".to_string()));
-        assert!(args.contains(&"Secure Note".to_string()));
-        assert!(args.contains(&"--title".to_string()));
-        assert!(args.contains(&"f4ah6o/opz".to_string()));
-        assert!(args.contains(&"--vault".to_string()));
-        assert!(args.contains(&"Private".to_string()));
-        assert!(args.contains(&"notesPlain=```a\nb\n```".to_string()));
+        assert_eq!(args, vec!["item", "create", "--vault", "Private", "-"]);
+        assert!(!args.iter().any(|arg| arg.contains("```a")));
+        assert_eq!(template.title, "f4ah6o/opz");
+        assert_eq!(template.category, "SECURE_NOTE");
+        assert_eq!(template.fields.len(), 1);
+        assert_eq!(template.fields[0].id, "notesPlain");
+        assert_eq!(template.fields[0].label, "notesPlain");
+        assert_eq!(template.fields[0].purpose.as_deref(), Some("NOTES"));
+        assert_eq!(template.fields[0].value, "```a\nb\n```");
     }
 
     // ============================================
