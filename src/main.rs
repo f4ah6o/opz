@@ -1765,13 +1765,14 @@ fn run_op_item_create(args: &[String], template: &ItemCreateTemplate) -> Result<
         "write_outputs.op_item_create",
         vec![KeyValue::new("op.arg_count", args.len() as i64)],
         || {
+            let sensitive_fields = collect_create_stdout_sensitive_fields(template);
             let mut cmd = Command::new("op");
             cmd.args(args);
 
             let mut child = cmd
                 .stdin(Stdio::piped())
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
                 .spawn()
                 .context("failed to run `op item create`")?;
 
@@ -1784,16 +1785,71 @@ fn run_op_item_create(args: &[String], template: &ItemCreateTemplate) -> Result<
                     .context("failed to write `op item create` template to stdin")?;
             }
 
-            let status = child
-                .wait()
+            let output = child
+                .wait_with_output()
                 .context("failed to wait for `op item create`")?;
-            if !status.success() {
-                return Err(anyhow!("op item create failed with status: {}", status));
+
+            std::io::stderr()
+                .write_all(&output.stderr)
+                .context("failed to write `op item create` stderr")?;
+
+            if !output.status.success() {
+                std::io::stdout()
+                    .write_all(&output.stdout)
+                    .context("failed to write `op item create` stdout")?;
+                return Err(anyhow!(
+                    "op item create failed with status: {}",
+                    output.status
+                ));
             }
+
+            let masked_stdout =
+                mask_create_stdout(&String::from_utf8_lossy(&output.stdout), &sensitive_fields);
+            std::io::stdout()
+                .write_all(masked_stdout.as_bytes())
+                .context("failed to write masked `op item create` stdout")?;
 
             Ok(())
         },
     )
+}
+
+fn collect_create_stdout_sensitive_fields(template: &ItemCreateTemplate) -> Vec<(String, String)> {
+    let mut fields = Vec::new();
+    for field in &template.fields {
+        if field.value.is_empty() {
+            continue;
+        }
+        fields.push((field.label.clone(), field.value.clone()));
+        if field.id != field.label {
+            fields.push((field.id.clone(), field.value.clone()));
+        }
+    }
+
+    fields.sort_by(|(_, left), (_, right)| right.len().cmp(&left.len()));
+    fields.dedup();
+    fields
+}
+
+fn mask_create_stdout(stdout: &str, sensitive_fields: &[(String, String)]) -> String {
+    let mut masked = stdout.to_string();
+    for (field_name, value) in sensitive_fields {
+        let pattern = format!(
+            "{}(^\\s*{}(?:\\s*\\[[^\\]]+\\])?\\s*[:=]\\s*){}(\\s*$)",
+            if value.contains('\n') {
+                "(?ms)"
+            } else {
+                "(?m)"
+            },
+            regex::escape(field_name),
+            regex::escape(value)
+        );
+        let Ok(regex) = Regex::new(&pattern) else {
+            continue;
+        };
+        masked = regex.replace_all(&masked, "$1***$2").into_owned();
+    }
+    masked
 }
 
 fn list_remote_repo_names() -> Result<Vec<String>> {
@@ -3634,6 +3690,72 @@ SINGLE='value # kept'
             .unwrap();
         assert_eq!(metadata.value, "owner/repo\nother/service");
         assert_eq!(metadata.field_type, "STRING");
+    }
+
+    #[test]
+    fn test_collect_create_stdout_sensitive_fields_from_template() {
+        let template = ItemCreateTemplate {
+            title: "my-item".to_string(),
+            category: "API_CREDENTIAL".to_string(),
+            fields: vec![
+                ItemCreateField {
+                    id: "api_key".to_string(),
+                    field_type: "STRING".to_string(),
+                    label: "API_KEY".to_string(),
+                    value: "secret".to_string(),
+                    purpose: None,
+                },
+                ItemCreateField {
+                    id: "EMPTY".to_string(),
+                    field_type: "STRING".to_string(),
+                    label: "EMPTY".to_string(),
+                    value: String::new(),
+                    purpose: None,
+                },
+            ],
+        };
+
+        assert_eq!(
+            collect_create_stdout_sensitive_fields(&template),
+            vec![
+                ("API_KEY".to_string(), "secret".to_string()),
+                ("api_key".to_string(), "secret".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_mask_create_stdout_masks_only_field_values() {
+        let template = build_api_credential_template(
+            "my-item",
+            &[
+                ("API_KEY".to_string(), "secret".to_string()),
+                ("DB_HOST".to_string(), "localhost".to_string()),
+            ],
+            &[],
+        );
+
+        let masked = mask_create_stdout(
+            "ID: abc123\nTitle: my-secret-item\nAPI_KEY: secret\nDB_HOST: localhost\n",
+            &collect_create_stdout_sensitive_fields(&template),
+        );
+
+        assert_eq!(
+            masked,
+            "ID: abc123\nTitle: my-secret-item\nAPI_KEY: ***\nDB_HOST: ***\n"
+        );
+    }
+
+    #[test]
+    fn test_mask_create_stdout_masks_multiline_notes_field() {
+        let template = build_secure_note_template("f4ah6o/opz", "```app.conf\nTOKEN=abc\n```");
+
+        let masked = mask_create_stdout(
+            "ID: abc123\nnotesPlain: ```app.conf\nTOKEN=abc\n```\nTitle: f4ah6o/opz\n",
+            &collect_create_stdout_sensitive_fields(&template),
+        );
+
+        assert_eq!(masked, "ID: abc123\nnotesPlain: ***\nTitle: f4ah6o/opz\n");
     }
 
     #[test]
