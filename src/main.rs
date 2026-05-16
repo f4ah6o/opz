@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
+    env,
     ffi::OsString,
     fs,
     io::Write,
@@ -46,6 +47,9 @@ struct Cli {
 enum Cmd {
     /// Find items by keyword (title contains)
     Find { query: String },
+
+    /// Check 1Password CLI status and external command dependencies
+    Doctor,
 
     /// Print bundled Agent Skills SKILL.md for opz
     Skills,
@@ -113,6 +117,29 @@ enum Cmd {
         #[arg(value_name = "ITEM", num_args = 1..)]
         items: Vec<String>,
     },
+
+    /// Store valid fields from 1Password items as Cloudflare Worker secrets
+    CloudflareSecret {
+        /// Worker name passed to wrangler --name
+        #[arg(long, value_name = "WORKER")]
+        name: Option<String>,
+
+        /// Wrangler environment passed to wrangler --env
+        #[arg(long, value_name = "ENV")]
+        env: Option<String>,
+
+        /// Wrangler config path passed to wrangler --config
+        #[arg(long, value_name = "PATH")]
+        config: Option<PathBuf>,
+
+        /// Print target secret names without storing values
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Item titles
+        #[arg(value_name = "ITEM", num_args = 1..)]
+        items: Vec<String>,
+    },
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -163,6 +190,17 @@ struct ItemCreateField {
 
 static OPZ_SKILL: &str = include_str!("../.agents/skills/opz/SKILL.md");
 
+#[derive(Debug)]
+struct DoctorFailure;
+
+impl std::fmt::Display for DoctorFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("doctor found required failures")
+    }
+}
+
+impl std::error::Error for DoctorFailure {}
+
 fn main() -> Result<()> {
     if std::env::var_os("OTEL_EXPORTER_OTLP_ENDPOINT").is_some() {
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -202,6 +240,9 @@ fn run_main() -> Result<()> {
             if let Some(clap_err) = err.downcast_ref::<clap::Error>() {
                 let _ = clap_err.print();
                 std::process::exit(clap_err.exit_code());
+            }
+            if err.downcast_ref::<DoctorFailure>().is_some() {
+                std::process::exit(1);
             }
             Err(err)
         }
@@ -247,6 +288,7 @@ fn run_cli(args: &[OsString]) -> Result<()> {
             });
             Ok(())
         }
+        Some(Cmd::Doctor) => run_doctor(),
         Some(Cmd::Skills) => print_bundled_skill(),
         Some(Cmd::Show { with_item, items }) => show_item_labels(&cli, items, *with_item),
         Some(Cmd::Gen { items, env_file }) => generate_env_output(&cli, items, env_file.as_deref()),
@@ -271,6 +313,22 @@ fn run_cli(args: &[OsString]) -> Result<()> {
             dry_run,
             items,
         }) => set_github_secrets(&cli, repo.as_deref(), *dry_run, items),
+        Some(Cmd::CloudflareSecret {
+            name,
+            env,
+            config,
+            dry_run,
+            items,
+        }) => set_cloudflare_secrets(
+            &cli,
+            CloudflareSecretTarget {
+                name: name.as_deref(),
+                env: env.as_deref(),
+                config: config.as_deref(),
+            },
+            *dry_run,
+            items,
+        ),
         None => {
             if cli.items.is_empty() {
                 return Err(anyhow!(
@@ -323,12 +381,14 @@ fn detect_command_hint(args: &[OsString]) -> &'static str {
 
         return match arg.as_ref() {
             "find" => "find",
+            "doctor" => "doctor",
             "skills" => "skills",
             "show" => "show",
             "gen" => "gen",
             "create" => "create",
             "run" => "run",
             "github-secret" => "github-secret",
+            "cloudflare-secret" => "cloudflare-secret",
             _ => "run",
         };
     }
@@ -342,6 +402,295 @@ fn print_bundled_skill() -> Result<()> {
         print!("{OPZ_SKILL}");
     });
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DoctorStatus {
+    Ok,
+    Warn,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DoctorCheck {
+    status: DoctorStatus,
+    name: String,
+    message: String,
+    required: bool,
+}
+
+impl DoctorCheck {
+    fn ok(name: impl Into<String>, message: impl Into<String>, required: bool) -> Self {
+        Self {
+            status: DoctorStatus::Ok,
+            name: name.into(),
+            message: message.into(),
+            required,
+        }
+    }
+
+    fn warn(name: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            status: DoctorStatus::Warn,
+            name: name.into(),
+            message: message.into(),
+            required: false,
+        }
+    }
+
+    fn error(name: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            status: DoctorStatus::Error,
+            name: name.into(),
+            message: message.into(),
+            required: true,
+        }
+    }
+}
+
+fn run_doctor() -> Result<()> {
+    let checks = telemetry_span::with_span("main_operation", vec![], collect_doctor_checks);
+    let rendered = render_doctor_checks(&checks);
+    telemetry_span::with_span("write_outputs", vec![], || {
+        print!("{rendered}");
+    });
+
+    if doctor_has_required_failure(&checks) {
+        return Err(anyhow!(DoctorFailure));
+    }
+    Ok(())
+}
+
+fn collect_doctor_checks() -> Vec<DoctorCheck> {
+    let mut checks = Vec::new();
+
+    match check_required_cli_version("op", &["--version"]) {
+        Ok(check) => checks.push(check),
+        Err(check) => {
+            checks.push(check);
+            checks.push(DoctorCheck::error(
+                "op auth",
+                "skipped because op is not available",
+            ));
+            checks.push(optional_cli_check(
+                "gh",
+                &["--version"],
+                "needed by github-secret",
+            ));
+            checks.push(optional_cli_check(
+                "wrangler",
+                &["--version"],
+                "needed by cloudflare-secret",
+            ));
+            checks.push(optional_cli_check(
+                "git",
+                &["--version"],
+                "needed by create",
+            ));
+            checks.push(optional_cli_check("sh", &["--version"], "needed by run"));
+            return checks;
+        }
+    }
+
+    checks.push(check_op_auth());
+    checks.push(check_op_accounts());
+    checks.push(optional_cli_check(
+        "gh",
+        &["--version"],
+        "needed by github-secret",
+    ));
+    checks.push(optional_cli_check(
+        "wrangler",
+        &["--version"],
+        "needed by cloudflare-secret",
+    ));
+    checks.push(optional_cli_check(
+        "git",
+        &["--version"],
+        "needed by create",
+    ));
+    checks.push(optional_cli_check("sh", &["--version"], "needed by run"));
+
+    checks
+}
+
+fn check_required_cli_version(
+    command: &str,
+    args: &[&str],
+) -> std::result::Result<DoctorCheck, DoctorCheck> {
+    let Some(path) = find_command_path(command) else {
+        return Err(DoctorCheck::error(command, "not found in PATH"));
+    };
+
+    match command_stdout(command, args) {
+        Ok(stdout) => Ok(DoctorCheck::ok(
+            command,
+            format!("{} ({})", path.display(), first_output_line(&stdout)),
+            true,
+        )),
+        Err(err) => Err(DoctorCheck::error(command, err)),
+    }
+}
+
+fn check_op_auth() -> DoctorCheck {
+    match command_stdout("op", &["whoami", "--format", "json"]) {
+        Ok(stdout) => {
+            let summary = summarize_op_whoami(&stdout).unwrap_or_else(|| "signed in".to_string());
+            DoctorCheck::ok("op auth", summary, true)
+        }
+        Err(err) => DoctorCheck::error("op auth", err),
+    }
+}
+
+fn check_op_accounts() -> DoctorCheck {
+    match command_stdout("op", &["account", "list", "--format", "json"]) {
+        Ok(stdout) => {
+            let count = serde_json::from_str::<serde_json::Value>(&stdout)
+                .ok()
+                .and_then(|value| value.as_array().map(Vec::len));
+            let message = match count {
+                Some(1) => "1 configured account".to_string(),
+                Some(n) => format!("{n} configured accounts"),
+                None => "account list available".to_string(),
+            };
+            DoctorCheck::ok("op accounts", message, false)
+        }
+        Err(err) => DoctorCheck::warn("op accounts", err),
+    }
+}
+
+fn optional_cli_check(command: &str, args: &[&str], note: &str) -> DoctorCheck {
+    let Some(path) = find_command_path(command) else {
+        return DoctorCheck::warn(command, format!("not found in PATH ({note})"));
+    };
+
+    match command_stdout(command, args) {
+        Ok(stdout) => DoctorCheck::ok(
+            command,
+            format!("{} ({})", path.display(), first_output_line(&stdout)),
+            false,
+        ),
+        Err(err) => DoctorCheck::warn(command, format!("{err} ({note})")),
+    }
+}
+
+fn command_stdout(command: &str, args: &[&str]) -> std::result::Result<String, String> {
+    let out = Command::new(command).args(args).output().map_err(|err| {
+        format!(
+            "failed to run `{}`: {err}",
+            command_with_args(command, args)
+        )
+    })?;
+
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let detail = if stderr.is_empty() {
+            format!("exit status {}", out.status)
+        } else {
+            stderr
+        };
+        return Err(format!(
+            "`{}` failed: {detail}",
+            command_with_args(command, args)
+        ));
+    }
+
+    String::from_utf8(out.stdout).map_err(|err| {
+        format!(
+            "`{}` output was not valid UTF-8: {err}",
+            command_with_args(command, args)
+        )
+    })
+}
+
+fn command_with_args(command: &str, args: &[&str]) -> String {
+    let mut parts = Vec::with_capacity(args.len() + 1);
+    parts.push(command.to_string());
+    parts.extend(args.iter().map(|arg| arg.to_string()));
+    parts.join(" ")
+}
+
+fn first_output_line(output: &str) -> String {
+    output
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| line.trim().to_string())
+        .unwrap_or_else(|| "no version output".to_string())
+}
+
+fn summarize_op_whoami(stdout: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(stdout).ok()?;
+    let email = value
+        .get("email")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| value.get("user_email").and_then(serde_json::Value::as_str));
+    let account = value
+        .get("account_uuid")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| value.get("account").and_then(serde_json::Value::as_str))
+        .or_else(|| value.get("url").and_then(serde_json::Value::as_str));
+
+    match (email, account) {
+        (Some(email), Some(account)) => Some(format!("{email} ({account})")),
+        (Some(email), None) => Some(email.to_string()),
+        (None, Some(account)) => Some(account.to_string()),
+        (None, None) => Some("signed in".to_string()),
+    }
+}
+
+fn find_command_path(command: &str) -> Option<PathBuf> {
+    let command_path = Path::new(command);
+    if command_path.components().count() > 1 {
+        return is_executable_file(command_path).then(|| command_path.to_path_buf());
+    }
+
+    let path_var = env::var_os("PATH")?;
+    for dir in env::split_paths(&path_var) {
+        let candidate = dir.join(command);
+        if is_executable_file(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(meta) = fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn render_doctor_checks(checks: &[DoctorCheck]) -> String {
+    let mut out = String::new();
+    for check in checks {
+        let status = match check.status {
+            DoctorStatus::Ok => "ok",
+            DoctorStatus::Warn => "warn",
+            DoctorStatus::Error => "error",
+        };
+        out.push_str(&format!("{status:<5} {}: {}\n", check.name, check.message));
+    }
+    out
+}
+
+fn doctor_has_required_failure(checks: &[DoctorCheck]) -> bool {
+    checks
+        .iter()
+        .any(|check| check.required && check.status == DoctorStatus::Error)
 }
 
 fn collect_item_env_sections(cli: &Cli, items: &[String]) -> Result<Vec<(String, Vec<String>)>> {
@@ -1054,26 +1403,112 @@ fn set_github_secrets(
     )
 }
 
+#[derive(Clone, Copy)]
+struct CloudflareSecretTarget<'a> {
+    name: Option<&'a str>,
+    env: Option<&'a str>,
+    config: Option<&'a Path>,
+}
+
+fn set_cloudflare_secrets(
+    cli: &Cli,
+    target: CloudflareSecretTarget<'_>,
+    dry_run: bool,
+    items: &[String],
+) -> Result<()> {
+    let sections = telemetry_span::with_span_result(
+        "load_inputs",
+        vec![KeyValue::new("item.count", items.len() as i64)],
+        || collect_item_env_sections(cli, items),
+    )?;
+    let merged_env_lines =
+        telemetry_span::with_span("main_operation", vec![], || merge_env_lines(&sections));
+    let secret_names = validate_cloudflare_secret_lines(&merged_env_lines)?;
+    if secret_names.is_empty() {
+        return Err(anyhow!("No valid Cloudflare secret fields found"));
+    }
+
+    let target_label = cloudflare_target_label(target);
+    if dry_run {
+        return telemetry_span::with_span("write_outputs", vec![], || {
+            for name in secret_names {
+                println!("Would set Cloudflare Worker secret {name} in {target_label}");
+            }
+            Ok(())
+        });
+    }
+
+    let env_vars = telemetry_span::with_span_result("load_inputs", vec![], || {
+        resolve_env_vars(&merged_env_lines)
+    })?;
+    let payload = build_secret_json_payload(&secret_names, &env_vars)?;
+
+    telemetry_span::with_span_result(
+        "write_outputs.cloudflare_secret_bulk",
+        vec![
+            KeyValue::new("cloudflare.target", target_label),
+            KeyValue::new("cloudflare.secret_count", secret_names.len() as i64),
+        ],
+        || {
+            run_wrangler_secret_bulk(target, payload.as_bytes())?;
+            for name in secret_names {
+                println!("Set Cloudflare Worker secret {name}");
+            }
+            Ok(())
+        },
+    )
+}
+
+fn cloudflare_target_label(target: CloudflareSecretTarget<'_>) -> String {
+    let worker = target.name.unwrap_or("wrangler config default worker");
+    match target.env {
+        Some(env) => format!("{worker} ({env})"),
+        None => worker.to_string(),
+    }
+}
+
+fn validate_cloudflare_secret_lines(env_lines: &[String]) -> Result<Vec<String>> {
+    validate_secret_lines(env_lines, "Cloudflare")
+}
+
 fn validate_github_secret_lines(env_lines: &[String]) -> Result<Vec<String>> {
+    let names = validate_secret_lines(env_lines, "GitHub")?;
+    for name in &names {
+        if name.to_ascii_uppercase().starts_with("GITHUB_") {
+            return Err(anyhow!(
+                "GitHub secret name cannot start with reserved prefix GITHUB_: {name}"
+            ));
+        }
+    }
+    Ok(names)
+}
+
+fn validate_secret_lines(env_lines: &[String], target_name: &str) -> Result<Vec<String>> {
     env_lines
         .iter()
         .filter_map(|line| parse_env_key(line).map(str::to_string))
         .map(|name| {
-            validate_github_secret_name(&name)?;
+            validate_secret_name(&name, target_name)?;
             Ok(name)
         })
         .collect()
 }
 
+#[cfg(test)]
 fn validate_github_secret_name(name: &str) -> Result<()> {
-    let re = Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*$")?;
-    if !re.is_match(name) {
-        return Err(anyhow!("Invalid GitHub secret name: {name}"));
-    }
+    validate_secret_name(name, "GitHub")?;
     if name.to_ascii_uppercase().starts_with("GITHUB_") {
         return Err(anyhow!(
             "GitHub secret name cannot start with reserved prefix GITHUB_: {name}"
         ));
+    }
+    Ok(())
+}
+
+fn validate_secret_name(name: &str, target_name: &str) -> Result<()> {
+    let re = Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*$")?;
+    if !re.is_match(name) {
+        return Err(anyhow!("Invalid {target_name} secret name: {name}"));
     }
     Ok(())
 }
@@ -1086,6 +1521,39 @@ fn build_gh_secret_set_args(repo: &str, name: &str) -> Vec<String> {
         "--repo".to_string(),
         repo.to_string(),
     ]
+}
+
+fn build_wrangler_secret_bulk_args(target: CloudflareSecretTarget<'_>) -> Vec<String> {
+    let mut args = vec!["secret".to_string(), "bulk".to_string()];
+
+    if let Some(name) = target.name {
+        args.push("--name".to_string());
+        args.push(name.to_string());
+    }
+    if let Some(env) = target.env {
+        args.push("--env".to_string());
+        args.push(env.to_string());
+    }
+    if let Some(config) = target.config {
+        args.push("--config".to_string());
+        args.push(config.display().to_string());
+    }
+
+    args
+}
+
+fn build_secret_json_payload(
+    secret_names: &[String],
+    env_vars: &HashMap<String, String>,
+) -> Result<String> {
+    let mut secrets = serde_json::Map::with_capacity(secret_names.len());
+    for name in secret_names {
+        let value = env_vars
+            .get(name)
+            .ok_or_else(|| anyhow!("resolved value missing for secret {name}"))?;
+        secrets.insert(name.clone(), serde_json::Value::String(value.clone()));
+    }
+    serde_json::to_string(&secrets).context("failed to encode Wrangler secret payload")
 }
 
 fn resolve_current_github_repo() -> Result<String> {
@@ -1141,6 +1609,38 @@ fn run_gh_secret_set(repo: &str, name: &str, value: &str) -> Result<()> {
     let status = child.wait().context("failed to wait for `gh secret set`")?;
     if !status.success() {
         return Err(anyhow!("gh secret set failed with status: {}", status));
+    }
+    Ok(())
+}
+
+fn run_wrangler_secret_bulk(target: CloudflareSecretTarget<'_>, payload: &[u8]) -> Result<()> {
+    let args = build_wrangler_secret_bulk_args(target);
+    let mut child = Command::new("wrangler")
+        .args(&args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .context("failed to run `wrangler secret bulk`")?;
+
+    {
+        let stdin = child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| anyhow!("failed to open stdin for `wrangler secret bulk`"))?;
+        stdin
+            .write_all(payload)
+            .context("failed to write Cloudflare secret payload to stdin")?;
+    }
+
+    let status = child
+        .wait()
+        .context("failed to wait for `wrangler secret bulk`")?;
+    if !status.success() {
+        return Err(anyhow!(
+            "wrangler secret bulk failed with status: {}",
+            status
+        ));
     }
     Ok(())
 }
@@ -1286,27 +1786,32 @@ fn run_with_items(
 }
 
 fn item_to_env_lines(item: &ItemGet, vault_id: &str, item_id: &str) -> Result<Vec<String>> {
-    let re = Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*$")?;
+    let labels = collect_item_labels(item)?;
     let mut out = Vec::new();
 
-    for f in &item.fields {
-        let Some(label) = f.label.as_ref() else {
-            continue;
-        };
-        if !re.is_match(label) {
-            // env var invalid -> skip
-            continue;
-        }
-        // Skip fields without value
-        if f.value.is_none() {
-            continue;
-        }
-
+    for label in labels {
         let reference = format!("op://{}/{}/{}", vault_id, item_id, label);
         out.push(format!("{k}={v}", k = label, v = reference));
     }
 
     Ok(out)
+}
+
+fn collect_item_labels(item: &ItemGet) -> Result<Vec<String>> {
+    let re = Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*$")?;
+    let mut labels = Vec::new();
+
+    for f in &item.fields {
+        let Some(label) = f.label.as_ref() else {
+            continue;
+        };
+        if !re.is_match(label) || f.value.is_none() {
+            continue;
+        }
+        labels.push(label.clone());
+    }
+
+    Ok(labels)
 }
 
 fn item_to_valid_labels(item: &ItemGet) -> Result<Vec<String>> {
@@ -1604,6 +2109,20 @@ mod tests {
 
     fn valid_labels(item: &ItemGet) -> Vec<String> {
         item_to_valid_labels(item).unwrap()
+    }
+
+    #[test]
+    fn test_collect_item_labels_matches_env_key_rules() {
+        let item = make_item(vec![
+            make_field(Some("API_KEY"), true),
+            make_field(Some("invalid-key"), true),
+            make_field(Some("NO_VALUE"), false),
+            make_field(None, true),
+            make_field(Some("DB_HOST"), true),
+        ]);
+
+        let labels = collect_item_labels(&item).unwrap();
+        assert_eq!(labels, vec!["API_KEY".to_string(), "DB_HOST".to_string()]);
     }
 
     #[test]
@@ -2364,6 +2883,56 @@ SINGLE='value # kept'
     }
 
     #[test]
+    fn test_cli_parse_doctor() {
+        let cli = Cli::try_parse_from(["opz", "doctor"]).unwrap();
+        match cli.cmd {
+            Some(Cmd::Doctor) => {}
+            _ => panic!("expected doctor command"),
+        }
+    }
+
+    #[test]
+    fn test_detect_command_hint_doctor() {
+        let args = vec![OsString::from("opz"), OsString::from("doctor")];
+        assert_eq!(detect_command_hint(&args), "doctor");
+    }
+
+    #[test]
+    fn test_render_doctor_checks() {
+        let checks = vec![
+            DoctorCheck::ok("op", "/bin/op (2.0.0)", true),
+            DoctorCheck::warn("gh", "not found in PATH (needed by github-secret)"),
+            DoctorCheck::error("op auth", "`op whoami --format json` failed"),
+        ];
+
+        let rendered = render_doctor_checks(&checks);
+        assert!(rendered.contains("ok    op: /bin/op (2.0.0)\n"));
+        assert!(rendered.contains("warn  gh: not found in PATH (needed by github-secret)\n"));
+        assert!(rendered.contains("error op auth: `op whoami --format json` failed\n"));
+    }
+
+    #[test]
+    fn test_doctor_has_required_failure_only_for_required_errors() {
+        let warnings_only = vec![
+            DoctorCheck::ok("op", "/bin/op (2.0.0)", true),
+            DoctorCheck::warn("gh", "not found in PATH (needed by github-secret)"),
+        ];
+        assert!(!doctor_has_required_failure(&warnings_only));
+
+        let required_error = vec![DoctorCheck::error("op", "not found in PATH")];
+        assert!(doctor_has_required_failure(&required_error));
+    }
+
+    #[test]
+    fn test_summarize_op_whoami_uses_non_secret_metadata() {
+        let summary = summarize_op_whoami(
+            r#"{"email":"user@example.test","account_uuid":"A1","user_uuid":"U1"}"#,
+        )
+        .unwrap();
+        assert_eq!(summary, "user@example.test (A1)");
+    }
+
+    #[test]
     fn test_bundled_skill_has_expected_metadata() {
         let skill_lines: Vec<&str> = OPZ_SKILL.lines().collect();
         assert_eq!(skill_lines.first().copied(), Some("---"));
@@ -2372,11 +2941,13 @@ SINGLE='value # kept'
             .iter()
             .any(|line| line.starts_with("description: ")));
         assert!(OPZ_SKILL.contains("opz find <query>"));
+        assert!(OPZ_SKILL.contains("opz doctor"));
         assert!(OPZ_SKILL.contains("opz show [OPTIONS] <ITEM>..."));
         assert!(OPZ_SKILL.contains("opz gen [OPTIONS] <ITEM>..."));
         assert!(OPZ_SKILL.contains("opz create <ITEM> [ENV]"));
         assert!(OPZ_SKILL.contains("opz run [OPTIONS] <ITEM>... -- <COMMAND>..."));
         assert!(OPZ_SKILL.contains("opz github-secret [OPTIONS] <ITEM>..."));
+        assert!(OPZ_SKILL.contains("opz cloudflare-secret [OPTIONS] <ITEM>..."));
         assert!(OPZ_SKILL.contains("opz skills"));
     }
 
@@ -2472,6 +3043,40 @@ SINGLE='value # kept'
     }
 
     #[test]
+    fn test_cli_parse_cloudflare_secret() {
+        let cli = Cli::try_parse_from([
+            "opz",
+            "cloudflare-secret",
+            "--name",
+            "worker-app",
+            "--env",
+            "production",
+            "--config",
+            "wrangler.jsonc",
+            "--dry-run",
+            "foo",
+            "bar",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Some(Cmd::CloudflareSecret {
+                name,
+                env,
+                config,
+                dry_run,
+                items,
+            }) => {
+                assert_eq!(name.as_deref(), Some("worker-app"));
+                assert_eq!(env.as_deref(), Some("production"));
+                assert_eq!(config.as_deref(), Some(Path::new("wrangler.jsonc")));
+                assert!(dry_run);
+                assert_eq!(items, vec!["foo".to_string(), "bar".to_string()]);
+            }
+            _ => panic!("expected cloudflare-secret command"),
+        }
+    }
+
+    #[test]
     fn test_validate_github_secret_name_rejects_reserved_prefix() {
         validate_github_secret_name("API_TOKEN").unwrap();
         validate_github_secret_name("_TOKEN").unwrap();
@@ -2508,6 +3113,34 @@ SINGLE='value # kept'
     }
 
     #[test]
+    fn test_validate_cloudflare_secret_lines_uses_merged_last_item_wins() {
+        let sections = vec![
+            (
+                "foo".to_string(),
+                vec![
+                    "API_TOKEN=op://vault1/item1/API_TOKEN".to_string(),
+                    "DB_URL=op://vault1/item1/DB_URL".to_string(),
+                ],
+            ),
+            (
+                "bar".to_string(),
+                vec!["API_TOKEN=op://vault2/item2/API_TOKEN".to_string()],
+            ),
+        ];
+
+        let merged = merge_env_lines(&sections);
+        let names = validate_cloudflare_secret_lines(&merged).unwrap();
+        assert_eq!(
+            merged,
+            vec![
+                "API_TOKEN=op://vault2/item2/API_TOKEN".to_string(),
+                "DB_URL=op://vault1/item1/DB_URL".to_string(),
+            ]
+        );
+        assert_eq!(names, vec!["API_TOKEN".to_string(), "DB_URL".to_string()]);
+    }
+
+    #[test]
     fn test_build_gh_secret_set_args_excludes_secret_value() {
         let args = build_gh_secret_set_args("owner/repo", "API_TOKEN");
         assert_eq!(
@@ -2521,6 +3154,44 @@ SINGLE='value # kept'
             ]
         );
         assert!(!args.contains(&"super-secret-value".to_string()));
+    }
+
+    #[test]
+    fn test_build_wrangler_secret_bulk_args_excludes_secret_values() {
+        let args = build_wrangler_secret_bulk_args(CloudflareSecretTarget {
+            name: Some("worker-app"),
+            env: Some("production"),
+            config: Some(Path::new("wrangler.jsonc")),
+        });
+        assert_eq!(
+            args,
+            vec![
+                "secret".to_string(),
+                "bulk".to_string(),
+                "--name".to_string(),
+                "worker-app".to_string(),
+                "--env".to_string(),
+                "production".to_string(),
+                "--config".to_string(),
+                "wrangler.jsonc".to_string(),
+            ]
+        );
+        assert!(!args.contains(&"super-secret-value".to_string()));
+    }
+
+    #[test]
+    fn test_build_secret_json_payload_uses_names_and_values() {
+        let names = vec!["API_TOKEN".to_string(), "DB_URL".to_string()];
+        let mut env_vars = HashMap::new();
+        env_vars.insert("API_TOKEN".to_string(), "secret-token".to_string());
+        env_vars.insert("DB_URL".to_string(), "postgres://example".to_string());
+        env_vars.insert("UNUSED".to_string(), "unused".to_string());
+
+        let payload = build_secret_json_payload(&names, &env_vars).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(value["API_TOKEN"], "secret-token");
+        assert_eq!(value["DB_URL"], "postgres://example");
+        assert!(value.get("UNUSED").is_none());
     }
 
     #[test]
