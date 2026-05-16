@@ -1,13 +1,10 @@
-mod telemetry;
-mod telemetry_span;
+mod instrumentation;
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
-use directories::ProjectDirs;
-use opentelemetry::KeyValue;
+use instrumentation::KeyValue;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     env,
@@ -230,38 +227,27 @@ impl std::fmt::Display for DoctorFailure {
 impl std::error::Error for DoctorFailure {}
 
 fn main() -> Result<()> {
-    if std::env::var_os("OTEL_EXPORTER_OTLP_ENDPOINT").is_some() {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .context("failed to start Tokio runtime for OTLP gRPC exporter")?;
-        return runtime.block_on(async { run_main() });
-    }
-
     run_main()
 }
 
 fn run_main() -> Result<()> {
     let args: Vec<OsString> = std::env::args_os().collect();
     let command_hint = detect_command_hint(&args).to_string();
-    let telemetry = telemetry::init(&command_hint, env!("CARGO_PKG_VERSION"));
 
-    let result = telemetry_span::with_span(
+    let result = instrumentation::with_span(
         &format!("cli.{command_hint}"),
-        telemetry_span::build_cli_trace_attrs(&command_hint, &args),
+        vec![KeyValue::new("cli.command", command_hint)],
         || {
             let result = run_cli(&args);
             if let Err(err) = &result {
                 if !is_clap_display_error(err) {
-                    telemetry_span::record_error_message(&err.to_string());
+                    instrumentation::record_error_message(&err.to_string());
                 }
             }
             result
         },
     );
 
-    telemetry.shutdown_best_effort();
     match result {
         Ok(()) => Ok(()),
         Err(err) => {
@@ -278,27 +264,26 @@ fn run_main() -> Result<()> {
 }
 
 fn run_cli(args: &[OsString]) -> Result<()> {
-    let cli = telemetry_span::with_span("parse_args", vec![], || {
+    let cli = instrumentation::with_span("parse_args", vec![], || {
         let parse_result = Cli::try_parse_from(args);
         if let Err(err) = &parse_result {
             if err.exit_code() != 0 {
-                telemetry_span::record_error_message(&err.to_string());
+                instrumentation::record_error_message(&err.to_string());
             }
         }
         parse_result
     })?;
-    telemetry_span::with_span("load_config", vec![], || {
+    instrumentation::with_span("load_config", vec![], || {
         let _ = std::env::current_dir();
-        let _ = std::env::var_os("OPZ_TRACE_CAPTURE_ARGS");
     });
 
     match &cli.cmd {
         Some(Cmd::Find { query }) => {
-            let items = telemetry_span::with_span_result("load_inputs", vec![], || {
+            let items = instrumentation::with_span_result("load_inputs", vec![], || {
                 item_list_cached(cli.vault.as_deref())
             })?;
             let q = query.to_lowercase();
-            let rows = telemetry_span::with_span("main_operation", vec![], || {
+            let rows = instrumentation::with_span("main_operation", vec![], || {
                 items
                     .into_iter()
                     .filter(|x| x.title.to_lowercase().contains(&q))
@@ -309,7 +294,7 @@ fn run_cli(args: &[OsString]) -> Result<()> {
                     .collect::<Vec<_>>()
             });
 
-            telemetry_span::with_span("write_outputs", vec![], || {
+            instrumentation::with_span("write_outputs", vec![], || {
                 for row in &rows {
                     println!("{row}");
                 }
@@ -441,8 +426,8 @@ fn detect_command_hint(args: &[OsString]) -> &'static str {
 }
 
 fn print_bundled_skill() -> Result<()> {
-    telemetry_span::with_span("main_operation", vec![], || ());
-    telemetry_span::with_span("write_outputs", vec![], || {
+    instrumentation::with_span("main_operation", vec![], || ());
+    instrumentation::with_span("write_outputs", vec![], || {
         print!("{OPZ_SKILL}");
     });
     Ok(())
@@ -493,9 +478,9 @@ impl DoctorCheck {
 }
 
 fn run_doctor() -> Result<()> {
-    let checks = telemetry_span::with_span("main_operation", vec![], collect_doctor_checks);
+    let checks = instrumentation::with_span("main_operation", vec![], collect_doctor_checks);
     let rendered = render_doctor_checks(&checks);
-    telemetry_span::with_span("write_outputs", vec![], || {
+    instrumentation::with_span("write_outputs", vec![], || {
         print!("{rendered}");
     });
 
@@ -1122,17 +1107,18 @@ fn resolve_env_vars(env_lines: &[String]) -> Result<HashMap<String, String>> {
 }
 
 fn resolve_env_vars_batch(references: &[(String, String)]) -> Result<HashMap<String, String>> {
-    telemetry_span::with_span_result(
+    instrumentation::with_span_result(
         "load_inputs.op_run_batch_resolve",
         vec![KeyValue::new(
             "env.reference_count",
             references.len() as i64,
         )],
         || {
-            let mut temp_env = tempfile::NamedTempFile::new().context("create temp env file")?;
+            let mut temp_env = TempEnvFile::create().context("create temp env file")?;
             for (key, reference) in references {
                 writeln!(temp_env, "{key}={reference}")?;
             }
+            temp_env.flush()?;
 
             let out = Command::new("op")
                 .arg("run")
@@ -1202,15 +1188,15 @@ fn sectioned_env_output_string(sections: &[(String, Vec<String>)]) -> String {
 }
 
 fn show_item_labels(cli: &Cli, items: &[String], with_item: bool) -> Result<()> {
-    let sections = telemetry_span::with_span_result(
+    let sections = instrumentation::with_span_result(
         "load_inputs",
         vec![KeyValue::new("item.count", items.len() as i64)],
         || collect_item_label_sections(cli, items),
     )?;
-    let rendered = telemetry_span::with_span("main_operation", vec![], || {
+    let rendered = instrumentation::with_span("main_operation", vec![], || {
         show_output_string(&sections, with_item)
     });
-    telemetry_span::with_span("write_outputs", vec![], || {
+    instrumentation::with_span("write_outputs", vec![], || {
         print!("{rendered}");
     });
     Ok(())
@@ -1243,7 +1229,7 @@ fn show_output_string(sections: &[(String, Vec<String>)], with_item: bool) -> St
 }
 
 fn create_api_credential_item_from_env(cli: &Cli, item_title: &str, env_file: &Path) -> Result<()> {
-    let env_pairs = telemetry_span::with_span_result(
+    let env_pairs = instrumentation::with_span_result(
         "load_inputs",
         vec![KeyValue::new(
             "cli.input_path",
@@ -1259,13 +1245,13 @@ fn create_api_credential_item_from_env(cli: &Cli, item_title: &str, env_file: &P
     }
 
     let github_repositories = list_remote_repo_names().unwrap_or_default();
-    let (args, template) = telemetry_span::with_span("main_operation", vec![], || {
+    let (args, template) = instrumentation::with_span("main_operation", vec![], || {
         (
             build_create_item_args(cli.vault.as_deref()),
             build_api_credential_template(item_title, &env_pairs, &github_repositories),
         )
     });
-    telemetry_span::with_span_result("write_outputs", vec![], || {
+    instrumentation::with_span_result("write_outputs", vec![], || {
         run_op_item_create(&args, &template)?;
         invalidate_item_list_cache_best_effort();
         Ok(())
@@ -1573,7 +1559,7 @@ fn build_api_credential_template(
 }
 
 fn create_secure_notes_from_file(cli: &Cli, file_path: &Path) -> Result<()> {
-    let (file_name, content, remote_repo_names) = telemetry_span::with_span_result(
+    let (file_name, content, remote_repo_names) = instrumentation::with_span_result(
         "load_inputs",
         vec![KeyValue::new(
             "cli.input_path",
@@ -1590,13 +1576,13 @@ fn create_secure_notes_from_file(cli: &Cli, file_path: &Path) -> Result<()> {
             Ok((file_name, content, remote_repo_names))
         },
     )?;
-    let (body, item_titles) = telemetry_span::with_span("main_operation", vec![], || {
+    let (body, item_titles) = instrumentation::with_span("main_operation", vec![], || {
         let body = build_secure_note_body(&file_name, &content);
         let item_titles = dedupe_titles_with_sequence(&remote_repo_names);
         (body, item_titles)
     });
 
-    telemetry_span::with_span_result("write_outputs", vec![], || {
+    instrumentation::with_span_result("write_outputs", vec![], || {
         for item_title in item_titles {
             let args = build_create_item_args(cli.vault.as_deref());
             let template = build_secure_note_template(&item_title, &body);
@@ -1620,7 +1606,7 @@ fn update_github_repositories_metadata(
         ));
     }
 
-    telemetry_span::with_span_result(
+    instrumentation::with_span_result(
         "write_outputs.github_repo_metadata",
         vec![
             KeyValue::new("item.count", items.len() as i64),
@@ -1761,7 +1747,7 @@ fn build_secure_note_template(item_title: &str, body: &str) -> ItemCreateTemplat
 }
 
 fn run_op_item_create(args: &[String], template: &ItemCreateTemplate) -> Result<()> {
-    telemetry_span::with_span_result(
+    instrumentation::with_span_result(
         "write_outputs.op_item_create",
         vec![KeyValue::new("op.arg_count", args.len() as i64)],
         || {
@@ -2091,15 +2077,15 @@ fn resolve_vault_id(
 }
 
 fn generate_env_output(cli: &Cli, items: &[String], env_file: Option<&Path>) -> Result<()> {
-    let sections = telemetry_span::with_span_result(
+    let sections = instrumentation::with_span_result(
         "load_inputs",
         vec![KeyValue::new("item.count", items.len() as i64)],
         || collect_item_env_sections(cli, items),
     )?;
     let merged_env_lines =
-        telemetry_span::with_span("main_operation", vec![], || merge_env_lines(&sections));
+        instrumentation::with_span("main_operation", vec![], || merge_env_lines(&sections));
 
-    telemetry_span::with_span_result(
+    instrumentation::with_span_result(
         "write_outputs",
         vec![
             KeyValue::new(
@@ -2135,20 +2121,20 @@ fn set_github_secrets(
     dry_run: bool,
     items: &[String],
 ) -> Result<()> {
-    let (sections, item_repositories) = telemetry_span::with_span_result(
+    let (sections, item_repositories) = instrumentation::with_span_result(
         "load_inputs",
         vec![KeyValue::new("item.count", items.len() as i64)],
         || collect_item_env_sections_with_github_repos(cli, items),
     )?;
     let merged_env_lines =
-        telemetry_span::with_span("main_operation", vec![], || merge_env_lines(&sections));
+        instrumentation::with_span("main_operation", vec![], || merge_env_lines(&sections));
     let secret_names = validate_github_secret_lines(&merged_env_lines)?;
     if secret_names.is_empty() {
         return Err(anyhow!("No valid GitHub secret fields found"));
     }
 
     let resolved_repo =
-        telemetry_span::with_span_result("load_config.github_repo", vec![], || match repo {
+        instrumentation::with_span_result("load_config.github_repo", vec![], || match repo {
             Some(repo) => Ok(repo.to_string()),
             None => resolve_current_github_repo(),
         })?;
@@ -2156,7 +2142,7 @@ fn set_github_secrets(
     guard_github_secret_repo(&resolved_repo, &item_repositories)?;
 
     if dry_run {
-        return telemetry_span::with_span("write_outputs", vec![], || {
+        return instrumentation::with_span("write_outputs", vec![], || {
             for name in secret_names {
                 println!("Would set GitHub secret {name} in {resolved_repo}");
             }
@@ -2164,11 +2150,11 @@ fn set_github_secrets(
         });
     }
 
-    let env_vars = telemetry_span::with_span_result("load_inputs", vec![], || {
+    let env_vars = instrumentation::with_span_result("load_inputs", vec![], || {
         resolve_env_vars(&merged_env_lines)
     })?;
 
-    telemetry_span::with_span_result(
+    instrumentation::with_span_result(
         "write_outputs.github_secret_set",
         vec![
             KeyValue::new("github.repo", resolved_repo.clone()),
@@ -2246,13 +2232,13 @@ fn set_cloudflare_secrets(
     dry_run: bool,
     items: &[String],
 ) -> Result<()> {
-    let sections = telemetry_span::with_span_result(
+    let sections = instrumentation::with_span_result(
         "load_inputs",
         vec![KeyValue::new("item.count", items.len() as i64)],
         || collect_item_env_sections(cli, items),
     )?;
     let merged_env_lines =
-        telemetry_span::with_span("main_operation", vec![], || merge_env_lines(&sections));
+        instrumentation::with_span("main_operation", vec![], || merge_env_lines(&sections));
     let secret_names = validate_cloudflare_secret_lines(&merged_env_lines)?;
     if secret_names.is_empty() {
         return Err(anyhow!("No valid Cloudflare secret fields found"));
@@ -2260,7 +2246,7 @@ fn set_cloudflare_secrets(
 
     let target_label = cloudflare_target_label(target);
     if dry_run {
-        return telemetry_span::with_span("write_outputs", vec![], || {
+        return instrumentation::with_span("write_outputs", vec![], || {
             for name in secret_names {
                 println!("Would set Cloudflare Worker secret {name} in {target_label}");
             }
@@ -2268,12 +2254,12 @@ fn set_cloudflare_secrets(
         });
     }
 
-    let env_vars = telemetry_span::with_span_result("load_inputs", vec![], || {
+    let env_vars = instrumentation::with_span_result("load_inputs", vec![], || {
         resolve_env_vars(&merged_env_lines)
     })?;
     let payload = build_secret_json_payload(&secret_names, &env_vars)?;
 
-    telemetry_span::with_span_result(
+    instrumentation::with_span_result(
         "write_outputs.cloudflare_secret_bulk",
         vec![
             KeyValue::new("cloudflare.target", target_label),
@@ -2537,15 +2523,15 @@ fn run_with_items(
     env_file: Option<&Path>,
     command: &[String],
 ) -> Result<()> {
-    let sections = telemetry_span::with_span_result(
+    let sections = instrumentation::with_span_result(
         "load_inputs",
         vec![KeyValue::new("item.count", items.len() as i64)],
         || collect_item_env_sections(cli, items),
     )?;
     let merged_env_lines =
-        telemetry_span::with_span("main_operation", vec![], || merge_env_lines(&sections));
+        instrumentation::with_span("main_operation", vec![], || merge_env_lines(&sections));
 
-    telemetry_span::with_span_result(
+    instrumentation::with_span_result(
         "write_outputs",
         vec![
             KeyValue::new(
@@ -2566,19 +2552,19 @@ fn run_with_items(
     )?;
 
     // First pass: collect all environment variable values
-    let env_vars = telemetry_span::with_span_result("load_inputs", vec![], || {
+    let env_vars = instrumentation::with_span_result("load_inputs", vec![], || {
         resolve_env_vars(&merged_env_lines)
     })?;
 
     // Second pass: expand $VAR references in command arguments
-    let expanded_args: Vec<String> = telemetry_span::with_span("main_operation", vec![], || {
+    let expanded_args: Vec<String> = instrumentation::with_span("main_operation", vec![], || {
         command
             .iter()
             .map(|arg| expand_vars(arg, &env_vars))
             .collect()
     });
 
-    telemetry_span::with_span_result("write_outputs.command_exec", vec![], || {
+    instrumentation::with_span_result("write_outputs.command_exec", vec![], || {
         #[cfg(unix)]
         let mut cmd = {
             let mut c = Command::new("sh");
@@ -2762,7 +2748,7 @@ fn parse_env_line_kv(line: &str) -> Option<(&str, &str)> {
 
 /// Read a secret from 1Password using op read
 fn op_read(reference: &str) -> Result<String> {
-    telemetry_span::with_span_result("load_inputs.op_read", vec![], || {
+    instrumentation::with_span_result("load_inputs.op_read", vec![], || {
         let out = Command::new("op")
             .arg("read")
             .arg(reference)
@@ -2781,7 +2767,7 @@ fn op_read(reference: &str) -> Result<String> {
 }
 
 fn write_env_file(path: &Path, new_lines: &[String]) -> Result<()> {
-    telemetry_span::with_span_result(
+    instrumentation::with_span_result(
         "write_outputs.write_env_file",
         vec![
             KeyValue::new("cli.output_path", path.display().to_string()),
@@ -2844,7 +2830,7 @@ fn write_env_file(path: &Path, new_lines: &[String]) -> Result<()> {
 
 fn op_json(args: &[&str]) -> Result<serde_json::Value> {
     let operation = args.iter().take(2).copied().collect::<Vec<_>>().join(" ");
-    telemetry_span::with_span_result(
+    instrumentation::with_span_result(
         "load_inputs.op_json",
         vec![KeyValue::new("op.operation", operation)],
         || {
@@ -2870,7 +2856,7 @@ fn op_json(args: &[&str]) -> Result<serde_json::Value> {
 
 /// Cache `op item list --format json` to speed up repeated runs.
 fn item_list_cached(vault: Option<&str>) -> Result<Vec<ItemListEntry>> {
-    telemetry_span::with_span_result(
+    instrumentation::with_span_result(
         "load_inputs.item_list_cached",
         vec![KeyValue::new("vault.specified", vault.is_some())],
         || {
@@ -2880,7 +2866,7 @@ fn item_list_cached(vault: Option<&str>) -> Result<Vec<ItemListEntry>> {
             if let Ok(meta) = fs::metadata(&cache_path) {
                 if let Ok(mtime) = meta.modified() {
                     if SystemTime::now().duration_since(mtime).unwrap_or_default() < ttl {
-                        return telemetry_span::with_span_result(
+                        return instrumentation::with_span_result(
                             "load_inputs.item_list_cache_read",
                             vec![KeyValue::new(
                                 "cache.path",
@@ -2904,12 +2890,12 @@ fn item_list_cached(vault: Option<&str>) -> Result<Vec<ItemListEntry>> {
             }
 
             let items =
-                telemetry_span::with_span_result("load_inputs.item_list_fetch", vec![], || {
+                instrumentation::with_span_result("load_inputs.item_list_fetch", vec![], || {
                     let v = op_json(&args)?;
                     let items: Vec<ItemListEntry> = serde_json::from_value(v)?;
                     Ok(items)
                 })?;
-            telemetry_span::with_span_result(
+            instrumentation::with_span_result(
                 "load_inputs.item_list_cache_write",
                 vec![KeyValue::new(
                     "cache.path",
@@ -2933,7 +2919,7 @@ fn item_list_cached(vault: Option<&str>) -> Result<Vec<ItemListEntry>> {
 }
 
 fn item_github_repository_index_cached(vault: Option<&str>) -> Result<Vec<(String, Vec<String>)>> {
-    telemetry_span::with_span_result(
+    instrumentation::with_span_result(
         "load_inputs.item_github_repository_index_cached",
         vec![KeyValue::new("vault.specified", vault.is_some())],
         || {
@@ -2985,30 +2971,106 @@ fn item_github_repository_index_cached(vault: Option<&str>) -> Result<Vec<(Strin
     )
 }
 
+struct TempEnvFile {
+    path: PathBuf,
+    file: fs::File,
+}
+
+impl TempEnvFile {
+    fn create() -> Result<Self> {
+        let dir = env::temp_dir();
+        for attempt in 0..100 {
+            let path = dir.join(format!(
+                "opz-env-{}-{}-{attempt}.env",
+                std::process::id(),
+                stable_hex_hash(&format!("{:?}", SystemTime::now()))
+            ));
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(file) => return Ok(Self { path, file }),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => return Err(err).with_context(|| format!("create {}", path.display())),
+            }
+        }
+
+        Err(anyhow!("failed to create unique temp env file"))
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Write for TempEnvFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.file.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+impl Drop for TempEnvFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 fn item_list_cache_dir() -> Result<PathBuf> {
-    let proj = ProjectDirs::from("dev", "opz", "opz").ok_or_else(|| anyhow!("no cache dir"))?;
-    Ok(proj.cache_dir().to_path_buf())
+    if let Some(cache_home) = env::var_os("XDG_CACHE_HOME").filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(cache_home).join("opz"));
+    }
+
+    if cfg!(target_os = "windows") {
+        if let Some(local_app_data) = env::var_os("LOCALAPPDATA").filter(|value| !value.is_empty())
+        {
+            return Ok(PathBuf::from(local_app_data).join("opz"));
+        }
+        if let Some(app_data) = env::var_os("APPDATA").filter(|value| !value.is_empty()) {
+            return Ok(PathBuf::from(app_data).join("opz"));
+        }
+        if let Some(profile) = env::var_os("USERPROFILE").filter(|value| !value.is_empty()) {
+            return Ok(PathBuf::from(profile)
+                .join("AppData")
+                .join("Local")
+                .join("opz"));
+        }
+    }
+
+    let home = env::var_os("HOME").ok_or_else(|| anyhow!("no cache dir"))?;
+    let home = PathBuf::from(home);
+    if cfg!(target_os = "macos") {
+        Ok(home.join("Library").join("Caches").join("dev.opz.opz"))
+    } else {
+        Ok(home.join(".cache").join("opz"))
+    }
 }
 
 fn cache_file_path(vault: Option<&str>) -> Result<PathBuf> {
     let base = item_list_cache_dir()?;
     let key = vault.unwrap_or("_all_");
-    let mut hasher = Sha256::new();
-    hasher.update(key.as_bytes());
-    let name = format!("item_list_{}.json", hex::encode(hasher.finalize()));
+    let name = format!("item_list_{}.json", stable_hex_hash(key));
     Ok(base.join(name))
 }
 
 fn github_repository_index_cache_file_path(vault: Option<&str>) -> Result<PathBuf> {
     let base = item_list_cache_dir()?;
     let key = format!("github_repositories:{}", vault.unwrap_or("_all_"));
-    let mut hasher = Sha256::new();
-    hasher.update(key.as_bytes());
-    let name = format!(
-        "github_repository_index_{}.json",
-        hex::encode(hasher.finalize())
-    );
+    let name = format!("github_repository_index_{}.json", stable_hex_hash(&key));
     Ok(base.join(name))
+}
+
+fn stable_hex_hash(input: &str) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in input.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
 }
 
 fn invalidate_item_list_cache() -> Result<()> {
@@ -3046,7 +3108,7 @@ fn invalidate_item_list_cache_best_effort() {
 }
 
 fn item_get(item_id: &str) -> Result<ItemGet> {
-    telemetry_span::with_span_result("load_inputs.item_get", vec![], || {
+    instrumentation::with_span_result("load_inputs.item_get", vec![], || {
         let v = op_json(&["item", "get", item_id, "--format", "json"])?;
         let item: ItemGet = serde_json::from_value(v)?;
         Ok(item)

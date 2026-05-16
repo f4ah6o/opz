@@ -12,33 +12,3 @@ release: release-check
 
 e2e:
     OPZ_E2E=1 cargo test --test e2e_real_op -- --nocapture
-
-e2e-trace:
-    OPZ_GIT_COMMIT=$(git rev-parse --short=12 HEAD) OTEL_SERVICE_NAME=opz-e2e OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 OPZ_E2E=1 cargo test --test e2e_real_op -- --nocapture
-
-trace-report ref service='opz-e2e' limit='200':
-    python3 scripts/jaeger_trace_compare.py --service {{service}} --limit {{limit}} report --commit {{ref}}
-
-trace-compare base head service='opz-e2e' limit='200':
-    python3 scripts/jaeger_trace_compare.py --service {{service}} --limit {{limit}} compare --base {{base}} --head {{head}}
-
-trace-report-samples ref samples='5' status='ok' service='opz-e2e' limit='1000':
-    python3 scripts/jaeger_trace_compare.py --service {{service}} --limit {{limit}} --samples {{samples}} --status {{status}} report --commit {{ref}}
-
-trace-compare-samples base head samples='5' status='ok' service='opz-e2e' limit='1000':
-    python3 scripts/jaeger_trace_compare.py --service {{service}} --limit {{limit}} --samples {{samples}} --status {{status}} compare --base {{base}} --head {{head}}
-
-jaeger-up:
-    docker compose up -d
-
-jaeger-down:
-    docker compose down
-
-trace-find query='example':
-    OPZ_GIT_COMMIT=$(git rev-parse --short=12 HEAD) OTEL_SERVICE_NAME=opz OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 cargo run -- find {{query}}
-
-trace-run item='example-item':
-    OPZ_GIT_COMMIT=$(git rev-parse --short=12 HEAD) OTEL_SERVICE_NAME=opz OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 cargo run -- run {{item}} -- env
-
-trace-ui:
-    (open http://localhost:16686 || xdg-open http://localhost:16686 || echo "Open http://localhost:16686 in your browser")
