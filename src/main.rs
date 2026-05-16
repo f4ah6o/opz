@@ -76,16 +76,28 @@ enum Cmd {
         items: Vec<String>,
     },
 
-    #[command(about = "Create a 1Password item from .env or private config file")]
-    Create {
-        #[arg(value_name = "ITEM", help = "Item title used when ENV is exactly .env")]
-        item: String,
+    /// Migrate scripts to repository metadata and item auto-detection
+    Migrate {
+        /// Print changes without editing 1Password items or files
+        #[arg(long)]
+        dry_run: bool,
 
-        #[arg(
-            value_name = "ENV",
-            help = "Source file path (defaults to .env). Non-.env creates Secure Note(s) named from git remotes."
-        )]
-        source_file: Option<PathBuf>,
+        /// Create a new item from .env before rewriting .env-based scripts
+        #[arg(long)]
+        new: bool,
+    },
+
+    /// Store a private config file as Secure Note(s) named from git remotes
+    Note {
+        /// Source file path
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+    },
+
+    #[command(hide = true)]
+    Create {
+        #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
+        args: Vec<String>,
     },
 
     /// Add or update GitHub repository metadata on existing 1Password items
@@ -99,11 +111,11 @@ enum Cmd {
         dry_run: bool,
 
         /// Item titles
-        #[arg(value_name = "ITEM", num_args = 1..)]
+        #[arg(value_name = "ITEM", num_args = 0..)]
         items: Vec<String>,
     },
 
-    /// Run command with secrets from 1Password item
+    /// Run command with secrets from 1Password item(s), auto-detecting by git remote when omitted
     Run {
         /// Output env file path (optional, no file generated if omitted)
         #[arg(long, value_name = "ENV")]
@@ -311,10 +323,11 @@ fn run_cli(args: &[OsString]) -> Result<()> {
             print_credential_file_advice_for_secret_command("gen");
             generate_env_output(&cli, items, env_file.as_deref())
         }
-        Some(Cmd::Create { item, source_file }) => {
-            let env_path = source_file.as_deref().unwrap_or_else(|| Path::new(".env"));
-            create_item_from_env(&cli, item, env_path)
-        }
+        Some(Cmd::Migrate { dry_run, new }) => migrate_scripts(&cli, *dry_run, *new),
+        Some(Cmd::Note { file }) => create_secure_notes_from_file(&cli, file),
+        Some(Cmd::Create { .. }) => Err(anyhow!(
+            "`opz create` was removed. Use `opz migrate --new` to create an item from .env, or `opz note <FILE>` to store a private config file."
+        )),
         Some(Cmd::GithubRepo {
             repo,
             dry_run,
@@ -327,11 +340,12 @@ fn run_cli(args: &[OsString]) -> Result<()> {
         }) => {
             if command.is_empty() {
                 return Err(anyhow!(
-                    "Command required after '--'. Usage: opz run [OPTIONS] [--env-file <ENV>] <ITEM>... -- <COMMAND>..."
+                    "Command required after '--'. Usage: opz run [OPTIONS] [--env-file <ENV>] [<ITEM>...] -- <COMMAND>..."
                 ));
             }
             print_credential_file_advice_for_secret_command("run");
-            run_with_items(&cli, items, env_file.as_deref(), command)
+            let resolved_items = resolve_run_items(&cli, items)?;
+            run_with_items(&cli, &resolved_items, env_file.as_deref(), command)
         }
         Some(Cmd::GithubSecret {
             repo,
@@ -361,19 +375,14 @@ fn run_cli(args: &[OsString]) -> Result<()> {
             )
         }
         None => {
-            if cli.items.is_empty() {
-                return Err(anyhow!(
-                    "At least one item title is required. Usage: opz [OPTIONS] [--env-file <ENV>] <ITEM>... -- <COMMAND>..."
-                ));
-            }
-
             if cli.command.is_empty() {
                 return Err(anyhow!(
-                    "Command required after '--'. Usage: opz [OPTIONS] [--env-file <ENV>] <ITEM>... -- <COMMAND>..."
+                    "Command required after '--'. Usage: opz [OPTIONS] [--env-file <ENV>] [<ITEM>...] -- <COMMAND>..."
                 ));
             }
             print_credential_file_advice_for_secret_command("run");
-            run_with_items(&cli, &cli.items, cli.env_file.as_deref(), &cli.command)
+            let resolved_items = resolve_run_items(&cli, &cli.items)?;
+            run_with_items(&cli, &resolved_items, cli.env_file.as_deref(), &cli.command)
         }
     }
 }
@@ -418,6 +427,8 @@ fn detect_command_hint(args: &[OsString]) -> &'static str {
             "show" => "show",
             "gen" => "gen",
             "create" => "create",
+            "migrate" => "migrate",
+            "note" => "note",
             "github-repo" => "github-repo",
             "run" => "run",
             "github-secret" => "github-secret",
@@ -518,7 +529,7 @@ fn collect_doctor_checks() -> Vec<DoctorCheck> {
             checks.push(optional_cli_check(
                 "git",
                 &["--version"],
-                "needed by create",
+                "needed by migrate and note",
             ));
             checks.push(optional_cli_check("sh", &["--version"], "needed by run"));
             checks.push(optional_cli_check(
@@ -546,7 +557,7 @@ fn collect_doctor_checks() -> Vec<DoctorCheck> {
     checks.push(optional_cli_check(
         "git",
         &["--version"],
-        "needed by create",
+        "needed by migrate and note",
     ));
     checks.push(optional_cli_check("sh", &["--version"], "needed by run"));
     checks.push(optional_cli_check(
@@ -577,7 +588,7 @@ fn print_credential_file_advice_for_secret_command(command: &str) {
     }
 
     eprintln!(
-        "Advice: found plaintext credential env file(s) while running `{command}`: {}. Prefer `opz run <ITEM> -- <COMMAND>` without an env file; use `opz create <ITEM> .env` to import plaintext values and `opz gen --env-file <FILE> <ITEM>` only when a tool requires op:// references.",
+        "Advice: found plaintext credential env file(s) while running `{command}`: {}. Prefer `opz run -- <COMMAND>` without an env file after `opz migrate --new`; use `opz gen --env-file <FILE> <ITEM>` only when a tool requires op:// references.",
         credential_finding_path_list(&findings)
     );
 }
@@ -619,7 +630,7 @@ fn check_credential_files() -> DoctorCheck {
 
 fn credential_file_advice(findings: &[CredentialFileFinding]) -> String {
     format!(
-        "found plaintext credential env file(s): {}; prefer `opz run <ITEM> -- <COMMAND>` without an env file, import with `opz create <ITEM> .env`, and generate files only with `opz gen --env-file <FILE> <ITEM>` when required",
+        "found plaintext credential env file(s): {}; prefer `opz run -- <COMMAND>` without an env file after `opz migrate --new`, and generate files only with `opz gen --env-file <FILE> <ITEM>` when required",
         credential_finding_path_list(findings)
     )
 }
@@ -1020,6 +1031,49 @@ fn collect_item_label_sections(cli: &Cli, items: &[String]) -> Result<Vec<(Strin
     Ok(sections)
 }
 
+fn resolve_run_items(cli: &Cli, items: &[String]) -> Result<Vec<String>> {
+    if !items.is_empty() {
+        return Ok(items.to_vec());
+    }
+
+    let repositories = list_remote_repo_names()
+        .context("No item specified and failed to auto-detect a repository from git remotes")?;
+    let candidates = item_github_repository_index_cached(cli.vault.as_deref())?;
+    let matches = match_item_titles_by_github_repositories(&candidates, &repositories);
+    match matches.as_slice() {
+        [title] => Ok(vec![title.clone()]),
+        [] => Err(anyhow!(
+            "No 1Password item matched git remote repository metadata: {}. Run `opz migrate`, `opz migrate --new`, or pass an item title explicitly.",
+            repositories.join(", ")
+        )),
+        _ => Err(anyhow!(
+            "Multiple 1Password items matched git remote repository metadata ({}): {}. Pass an item title explicitly.",
+            repositories.join(", "),
+            matches.join(", ")
+        )),
+    }
+}
+
+fn match_item_titles_by_github_repositories(
+    candidates: &[(String, Vec<String>)],
+    repositories: &[String],
+) -> Vec<String> {
+    let wanted: HashSet<String> = repositories
+        .iter()
+        .filter_map(|repo| normalize_github_repo_spec(repo))
+        .collect();
+    candidates
+        .iter()
+        .filter(|(_, item_repos)| {
+            item_repos
+                .iter()
+                .filter_map(|repo| normalize_github_repo_spec(repo))
+                .any(|repo| wanted.contains(&repo))
+        })
+        .map(|(title, _)| title.clone())
+        .collect()
+}
+
 fn merge_env_lines(sections: &[(String, Vec<String>)]) -> Vec<String> {
     let mut merged_lines: Vec<String> = Vec::new();
     let mut key_positions: HashMap<String, usize> = HashMap::new();
@@ -1188,32 +1242,6 @@ fn show_output_string(sections: &[(String, Vec<String>)], with_item: bool) -> St
     out
 }
 
-fn create_item_from_env(cli: &Cli, item_title: &str, env_file: &Path) -> Result<()> {
-    if !is_exact_dotenv(env_file) {
-        return telemetry_span::with_span_result(
-            "main_operation",
-            vec![
-                KeyValue::new("cli.input_path", env_file.display().to_string()),
-                KeyValue::new("item.title", item_title.to_string()),
-            ],
-            || create_secure_notes_from_file(cli, env_file),
-        );
-    }
-
-    telemetry_span::with_span_result(
-        "main_operation",
-        vec![
-            KeyValue::new("cli.input_path", env_file.display().to_string()),
-            KeyValue::new("item.title", item_title.to_string()),
-        ],
-        || create_api_credential_item_from_env(cli, item_title, env_file),
-    )
-}
-
-fn is_exact_dotenv(path: &Path) -> bool {
-    path.file_name().and_then(|name| name.to_str()) == Some(".env")
-}
-
 fn create_api_credential_item_from_env(cli: &Cli, item_title: &str, env_file: &Path) -> Result<()> {
     let env_pairs = telemetry_span::with_span_result(
         "load_inputs",
@@ -1242,6 +1270,261 @@ fn create_api_credential_item_from_env(cli: &Cli, item_title: &str, env_file: &P
         invalidate_item_list_cache_best_effort();
         Ok(())
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScriptMigration {
+    items: Vec<String>,
+    uses_dotenv: bool,
+    rewritten: String,
+}
+
+fn migrate_scripts(cli: &Cli, dry_run: bool, create_new: bool) -> Result<()> {
+    let repositories = resolve_requested_github_repositories(&[])?;
+    let mut migrations = Vec::new();
+
+    for path in migration_script_paths()? {
+        let content =
+            fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        let migrated = if path.file_name().and_then(|name| name.to_str()) == Some("package.json") {
+            migrate_package_json_scripts(&content)?
+        } else {
+            migrate_script_text(&content)?
+        };
+        if !migrated.items.is_empty() || migrated.uses_dotenv || migrated.rewritten != content {
+            migrations.push((path, content, migrated));
+        }
+    }
+
+    if migrations.is_empty() && !create_new {
+        println!("No migratable scripts found.");
+        return Ok(());
+    }
+    if migrations.is_empty() && create_new && !Path::new(".env").exists() {
+        println!("No migratable scripts or .env file found.");
+        return Ok(());
+    }
+
+    let mut item_titles = Vec::new();
+    for (_, _, migration) in &migrations {
+        item_titles.extend(migration.items.iter().cloned());
+    }
+    item_titles = dedupe_preserve_order(item_titles);
+
+    let dotenv_item = if create_new
+        && (Path::new(".env").exists()
+            || migrations
+                .iter()
+                .any(|(_, _, migration)| migration.uses_dotenv))
+    {
+        Some(
+            repositories
+                .first()
+                .cloned()
+                .ok_or_else(|| anyhow!("No GitHub repositories found for --new"))?,
+        )
+    } else if migrations
+        .iter()
+        .any(|(_, _, migration)| migration.uses_dotenv)
+    {
+        eprintln!("Skipped .env-based script migration; pass `--new` to create an item from .env.");
+        None
+    } else {
+        None
+    };
+
+    if let Some(item_title) = &dotenv_item {
+        item_titles.push(item_title.clone());
+        if dry_run {
+            println!("Would create item {item_title} from .env");
+        } else {
+            create_api_credential_item_from_env(cli, item_title, Path::new(".env"))?;
+            println!("Created item {item_title} from .env");
+        }
+    }
+
+    item_titles = dedupe_preserve_order(item_titles);
+    for item_title in &item_titles {
+        if dry_run {
+            let merged_repos = match find_item(cli.vault.as_deref(), item_title) {
+                Ok((_, _, _, item)) => {
+                    merge_github_repository_lists(&item_github_repositories(&item), &repositories)
+                }
+                Err(_) => repositories.clone(),
+            };
+            println!(
+                "Would set {} on {} to {}",
+                GITHUB_REPOSITORIES_LABEL,
+                item_title,
+                merged_repos.join(", ")
+            );
+        } else {
+            let (item_id, _, resolved_title, item) = find_item(cli.vault.as_deref(), item_title)?;
+            let merged_repos =
+                merge_github_repository_lists(&item_github_repositories(&item), &repositories);
+            run_op_item_edit_github_repositories(cli.vault.as_deref(), &item_id, &merged_repos)?;
+            println!(
+                "Set {} on {} to {}",
+                GITHUB_REPOSITORIES_LABEL,
+                resolved_title,
+                merged_repos.join(", ")
+            );
+        }
+    }
+
+    for (path, original, migration) in migrations {
+        let should_write = migration.rewritten != original
+            && (!migration.uses_dotenv || create_new)
+            && (!migration.items.is_empty() || create_new);
+        if !should_write {
+            continue;
+        }
+        if dry_run {
+            println!("Would rewrite {}", path.display());
+        } else {
+            fs::write(&path, migration.rewritten)
+                .with_context(|| format!("write {}", path.display()))?;
+            println!("Rewrote {}", path.display());
+        }
+    }
+
+    if !dry_run {
+        invalidate_item_list_cache_best_effort();
+    }
+    Ok(())
+}
+
+fn migration_script_paths() -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for name in ["justfile", "Justfile", "package.json"] {
+        let path = PathBuf::from(name);
+        if path.exists() {
+            paths.push(path);
+        }
+    }
+    Ok(paths)
+}
+
+fn migrate_package_json_scripts(content: &str) -> Result<ScriptMigration> {
+    let value: serde_json::Value =
+        serde_json::from_str(content).context("failed to parse package.json")?;
+    let Some(scripts) = value.get("scripts").and_then(|value| value.as_object()) else {
+        return Ok(ScriptMigration {
+            items: Vec::new(),
+            uses_dotenv: false,
+            rewritten: content.to_string(),
+        });
+    };
+
+    let mut all_items = Vec::new();
+    let mut uses_dotenv = false;
+    let mut rewritten = content.to_string();
+    for script in scripts.values() {
+        let Some(text) = script.as_str() else {
+            continue;
+        };
+        let migration = migrate_script_text(text)?;
+        all_items.extend(migration.items);
+        uses_dotenv |= migration.uses_dotenv;
+        if migration.rewritten != text {
+            rewritten = replace_json_string_literal(&rewritten, text, &migration.rewritten)?;
+        }
+    }
+
+    Ok(ScriptMigration {
+        items: dedupe_preserve_order(all_items),
+        uses_dotenv,
+        rewritten,
+    })
+}
+
+fn replace_json_string_literal(content: &str, old: &str, new: &str) -> Result<String> {
+    let old_literal = serde_json::to_string(old)?;
+    let new_literal = serde_json::to_string(new)?;
+    Ok(content.replacen(&old_literal, &new_literal, 1))
+}
+
+fn migrate_script_text(content: &str) -> Result<ScriptMigration> {
+    let opz_run_re =
+        Regex::new(r"\bopz\s+run(?P<opts>(?:\s+--env-file\s+\S+)?)\s+(?P<item>[^\s-][^\s]*)\s+--")?;
+    let shorthand_re = Regex::new(r"\bopz\s+(?P<item>[^\s-][^\s]*)\s+--")?;
+    let op_item_get_re = Regex::new(r"\bop\s+item\s+get\s+(?P<item>[^\s-][^\s]*)")?;
+    let op_run_env_re = Regex::new(r"\bop\s+run\s+--env-file\s+\.env\s+--")?;
+
+    let mut items = Vec::new();
+    let rewritten = opz_run_re
+        .replace_all(content, |caps: &regex::Captures| {
+            let item = caps["item"].to_string();
+            if is_static_item_token(&item) {
+                items.push(item);
+                format!("opz run{} --", &caps["opts"])
+            } else {
+                caps[0].to_string()
+            }
+        })
+        .to_string();
+    let rewritten = shorthand_re
+        .replace_all(&rewritten, |caps: &regex::Captures| {
+            let item = caps["item"].to_string();
+            if matches!(
+                item.as_str(),
+                "run"
+                    | "find"
+                    | "doctor"
+                    | "skills"
+                    | "show"
+                    | "gen"
+                    | "create"
+                    | "migrate"
+                    | "note"
+                    | "github-repo"
+                    | "github-secret"
+                    | "cloudflare-secret"
+            ) {
+                caps[0].to_string()
+            } else if is_static_item_token(&item) {
+                items.push(item);
+                "opz --".to_string()
+            } else {
+                caps[0].to_string()
+            }
+        })
+        .to_string();
+    for caps in op_item_get_re.captures_iter(&rewritten) {
+        let item = caps["item"].to_string();
+        if is_static_item_token(&item) {
+            items.push(item);
+        }
+    }
+    let uses_dotenv = op_run_env_re.is_match(&rewritten);
+    let rewritten = op_run_env_re
+        .replace_all(&rewritten, "opz run --")
+        .to_string();
+
+    Ok(ScriptMigration {
+        items: dedupe_preserve_order(items),
+        uses_dotenv,
+        rewritten,
+    })
+}
+
+fn is_static_item_token(value: &str) -> bool {
+    !value.contains('{')
+        && !value.contains('}')
+        && !value.contains('$')
+        && !value.contains('*')
+        && !value.contains('?')
+        && !value.contains('`')
+        && !value.contains('(')
+        && !value.contains(')')
+}
+
+fn dedupe_preserve_order(values: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    values
+        .into_iter()
+        .filter(|value| seen.insert(value.clone()))
+        .collect()
 }
 
 fn build_create_item_args(vault: Option<&str>) -> Vec<String> {
@@ -1546,7 +1829,7 @@ fn list_remote_repo_names() -> Result<Vec<String>> {
 
     if repo_names.is_empty() {
         return Err(anyhow!(
-            "no parseable git remotes found; non-.env create requires at least one remote URL like https://host/org/repo.git"
+            "no parseable git remotes found; note requires at least one remote URL like https://host/org/repo.git"
         ));
     }
 
@@ -1848,7 +2131,7 @@ fn set_github_secrets(
     )
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ItemGithubRepositories {
     item_title: String,
     repositories: Vec<String>,
@@ -2593,6 +2876,59 @@ fn item_list_cached(vault: Option<&str>) -> Result<Vec<ItemListEntry>> {
     )
 }
 
+fn item_github_repository_index_cached(vault: Option<&str>) -> Result<Vec<(String, Vec<String>)>> {
+    telemetry_span::with_span_result(
+        "load_inputs.item_github_repository_index_cached",
+        vec![KeyValue::new("vault.specified", vault.is_some())],
+        || {
+            let cache_path = github_repository_index_cache_file_path(vault)?;
+            let ttl = Duration::from_secs(60);
+
+            if let Ok(meta) = fs::metadata(&cache_path) {
+                if let Ok(mtime) = meta.modified() {
+                    if SystemTime::now().duration_since(mtime).unwrap_or_default() < ttl {
+                        let bytes = fs::read(&cache_path)?;
+                        let items: Vec<ItemGithubRepositories> = serde_json::from_slice(&bytes)?;
+                        return Ok(items
+                            .into_iter()
+                            .map(|item| (item.item_title, item.repositories))
+                            .collect());
+                    }
+                }
+            }
+
+            let item_entries = item_list_cached(vault)?;
+            let mut index = Vec::new();
+            for entry in item_entries {
+                let item = item_get(&entry.id).with_context(|| {
+                    format!("failed to inspect item `{}` for auto-detect", entry.title)
+                })?;
+                let repositories = item_github_repositories(&item);
+                if !repositories.is_empty() {
+                    index.push(ItemGithubRepositories {
+                        item_title: entry.title,
+                        repositories,
+                    });
+                }
+            }
+
+            let cache_parent = cache_path.parent().ok_or_else(|| {
+                anyhow!(
+                    "cache path has no parent directory: {}",
+                    cache_path.display()
+                )
+            })?;
+            fs::create_dir_all(cache_parent)?;
+            fs::write(&cache_path, serde_json::to_vec(&index)?)?;
+
+            Ok(index
+                .into_iter()
+                .map(|item| (item.item_title, item.repositories))
+                .collect())
+        },
+    )
+}
+
 fn item_list_cache_dir() -> Result<PathBuf> {
     let proj = ProjectDirs::from("dev", "opz", "opz").ok_or_else(|| anyhow!("no cache dir"))?;
     Ok(proj.cache_dir().to_path_buf())
@@ -2604,6 +2940,18 @@ fn cache_file_path(vault: Option<&str>) -> Result<PathBuf> {
     let mut hasher = Sha256::new();
     hasher.update(key.as_bytes());
     let name = format!("item_list_{}.json", hex::encode(hasher.finalize()));
+    Ok(base.join(name))
+}
+
+fn github_repository_index_cache_file_path(vault: Option<&str>) -> Result<PathBuf> {
+    let base = item_list_cache_dir()?;
+    let key = format!("github_repositories:{}", vault.unwrap_or("_all_"));
+    let mut hasher = Sha256::new();
+    hasher.update(key.as_bytes());
+    let name = format!(
+        "github_repository_index_{}.json",
+        hex::encode(hasher.finalize())
+    );
     Ok(base.join(name))
 }
 
@@ -2625,7 +2973,9 @@ fn invalidate_item_list_cache() -> Result<()> {
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if name.starts_with("item_list_") && name.ends_with(".json") {
+        if (name.starts_with("item_list_") || name.starts_with("github_repository_index_"))
+            && name.ends_with(".json")
+        {
             fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
         }
     }
@@ -2812,6 +3162,42 @@ mod tests {
             Some("owner/repo".to_string())
         );
         assert_eq!(normalize_github_repo_spec("not-a-repo"), None);
+    }
+
+    #[test]
+    fn test_match_item_titles_by_github_repositories_matches_one() {
+        let candidates = vec![
+            ("service".to_string(), vec!["owner/repo".to_string()]),
+            ("other".to_string(), vec!["other/repo".to_string()]),
+        ];
+
+        let matches =
+            match_item_titles_by_github_repositories(&candidates, &["OWNER/REPO".to_string()]);
+
+        assert_eq!(matches, vec!["service".to_string()]);
+    }
+
+    #[test]
+    fn test_match_item_titles_by_github_repositories_matches_none() {
+        let candidates = vec![("service".to_string(), vec!["owner/repo".to_string()])];
+
+        let matches =
+            match_item_titles_by_github_repositories(&candidates, &["other/repo".to_string()]);
+
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn test_match_item_titles_by_github_repositories_preserves_multiple_matches() {
+        let candidates = vec![
+            ("service".to_string(), vec!["owner/repo".to_string()]),
+            ("shared".to_string(), vec!["owner/repo".to_string()]),
+        ];
+
+        let matches =
+            match_item_titles_by_github_repositories(&candidates, &["owner/repo".to_string()]);
+
+        assert_eq!(matches, vec!["service".to_string(), "shared".to_string()]);
     }
 
     #[test]
@@ -3292,6 +3678,75 @@ SINGLE='value # kept'
     }
 
     #[test]
+    fn test_migrate_script_text_rewrites_explicit_opz_run_item() {
+        let migration = migrate_script_text("test:\n    opz run service -- env\n").unwrap();
+
+        assert_eq!(migration.items, vec!["service".to_string()]);
+        assert!(!migration.uses_dotenv);
+        assert_eq!(migration.rewritten, "test:\n    opz run -- env\n");
+    }
+
+    #[test]
+    fn test_migrate_script_text_rewrites_top_level_shorthand_item() {
+        let migration = migrate_script_text("test:\n    opz service -- env\n").unwrap();
+
+        assert_eq!(migration.items, vec!["service".to_string()]);
+        assert_eq!(migration.rewritten, "test:\n    opz -- env\n");
+    }
+
+    #[test]
+    fn test_migrate_script_text_detects_dotenv_op_run() {
+        let migration = migrate_script_text("test:\n    op run --env-file .env -- env\n").unwrap();
+
+        assert!(migration.items.is_empty());
+        assert!(migration.uses_dotenv);
+        assert_eq!(migration.rewritten, "test:\n    opz run -- env\n");
+    }
+
+    #[test]
+    fn test_migrate_script_text_collects_op_item_get_without_rewrite() {
+        let migration =
+            migrate_script_text("test:\n    op item get service --format json\n").unwrap();
+
+        assert_eq!(migration.items, vec!["service".to_string()]);
+        assert_eq!(
+            migration.rewritten,
+            "test:\n    op item get service --format json\n"
+        );
+    }
+
+    #[test]
+    fn test_migrate_script_text_skips_template_item_tokens() {
+        let migration = migrate_script_text("test item:\n    opz run {{item}} -- env\n").unwrap();
+
+        assert!(migration.items.is_empty());
+        assert_eq!(
+            migration.rewritten,
+            "test item:\n    opz run {{item}} -- env\n"
+        );
+    }
+
+    #[test]
+    fn test_migrate_script_text_skips_command_substitution_item_tokens() {
+        let migration = migrate_script_text("test:\n    opz run $(item) -- env\n").unwrap();
+
+        assert!(migration.items.is_empty());
+        assert_eq!(migration.rewritten, "test:\n    opz run $(item) -- env\n");
+    }
+
+    #[test]
+    fn test_migrate_package_json_scripts_rewrites_script_values() {
+        let content = r#"{"name":"app","scripts":{"dev":"opz run service -- vite","test":"echo ok"},"dependencies":{"z":"1"}}"#;
+        let migration = migrate_package_json_scripts(content).unwrap();
+
+        assert_eq!(migration.items, vec!["service".to_string()]);
+        assert_eq!(
+            migration.rewritten,
+            r#"{"name":"app","scripts":{"dev":"opz run -- vite","test":"echo ok"},"dependencies":{"z":"1"}}"#
+        );
+    }
+
+    #[test]
     fn test_credential_env_file_name_patterns() {
         assert!(is_credential_env_file_name(".env"));
         assert!(is_credential_env_file_name(".env.local"));
@@ -3331,14 +3786,6 @@ SINGLE='value # kept'
 
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].path, PathBuf::from(".env"));
-    }
-
-    #[test]
-    fn test_is_exact_dotenv() {
-        assert!(is_exact_dotenv(Path::new(".env")));
-        assert!(!is_exact_dotenv(Path::new(".env.local")));
-        assert!(!is_exact_dotenv(Path::new("config/.env.production")));
-        assert!(!is_exact_dotenv(Path::new("secrets.toml")));
     }
 
     #[test]
@@ -3663,9 +4110,10 @@ SINGLE='value # kept'
         assert!(OPZ_SKILL.contains("opz doctor"));
         assert!(OPZ_SKILL.contains("opz show [OPTIONS] <ITEM>..."));
         assert!(OPZ_SKILL.contains("opz gen [OPTIONS] <ITEM>..."));
-        assert!(OPZ_SKILL.contains("opz create <ITEM> [ENV]"));
+        assert!(OPZ_SKILL.contains("opz migrate [OPTIONS]"));
+        assert!(OPZ_SKILL.contains("opz note <FILE>"));
         assert!(OPZ_SKILL.contains("opz github-repo [OPTIONS] <ITEM>..."));
-        assert!(OPZ_SKILL.contains("opz run [OPTIONS] <ITEM>... -- <COMMAND>..."));
+        assert!(OPZ_SKILL.contains("opz run [OPTIONS] [<ITEM>...] -- <COMMAND>..."));
         assert!(OPZ_SKILL.contains("opz github-secret [OPTIONS] <ITEM>..."));
         assert!(OPZ_SKILL.contains("opz cloudflare-secret [OPTIONS] <ITEM>..."));
         assert!(OPZ_SKILL.contains("opz skills"));
@@ -3721,6 +4169,56 @@ SINGLE='value # kept'
                 assert_eq!(env_file.as_deref(), Some(Path::new(".env")));
             }
             _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_run_without_items_for_auto_detect() {
+        let cli = Cli::try_parse_from(["opz", "run", "--", "echo", "ok"]).unwrap();
+        match cli.cmd {
+            Some(Cmd::Run { items, command, .. }) => {
+                assert!(items.is_empty());
+                assert_eq!(command, vec!["echo".to_string(), "ok".to_string()]);
+            }
+            _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_top_level_without_items_for_auto_detect() {
+        let cli = Cli::try_parse_from(["opz", "--", "echo", "ok"]).unwrap();
+        assert!(cli.cmd.is_none());
+        assert!(cli.items.is_empty());
+        assert_eq!(cli.command, vec!["echo".to_string(), "ok".to_string()]);
+    }
+
+    #[test]
+    fn test_cli_parse_migrate_flags() {
+        let cli = Cli::try_parse_from(["opz", "migrate", "--dry-run", "--new"]).unwrap();
+        match cli.cmd {
+            Some(Cmd::Migrate { dry_run, new }) => {
+                assert!(dry_run);
+                assert!(new);
+            }
+            _ => panic!("expected migrate command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_note() {
+        let cli = Cli::try_parse_from(["opz", "note", "app.conf"]).unwrap();
+        match cli.cmd {
+            Some(Cmd::Note { file }) => assert_eq!(file, PathBuf::from("app.conf")),
+            _ => panic!("expected note command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_removed_create_shim() {
+        let cli = Cli::try_parse_from(["opz", "create", "service"]).unwrap();
+        match cli.cmd {
+            Some(Cmd::Create { args }) => assert_eq!(args, vec!["service".to_string()]),
+            _ => panic!("expected hidden create command"),
         }
     }
 

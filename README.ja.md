@@ -7,10 +7,10 @@
 * タイトルのキーワードで 1Password アイテムを検索します。
 * `doctor` で `op` の認証状態、任意の依存 CLI、平文の `.env` 系 credential ファイルをチェックします。
 * shell の環境変数名として使えるフィールドラベルを表示します。
-* 1 つ以上の 1Password アイテムから secret を取得してコマンドを実行します。
+* 1 つ以上の 1Password アイテムから secret を取得してコマンドを実行します。repository metadata による item 自動検出にも対応します。
 * `op://...` 参照を含む env ファイルを生成し、既存ファイルの無関係な行は残します。
-* `.env` から 1Password アイテムを作成し、private 設定ファイルは Secure Note として保存します。
-* 既存 item に GitHub repository metadata を追加して migrate できます。
+* 既存 script を、明示 item や `.env` から repository metadata ベースの実行へ migrate できます。
+* private 設定ファイルを Secure Note として保存します。
 * 有効なアイテムフィールドを GitHub repository secrets に保存し、item 側の repository metadata があれば誤配を防ぎます。
 * 有効なアイテムフィールドを Wrangler 経由で Cloudflare Worker secrets に保存します。
 * bundled `opz` Agent Skill を出力します。
@@ -90,8 +90,8 @@ opz skills
 1 つ以上の 1Password アイテムから secret を取得してコマンドを実行します:
 
 ```bash
-opz run [OPTIONS] [--env-file <ENV>] <ITEM>... -- <COMMAND>...
-opz [OPTIONS] [--env-file <ENV>] <ITEM>... -- <COMMAND>...
+opz run [OPTIONS] [--env-file <ENV>] [<ITEM>...] -- <COMMAND>...
+opz [OPTIONS] [--env-file <ENV>] [<ITEM>...] -- <COMMAND>...
 ```
 
 オプション:
@@ -99,14 +99,17 @@ opz [OPTIONS] [--env-file <ENV>] <ITEM>... -- <COMMAND>...
 * `--env-file <ENV>` - 出力 env ファイルパス。省略時はファイルを書きません。
 
 引数:
-* `<ITEM>...` - secret を取得する 1 つ以上のアイテムタイトル。
+* `<ITEM>...` - secret を取得する任意のアイテムタイトル。省略時は、現在の git remote と一致する `github_repositories` metadata を持つ item を自動検出します。
 
 `--env-file` を指定すると、env ファイルはコマンド終了後も残ります。既存ファイルはマージされ、無関係な行は残り、重複キーは上書きされ、新しいキーは末尾に追加されます。複数アイテムで同じキーがある場合は後勝ちです（`opz run foo bar ...` では `bar` の値が優先）。
 
 例:
 ```bash
-# 推奨: .env ファイルを生成せずに1アイテムで実行
+# .env ファイルを生成せずに1アイテムで実行
 opz run example-item -- your-command
+
+# migrate 後の推奨: git remote metadata から item を自動検出
+opz run -- your-command
 
 # 複数アイテムで実行（重複キーは後勝ち）
 opz run foo bar -- your-command
@@ -149,44 +152,55 @@ opz --vault Private gen foo bar
 
 標準出力では `# --- item: <title> ---` のようなコメント見出しを付けます。ファイル出力では、セクションコメントなしのマージ済みキー一覧を書きます。
 
-### `.env` または private 設定ファイルからアイテム作成
+### Script と `.env` の migrate
 
-`create` は読み込むファイル名で 2 つのモードを切り替えます:
+`justfile` / `Justfile` の recipe と `package.json` の scripts を、repository metadata と item 自動検出へ移行します:
 
 ```bash
-opz [OPTIONS] create <ITEM> [ENV]
+opz migrate [OPTIONS]
 ```
 
-引数:
-* `<ITEM>` - `[ENV]` が厳密に `.env` のときに使う 1Password アイテムタイトル。
-* `[ENV]` - 読み込むファイルパス。省略時は `.env`。
+オプション:
+* `--dry-run` - 1Password item やファイルを編集せず、変更内容だけを表示
+* `--new` - `.env` から新しい `API_CREDENTIAL` item を作成してから `.env` ベースの script を書き換えます。item 名は先頭の git remote repository 名です。
+* `--vault <NAME>` - Vault 名（省略時はすべての Vault を検索）
 
 挙動:
-* `[ENV]` が厳密に `.env` の場合:
-  * `API_CREDENTIAL` アイテムを作成します。
-  * タイトルは `<ITEM>` です。
-  * 各 `KEY=VALUE` を `KEY` という名前のカスタムテキストフィールドとして追加します。
-  * 解釈できる git remote を `github_repositories` metadata フィールドに `owner/repo` 形式で1行ずつ記録します。
-  * `export KEY=...`、インラインコメント（`KEY=value # note`）、クォート内の `#` に対応します。
-  * 無効な env キーと既存の `op://...` 値はスキップします。
-  * 重複キーは後勝ちです。
-* `[ENV]` が `.env` 以外の場合:
-  * `SECURE_NOTE` アイテムを作成します。
-  * 本文は ```` ```<file name>\n<content>\n``` ```` の形で保存します。
-  * タイトルには git remote URL から抽出した `org/repo` を使います。
-  * remote が複数ある場合は remote ごとに作成し、同名時は `-2`, `-3` のように番号を付けます。
-  * 解釈できる git remote がない場合はエラー終了します。
+* `opz run <ITEM> -- <COMMAND>` は、現在の git remote を `<ITEM>` の metadata に記録してから `opz run -- <COMMAND>` に書き換えます。
+* `opz <ITEM> -- <COMMAND>` も同様に `opz -- <COMMAND>` へ書き換えます。
+* `op item get <ITEM>` は metadata 登録の手がかりとして使いますが、`opz run` と等価ではないため書き換えません。
+* `.env` ベースの script は `--new` 指定時だけ書き換えます。指定がない場合は報告してスキップします。
 
 例:
 ```bash
-# .env から作成
-opz create my-service
+# 変更内容だけ確認
+opz migrate --dry-run
 
-# private 設定ファイルを Secure Note として保存（タイトルは remote の org/repo）
-opz create ignored-item app.conf
+# script を書き換え、item metadata を更新
+opz migrate
 
-# Vault を指定して作成
-opz --vault Private create my-service .env
+# .env から新しい item を作成して migrate
+opz migrate --new
+```
+
+### Private 設定ファイルを Secure Note として保存
+
+private 設定ファイルを git remote 由来のタイトルで Secure Note item として保存します:
+
+```bash
+opz note <FILE>
+```
+
+挙動:
+* 本文は ```` ```<file name>\n<content>\n``` ```` の形で保存します。
+* タイトルには git remote URL から抽出した `org/repo` を使います。
+* remote が複数ある場合は remote ごとに作成し、同名時は `-2`, `-3` のように番号を付けます。
+* 解釈できる git remote がない場合はエラー終了します。
+
+例:
+```bash
+opz note app.conf
+opz --vault Private note app.conf
 ```
 
 ### 既存 item に GitHub Repository Metadata を追加
@@ -383,7 +397,7 @@ Jaeger の Search で service `opz`（または `OTEL_SERVICE_NAME`）を選び�
 * [1Password CLI](https://developer.1password.com/docs/cli/) (`op`) がインストールされ、認証されていること
 * 任意: `github-secret` 用の GitHub CLI (`gh`)
 * 任意: `cloudflare-secret` 用の Wrangler (`wrangler`)
-* 任意: private 設定ファイルの `create` 用の Git (`git`)
+* 任意: `migrate` と `note` 用の Git (`git`)
 
 ## E2Eテスト
 

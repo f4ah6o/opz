@@ -1,6 +1,6 @@
 ---
 name: opz
-description: Use the opz CLI to search 1Password items, inspect valid env labels, diagnose op and dependency status, generate env files, create items from local files, store GitHub repository secrets, store Cloudflare Worker secrets, and run commands with secrets injected as environment variables.
+description: Use the opz CLI to search 1Password items, inspect valid env labels, diagnose op and dependency status, generate env files, migrate scripts to repository metadata, store private files as notes, store GitHub repository secrets, store Cloudflare Worker secrets, and run commands with secrets injected as environment variables.
 ---
 
 # opz
@@ -10,7 +10,7 @@ Use this skill when you need to work with 1Password-backed secrets through the `
 ## Prerequisites
 
 - 1Password CLI (`op`) is installed and authenticated.
-- The relevant vault and item names are known, or can be discovered with `opz find`.
+- The relevant vault and item names are known, can be discovered with `opz find`, or can be auto-detected from `github_repositories` metadata.
 
 ## Global Options
 
@@ -53,12 +53,22 @@ opz gen [OPTIONS] <ITEM>...
 opz gen --env-file .env.local <ITEM>...
 ```
 
-### `create`
+### `migrate`
 
-Create a 1Password item from `.env` or another private config file. Exact `.env` input creates an `API_CREDENTIAL` titled with `<ITEM>` and records parseable git remotes in `github_repositories`. Other files create `SECURE_NOTE` items titled from parseable git remotes such as `org/repo`.
+Migrate `justfile`/`Justfile` recipes and `package.json` scripts from explicit item names or `.env` usage to repository metadata and item auto-detection. `--new` creates an `API_CREDENTIAL` item from `.env` first.
 
 ```bash
-opz create <ITEM> [ENV]
+opz migrate [OPTIONS]
+opz migrate --dry-run
+opz migrate --new
+```
+
+### `note`
+
+Store a private config file as Secure Note item(s) titled from parseable git remotes such as `org/repo`.
+
+```bash
+opz note <FILE>
 ```
 
 ### `run`
@@ -66,8 +76,8 @@ opz create <ITEM> [ENV]
 Run a command with secrets from one or more items injected as environment variables. `$VAR` and `${VAR}` in command arguments are expanded only when that variable was resolved from the selected items.
 
 ```bash
-opz run [OPTIONS] <ITEM>... -- <COMMAND>...
-opz [OPTIONS] <ITEM>... -- <COMMAND>...
+opz run [OPTIONS] [<ITEM>...] -- <COMMAND>...
+opz [OPTIONS] [<ITEM>...] -- <COMMAND>...
 ```
 
 ### `github-secret`
@@ -115,13 +125,16 @@ opz skills
 - `github-secret` also uses later-item-wins and passes values to `gh secret set` through stdin.
 - `github-secret` rejects names starting with `GITHUB_` and blocks writes when item `github_repositories` metadata does not include the target repo.
 - `github-repo` migrates existing items by merging repository metadata into `github_repositories`.
+- `migrate` rewrites supported scripts and updates item metadata by default; use `--dry-run` to preview.
+- `migrate` treats `op item get <ITEM>` as a metadata signal but does not rewrite it.
+- `run` auto-detects an item when no item is passed and exactly one item matches the current git remote through `github_repositories`.
 - `github_repositories` is metadata, not an env label or deployable secret.
 - `cloudflare-secret` also uses later-item-wins and passes a JSON payload to `wrangler secret bulk` through stdin.
 - `cloudflare-secret` supports `--name`, `--env`, and `--config` for Wrangler target selection.
 - `gen` stdout uses `op://<vault_id>/<item_id>/<field>` references, not resolved secret values.
 - When `--env-file` points to an existing file, `opz` appends new keys and overwrites duplicate keys while preserving unrelated lines.
 - `show` only prints labels that are valid shell environment variable names.
-- Item lists are cached for 60 seconds. Creating items invalidates that cache best-effort.
+- Item lists are cached for 60 seconds. Creating or editing items invalidates that cache best-effort.
 - OTLP tracing is disabled unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set.
 
 ## Suggested Workflow
@@ -131,6 +144,7 @@ opz skills
 3. Inspect available labels with `opz show`.
 4. Use `opz run ... -- <COMMAND>` for the normal file-free workflow.
 5. Use `opz gen --env-file ...` only when another tool needs `op://` references in a file.
-6. Use `opz github-repo --dry-run ...` to preview repository metadata migration for older items.
-7. Use `opz github-secret --dry-run ...` before writing GitHub repository secrets.
-8. Use `opz cloudflare-secret --dry-run ...` before writing Cloudflare Worker secrets.
+6. Use `opz migrate --dry-run` to preview script migration, then `opz migrate` or `opz migrate --new`.
+7. Use `opz github-repo --dry-run ...` to manually add repository metadata for older items.
+8. Use `opz github-secret --dry-run ...` before writing GitHub repository secrets.
+9. Use `opz cloudflare-secret --dry-run ...` before writing Cloudflare Worker secrets.
