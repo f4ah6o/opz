@@ -70,3 +70,43 @@ esac
     assert!(stdout.contains("ok    op: "));
     assert!(stdout.contains("error op auth: `op whoami --format json` failed: not signed in"));
 }
+
+#[test]
+#[cfg(unix)]
+fn doctor_warns_for_plaintext_env_files_and_secretlint_findings() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(temp.path().join(".env"), "API_KEY=plain\n").unwrap();
+    make_executable(
+        &temp.path().join("op"),
+        r#"#!/bin/sh
+case "$*" in
+  "--version") echo "2.30.0" ;;
+  "whoami --format json") echo '{"email":"user@example.test","account_uuid":"A1"}' ;;
+  "account list --format json") echo '[{"url":"example.1password.com"}]' ;;
+  *) exit 2 ;;
+esac
+"#,
+    );
+    make_executable(
+        &temp.path().join("secretlint"),
+        r#"#!/bin/sh
+case "$*" in
+  "--version") echo "secretlint/10.0.0" ;;
+  *) echo '[{"filePath":".env","messages":[{"message":"found secret"}]}]'; exit 1 ;;
+esac
+"#,
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_opz"))
+        .arg("doctor")
+        .env("PATH", temp.path())
+        .current_dir(temp.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("ok    secretlint: "), "{stdout}");
+    assert!(stdout.contains("warn  credential files: found plaintext credential env file(s): .env"));
+    assert!(stdout.contains("secretlint reported possible plaintext secrets"));
+}

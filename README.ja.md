@@ -5,12 +5,13 @@
 ## 機能
 
 * タイトルのキーワードで 1Password アイテムを検索します。
-* `doctor` で `op` の認証状態と任意の依存 CLI をチェックします。
+* `doctor` で `op` の認証状態、任意の依存 CLI、平文の `.env` 系 credential ファイルをチェックします。
 * shell の環境変数名として使えるフィールドラベルを表示します。
 * 1 つ以上の 1Password アイテムから secret を取得してコマンドを実行します。
 * `op://...` 参照を含む env ファイルを生成し、既存ファイルの無関係な行は残します。
 * `.env` から 1Password アイテムを作成し、private 設定ファイルは Secure Note として保存します。
-* 有効なアイテムフィールドを GitHub repository secrets に保存します。
+* 既存 item に GitHub repository metadata を追加して migrate できます。
+* 有効なアイテムフィールドを GitHub repository secrets に保存し、item 側の repository metadata があれば誤配を防ぎます。
 * 有効なアイテムフィールドを Wrangler 経由で Cloudflare Worker secrets に保存します。
 * bundled `opz` Agent Skill を出力します。
 * アイテムリストを 60 秒キャッシュし、完全一致がない場合はタイトルの部分一致で探します。
@@ -51,7 +52,7 @@ opz find github
 opz doctor
 ```
 
-`doctor` は必須の `op` チェックが失敗した場合だけ非 0 で終了します。`gh`、`wrangler`、`git`、`sh` など任意ツールの欠落は警告として表示します。
+`doctor` は必須の `op` チェックが失敗した場合だけ非 0 で終了します。`gh`、`wrangler`、`git`、`sh`、`secretlint` など任意ツールの欠落は警告として表示します。平文の `.env` 系 credential ファイルもチェックし、`secretlint` が使える場合はそのファイルに対して実行します。
 
 ### アイテムラベル表示
 
@@ -104,13 +105,13 @@ opz [OPTIONS] [--env-file <ENV>] <ITEM>... -- <COMMAND>...
 
 例:
 ```bash
-# 1アイテムで実行（.env ファイルは生成されない）
+# 推奨: .env ファイルを生成せずに1アイテムで実行
 opz run example-item -- your-command
 
 # 複数アイテムで実行（重複キーは後勝ち）
 opz run foo bar -- your-command
 
-# secret を注入して .env ファイルも生成
+# 他の tool が op:// 参照ファイルを必要とするときだけ env ファイルを生成
 opz run --env-file .env foo bar -- your-command
 
 # 短縮形でも複数アイテム対応
@@ -165,6 +166,7 @@ opz [OPTIONS] create <ITEM> [ENV]
   * `API_CREDENTIAL` アイテムを作成します。
   * タイトルは `<ITEM>` です。
   * 各 `KEY=VALUE` を `KEY` という名前のカスタムテキストフィールドとして追加します。
+  * 解釈できる git remote を `github_repositories` metadata フィールドに `owner/repo` 形式で1行ずつ記録します。
   * `export KEY=...`、インラインコメント（`KEY=value # note`）、クォート内の `#` に対応します。
   * 無効な env キーと既存の `op://...` 値はスキップします。
   * 重複キーは後勝ちです。
@@ -186,6 +188,33 @@ opz create ignored-item app.conf
 # Vault を指定して作成
 opz --vault Private create my-service .env
 ```
+
+### 既存 item に GitHub Repository Metadata を追加
+
+既存の 1Password item に `github_repositories` metadata を追加または更新します:
+
+```bash
+opz github-repo [OPTIONS] <ITEM>...
+```
+
+オプション:
+* `--repo <OWNER/REPO>` - 記録する repository。複数回指定できます。省略時は現在の repository の git remote から解釈できる値を使います。
+* `--dry-run` - item を編集せず、更新内容だけを表示
+* `--vault <NAME>` - Vault 名（省略時はすべての Vault を検索）
+
+例:
+```bash
+# 現在の git remote を使った migration を事前確認
+opz github-repo --dry-run my-service shared-secrets
+
+# 現在の git remote repository metadata を追加
+opz github-repo my-service shared-secrets
+
+# 明示した repository を追加
+opz github-repo --repo owner/repo --repo other/service my-service
+```
+
+既存の `github_repositories` は残し、指定した repository とマージします。
 
 ### GitHub Repository Secrets に保存
 
@@ -213,6 +242,8 @@ opz github-secret --repo owner/repo my-service shared-secrets
 ```
 
 `github-secret` は `gen` や `run` と同じ有効フィールドラベルを使います。複数 item で同名がある場合は後勝ちです。Secret 値はメモリ上で解決し、`gh secret set` の stdin に渡します。値を表示したりコマンド引数に載せたりしません。GitHub が予約しているため、`GITHUB_` で始まる名前は拒否します。
+
+選択した 1Password item に `github_repositories` フィールドがある場合、保存先 repository はその `owner/repo` 一覧のいずれかと一致する必要があります。一覧は改行またはカンマ区切りで複数指定できます。この metadata がない item は従来通り利用できますが、repository guard を適用できないため警告を表示します。
 
 ### Cloudflare Worker Secrets に保存
 
@@ -248,7 +279,7 @@ opz cloudflare-secret --name worker-app --env production my-service shared-secre
 1. 1Password からアイテムリストを取得し、そのメタデータを 60 秒キャッシュします。
 2. タイトルで一致するアイテムを 1 件探します。まず完全一致、見つからなければタイトルの部分一致を使います。
 3. 一致したアイテムを取得し、有効な env ラベルを持つフィールドから `op://<vault_id>/<item_id>/<field>` 参照を作ります。
-4. env ファイル指定があれば、既存ファイルとマージして書き込みます。
+4. env ファイル指定があれば、既存ファイルとマージして書き込みます。推奨は file-free な `opz run` で、env ファイルは `op://` 参照を必要とする tool 向けです。
 5. `op run --env-file <temp> -- sh -c 'env -0'` で secret をまとめて解決し、失敗した場合は参照ごとに `op read` へフォールバックします。
 6. 解決済みの値を環境変数に入れてコマンドを実行します。コマンド引数内の `$VAR` と `${VAR}` は、選択したアイテムから解決できた変数だけ展開します。
 
