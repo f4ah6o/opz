@@ -27,7 +27,7 @@ fn ensure_exists(path: &Path, context: &str) {
 }
 
 #[test]
-fn e2e_real_op_create_run_shorthand_gen_delete() {
+fn e2e_real_op_migrate_run_shorthand_gen_delete() {
     if std::env::var("OPZ_E2E").ok().as_deref() != Some("1") {
         eprintln!("skip e2e: set OPZ_E2E=1 to run this test");
         return;
@@ -43,7 +43,7 @@ fn e2e_real_op_create_run_shorthand_gen_delete() {
         .expect("system time before UNIX_EPOCH")
         .as_millis();
     let pid = std::process::id();
-    let item_title = format!("opz-e2e-{now}-{pid}");
+    let item_title = format!("opz-e2e/{now}-{pid}");
 
     let foo = format!("foo_{now}_{pid}");
     let bar = format!("bar_{now}_{pid}");
@@ -52,23 +52,34 @@ fn e2e_real_op_create_run_shorthand_gen_delete() {
     fs::write(&env1, env_body).expect("write .env");
     ensure_exists(&env1, "step1");
 
-    eprintln!("[e2e] step2: create item '{item_title}'");
+    eprintln!("[e2e] step2: initialize git remote and migrate item '{item_title}'");
+    run_checked(
+        Command::new("git").current_dir(temp.path()).arg("init"),
+        "step2a git init",
+    );
+    run_checked(
+        Command::new("git")
+            .current_dir(temp.path())
+            .arg("remote")
+            .arg("add")
+            .arg("origin")
+            .arg(format!("https://github.com/{item_title}.git")),
+        "step2b git remote add",
+    );
     run_checked(
         Command::new(opz_bin)
             .current_dir(temp.path())
-            .arg("create")
-            .arg(&item_title)
-            .arg(&env1),
-        "step2 create",
+            .arg("migrate")
+            .arg("--new"),
+        "step2c migrate --new",
     );
 
     // Step3a: run subcommand
-    eprintln!("[e2e] step3a: run subcommand");
+    eprintln!("[e2e] step3a: run subcommand with auto-detect");
     run_checked(
         Command::new(opz_bin)
             .current_dir(temp.path())
             .arg("run")
-            .arg(&item_title)
             .arg("--")
             .arg("sh")
             .arg("-c")
@@ -76,15 +87,14 @@ fn e2e_real_op_create_run_shorthand_gen_delete() {
             .arg("x")
             .arg(&foo)
             .arg(&bar),
-        "step3a run subcommand",
+        "step3a run subcommand auto-detect",
     );
 
     // Step3b: top-level shorthand (without explicit run)
-    eprintln!("[e2e] step3b: run shorthand");
+    eprintln!("[e2e] step3b: run shorthand with auto-detect");
     run_checked(
         Command::new(opz_bin)
             .current_dir(temp.path())
-            .arg(&item_title)
             .arg("--")
             .arg("sh")
             .arg("-c")
@@ -92,7 +102,7 @@ fn e2e_real_op_create_run_shorthand_gen_delete() {
             .arg("x")
             .arg(&foo)
             .arg(&bar),
-        "step3b shorthand",
+        "step3b shorthand auto-detect",
     );
 
     eprintln!("[e2e] step4: gen {}", env2.display());

@@ -12,10 +12,10 @@
 * Search 1Password items by title keyword.
 * Check `op` authentication, optional CLI dependencies, and plaintext `.env`-style credential files with `doctor`.
 * Show item field labels that are valid shell environment variable names.
-* Run a command with secrets from one or more 1Password items.
+* Run a command with secrets from one or more 1Password items, with repository-based item auto-detection.
 * Generate env files containing `op://...` references, preserving unrelated existing lines.
-* Create 1Password items from `.env` files or save private config files as Secure Notes.
-* Add GitHub repository metadata to existing items for migration.
+* Migrate scripts from explicit items or `.env` files to repository metadata.
+* Save private config files as Secure Notes.
 * Store valid item fields as GitHub repository secrets, guarded by item repository metadata when present.
 * Store valid item fields as Cloudflare Worker secrets through Wrangler.
 * Print the bundled `opz` Agent Skill.
@@ -95,8 +95,8 @@ This lets other agents and tools load the current `opz` usage context directly i
 Run a command with secrets from one or more 1Password items:
 
 ```bash
-opz run [OPTIONS] [--env-file <ENV>] <ITEM>... -- <COMMAND>...
-opz [OPTIONS] [--env-file <ENV>] <ITEM>... -- <COMMAND>...
+opz run [OPTIONS] [--env-file <ENV>] [<ITEM>...] -- <COMMAND>...
+opz [OPTIONS] [--env-file <ENV>] [<ITEM>...] -- <COMMAND>...
 ```
 
 Options:
@@ -104,14 +104,17 @@ Options:
 * `--env-file <ENV>` - Output env file path. If omitted, no file is written.
 
 Arguments:
-* `<ITEM>...` - One or more item titles to fetch secrets from.
+* `<ITEM>...` - Optional item titles to fetch secrets from. When omitted, `opz` auto-detects one item whose `github_repositories` metadata matches the current git remote.
 
 When `--env-file` is set, the file remains after the command exits. Existing files are merged: unrelated lines stay in place, duplicate keys are overwritten, and new keys are appended. If multiple items define the same key, later items win (`opz run foo bar ...` prefers values from `bar`).
 
 Examples:
 ```bash
-# Recommended: run with one item and no .env file generated
+# Run with one item and no .env file generated
 opz run example-item -- your-command
+
+# Recommended after migration: auto-detect item from git remote metadata
+opz run -- your-command
 
 # Run command with multiple items (later items win on duplicate keys)
 opz run foo bar -- your-command
@@ -154,44 +157,55 @@ opz --vault Private gen foo bar
 
 Stdout uses per-item comment headers such as `# --- item: <title> ---`. File output writes the merged key list without those section comments.
 
-### Create Item from `.env` or Private Config
+### Migrate Scripts and `.env`
 
-`create` has two modes, selected by the source file name:
+Migrate `justfile`/`Justfile` recipes and `package.json` scripts to repository metadata and item auto-detection:
 
 ```bash
-opz [OPTIONS] create <ITEM> [ENV]
+opz migrate [OPTIONS]
 ```
 
-Arguments:
-* `<ITEM>` - New item title when `[ENV]` is exactly `.env`.
-* `[ENV]` - Source file path. The default is `.env`.
+Options:
+* `--dry-run` - Print metadata and file changes without editing 1Password items or files.
+* `--new` - Create a new API_CREDENTIAL item from `.env` before rewriting `.env`-based scripts. The item title defaults to the first git remote repository name.
+* `--vault <NAME>` - Vault name (optional, searches all vaults if omitted)
 
 Behavior:
-* If `[ENV]` is exactly `.env`:
-  * Creates an `API_CREDENTIAL` item.
-  * Uses `<ITEM>` as the title.
-  * Adds each `KEY=VALUE` as a custom text field named `KEY`.
-  * Records parseable git remotes in a `github_repositories` metadata field, one `owner/repo` per line.
-  * Supports `export KEY=...`, inline comments (`KEY=value # note`), and `#` inside quotes.
-  * Skips invalid env keys and existing `op://...` values.
-  * For duplicate keys, the last entry wins.
-* If `[ENV]` is anything other than `.env`:
-  * Creates `SECURE_NOTE` item(s).
-  * Stores the file as a fenced note body: ```` ```<file name>\n<content>\n``` ````.
-  * Uses git remote repository names (`org/repo`) as item titles.
-  * If multiple remotes exist, creates one item per remote; duplicate titles get `-2`, `-3`, and so on.
-  * Fails if no parseable git remote is available.
+* `opz run <ITEM> -- <COMMAND>` becomes `opz run -- <COMMAND>` after recording the current git remote in `<ITEM>` metadata.
+* `opz <ITEM> -- <COMMAND>` becomes `opz -- <COMMAND>` with the same metadata update.
+* `op item get <ITEM>` is used as a metadata registration signal, but is not rewritten because it is not equivalent to `opz run`.
+* `.env`-based scripts are rewritten only with `--new`; without it, they are reported and skipped.
 
 Examples:
 ```bash
-# Create item from .env
-opz create my-service
+# Preview migration
+opz migrate --dry-run
 
-# Save private config as Secure Note (title from git remote org/repo)
-opz create ignored-item app.conf
+# Rewrite scripts and update item metadata
+opz migrate
 
-# Create item in specific vault
-opz --vault Private create my-service .env
+# Create a new item from .env and migrate .env-based scripts
+opz migrate --new
+```
+
+### Save Private Config as Secure Note
+
+Store a private config file as Secure Note item(s), titled from git remotes:
+
+```bash
+opz note <FILE>
+```
+
+Behavior:
+* Stores the file as a fenced note body: ```` ```<file name>\n<content>\n``` ````.
+* Uses git remote repository names (`org/repo`) as item titles.
+* If multiple remotes exist, creates one item per remote; duplicate titles get `-2`, `-3`, and so on.
+* Fails if no parseable git remote is available.
+
+Examples:
+```bash
+opz note app.conf
+opz --vault Private note app.conf
 ```
 
 ### Add GitHub Repository Metadata to Existing Items
@@ -388,7 +402,7 @@ Then open Jaeger Search and select service `opz` (or your `OTEL_SERVICE_NAME`) t
 * [1Password CLI](https://developer.1password.com/docs/cli/) (`op`) installed and authenticated
 * Optional: GitHub CLI (`gh`) for `github-secret`
 * Optional: Wrangler (`wrangler`) for `cloudflare-secret`
-* Optional: Git (`git`) for private config `create`
+* Optional: Git (`git`) for `migrate` and `note`
 
 ## E2E Test
 
