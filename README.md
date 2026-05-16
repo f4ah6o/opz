@@ -5,7 +5,7 @@
 [![CI](https://github.com/f4ah6o/opz/actions/workflows/publish.yaml/badge.svg)](https://github.com/f4ah6o/opz/actions/workflows/publish.yaml)
 <!-- bdg:end -->
 
-`opz` is a small wrapper around the 1Password CLI. It finds items, turns valid field labels into environment variables, and can run a command with those secrets injected.
+`opz` is a small wrapper around the 1Password CLI. It finds items, turns valid field labels into environment variables, and runs commands with those secrets injected.
 
 ## Features
 
@@ -19,19 +19,13 @@
 * Store valid item fields as GitHub repository secrets, guarded by item repository metadata when present.
 * Store valid item fields as Cloudflare Worker secrets through Wrangler.
 * Print the bundled `opz` Agent Skill.
-* Cache item lists for 60 seconds and fall back to title contains matching when exact lookup misses.
+* Cache item lists and repository metadata for 60 seconds, then fall back to title contains matching when exact lookup misses.
 
 ## Installation
 
 ```bash
 cargo install opz
 ```
-
-## Trusted publishing
-
-This repository is configured for [crates.io trusted publishing](https://crates.io/docs/trusted-publishing).
-Create a tag such as `v2026.5.1` and push it to trigger the `Publish to crates.io` workflow, which mints a short-lived token through OIDC and runs `cargo publish --locked`.
-Enable trusted publishing for the `opz` crate in the crates.io UI before the workflow requests tokens. The linked repository should be `f4ah6o/opz`.
 
 ## Usage
 
@@ -90,6 +84,20 @@ opz skills
 
 This lets other agents and tools load the current `opz` usage context directly in the Agent Skills standard format.
 
+### Removed `create` Command
+
+`opz create` no longer creates items. It remains as a hidden compatibility shim so older scripts get a clear migration error instead of an unknown-command failure.
+
+Use these commands instead:
+
+```bash
+# Create an API_CREDENTIAL item from .env and migrate supported scripts
+opz migrate --new
+
+# Store a non-.env private file as Secure Note item(s)
+opz note app.conf
+```
+
 ### Run Commands with Secrets
 
 Run a command with secrets from one or more 1Password items:
@@ -104,7 +112,7 @@ Options:
 * `--env-file <ENV>` - Output env file path. If omitted, no file is written.
 
 Arguments:
-* `<ITEM>...` - Optional item titles to fetch secrets from. When omitted, `opz` auto-detects one item whose `github_repositories` metadata matches the current git remote.
+* `<ITEM>...` - Optional item titles to fetch secrets from. When omitted, `opz` auto-detects one item whose `github_repositories` metadata matches a current git remote.
 
 When `--env-file` is set, the file remains after the command exits. Existing files are merged: unrelated lines stay in place, duplicate keys are overwritten, and new keys are appended. If multiple items define the same key, later items win (`opz run foo bar ...` prefers values from `bar`).
 
@@ -175,6 +183,7 @@ Behavior:
 * `opz <ITEM> -- <COMMAND>` becomes `opz -- <COMMAND>` with the same metadata update.
 * `op item get <ITEM>` is used as a metadata registration signal, but is not rewritten because it is not equivalent to `opz run`.
 * `.env`-based scripts are rewritten only with `--new`; without it, they are reported and skipped.
+* `package.json` is patched at the matching script string, so key order and formatting outside the changed value stay intact.
 
 Examples:
 ```bash
@@ -295,12 +304,13 @@ opz cloudflare-secret --name worker-app --env production my-service shared-secre
 
 ## How It Works
 
-1. Fetches the item list from 1Password and caches that metadata for 60 seconds.
-2. Finds one matching title. Exact match is tried first; title contains matching is used as a fallback.
-3. Fetches the matched item and builds `op://<vault_id>/<item_id>/<field>` references for fields with valid env labels.
-4. Writes an env file when requested, merging with any existing file. The recommended path is file-free `opz run`; env files are for tools that require `op://` references.
-5. Resolves secrets with `op run --env-file <temp> -- sh -c 'env -0'`, falling back to `op read` per reference if batch resolution fails.
-6. Runs the command with resolved values in the environment. `$VAR` and `${VAR}` in command arguments are expanded only for variables resolved from the selected items.
+1. When item titles are provided, `opz` fetches the item list from 1Password and caches that metadata for 60 seconds.
+2. Title lookup tries exact match first, then title contains matching.
+3. When item titles are omitted, `opz` reads git remotes, loads a cached `github_repositories` index, and accepts the result only when exactly one item matches.
+4. After the item is selected, `opz` fetches it and builds `op://<vault_id>/<item_id>/<field>` references for fields with valid env labels.
+5. If `--env-file` is set, `opz` writes references to that file and preserves unrelated existing lines. The usual path is file-free `opz run`; env files are for tools that require `op://` references.
+6. Secret values are resolved with `op run --env-file <temp> -- sh -c 'env -0'`, with `op read` per reference as a fallback.
+7. `opz` runs the command with the resolved values in the environment. `$VAR` and `${VAR}` in command arguments are expanded only for variables resolved from the selected items.
 
 `gen` stops after writing references. `show` fetches items and prints valid labels without resolving secret values.
 
@@ -330,7 +340,7 @@ sequenceDiagram
     op-->>opz: Exit status
 ```
 
-Security: `opz` delegates secret access and authentication to the `op` CLI. The 60-second cache stores item-list metadata only, not secret values.
+Security: `opz` delegates secret access and authentication to the `op` CLI. The 60-second caches store item-list and repository metadata only, not secret values.
 
 ## Tracing (OpenTelemetry + Jaeger)
 
@@ -399,10 +409,9 @@ Then open Jaeger Search and select service `opz` (or your `OTEL_SERVICE_NAME`) t
 
 ## Requirements
 
-* [1Password CLI](https://developer.1password.com/docs/cli/) (`op`) installed and authenticated
-* Optional: GitHub CLI (`gh`) for `github-secret`
-* Optional: Wrangler (`wrangler`) for `cloudflare-secret`
-* Optional: Git (`git`) for `migrate` and `note`
+Install and authenticate [1Password CLI](https://developer.1password.com/docs/cli/) (`op`) before using secret-backed commands.
+
+`github-secret` needs GitHub CLI (`gh`). `cloudflare-secret` needs Wrangler (`wrangler`). `migrate` and `note` need Git (`git`) when they read repository remotes.
 
 ## E2E Test
 

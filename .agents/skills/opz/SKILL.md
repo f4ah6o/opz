@@ -10,7 +10,7 @@ Use this skill when you need to work with 1Password-backed secrets through the `
 ## Prerequisites
 
 - 1Password CLI (`op`) is installed and authenticated.
-- The relevant vault and item names are known, can be discovered with `opz find`, or can be auto-detected from `github_repositories` metadata.
+- The relevant vault and item names are known, can be discovered with `opz find`, or can be auto-detected from `github_repositories` metadata tied to the current git remote.
 
 ## Global Options
 
@@ -74,6 +74,7 @@ opz note <FILE>
 ### `run`
 
 Run a command with secrets from one or more items injected as environment variables. `$VAR` and `${VAR}` in command arguments are expanded only when that variable was resolved from the selected items.
+When no item is passed, `run` auto-detects exactly one item whose `github_repositories` metadata matches the current git remote.
 
 ```bash
 opz run [OPTIONS] [<ITEM>...] -- <COMMAND>...
@@ -118,6 +119,10 @@ Print this bundled Agent Skills `SKILL.md` to stdout.
 opz skills
 ```
 
+### removed `create`
+
+`opz create` is hidden and only returns a migration error. Use `opz migrate --new` for `.env` imports and `opz note <FILE>` for non-`.env` private files.
+
 ## Behavior Notes
 
 - When multiple items define the same env key, later items win.
@@ -127,6 +132,7 @@ opz skills
 - `github-repo` migrates existing items by merging repository metadata into `github_repositories`.
 - `migrate` rewrites supported scripts and updates item metadata by default; use `--dry-run` to preview.
 - `migrate` treats `op item get <ITEM>` as a metadata signal but does not rewrite it.
+- `migrate` patches matching `package.json` script strings without reserializing the whole file.
 - `run` auto-detects an item when no item is passed and exactly one item matches the current git remote through `github_repositories`.
 - `github_repositories` is metadata, not an env label or deployable secret.
 - `cloudflare-secret` also uses later-item-wins and passes a JSON payload to `wrangler secret bulk` through stdin.
@@ -134,7 +140,7 @@ opz skills
 - `gen` stdout uses `op://<vault_id>/<item_id>/<field>` references, not resolved secret values.
 - When `--env-file` points to an existing file, `opz` appends new keys and overwrites duplicate keys while preserving unrelated lines.
 - `show` only prints labels that are valid shell environment variable names.
-- Item lists are cached for 60 seconds. Creating or editing items invalidates that cache best-effort.
+- Item lists and the auto-detect repository index are cached for 60 seconds. Creating or editing items invalidates those caches best-effort.
 - OTLP tracing is disabled unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set.
 
 ## Suggested Workflow

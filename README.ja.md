@@ -14,19 +14,13 @@
 * 有効なアイテムフィールドを GitHub repository secrets に保存し、item 側の repository metadata があれば誤配を防ぎます。
 * 有効なアイテムフィールドを Wrangler 経由で Cloudflare Worker secrets に保存します。
 * bundled `opz` Agent Skill を出力します。
-* アイテムリストを 60 秒キャッシュし、完全一致がない場合はタイトルの部分一致で探します。
+* アイテムリストと repository metadata を 60 秒キャッシュし、完全一致がない場合はタイトルの部分一致で探します。
 
 ## インストール
 
 ```bash
 cargo install opz
 ```
-
-## Trusted publishing
-
-このリポジトリは [crates.io trusted publishing](https://crates.io/docs/trusted-publishing) に対応しています。
-`v2026.5.1` のようなタグを作成してプッシュすると、`Publish to crates.io` ワークフローがトリガーされ、OIDC 経由で短期間有効なトークンを取得し、`cargo publish --locked` を実行します。
-ワークフローがトークンをリクエストできるようにするには、crates.io UI で `opz` クレートの trusted publishing を有効にします。リンク先 repository は `f4ah6o/opz` です。
 
 ## 使い方
 
@@ -85,6 +79,20 @@ opz skills
 
 これにより、他の agent や tool は Agent Skills 標準形式で `opz` の利用コンテキストをそのまま読み込めます。
 
+### 削除済みの `create` コマンド
+
+`opz create` は item を作成しません。古い script が unknown command で失敗しないよう、隠し互換コマンドとして残し、移行先を示すエラーを返します。
+
+代わりに次を使います:
+
+```bash
+# .env から API_CREDENTIAL item を作成し、対応 script を migrate
+opz migrate --new
+
+# .env 以外の private file を Secure Note item として保存
+opz note app.conf
+```
+
 ### Secret 付きでコマンド実行
 
 1 つ以上の 1Password アイテムから secret を取得してコマンドを実行します:
@@ -99,7 +107,7 @@ opz [OPTIONS] [--env-file <ENV>] [<ITEM>...] -- <COMMAND>...
 * `--env-file <ENV>` - 出力 env ファイルパス。省略時はファイルを書きません。
 
 引数:
-* `<ITEM>...` - secret を取得する任意のアイテムタイトル。省略時は、現在の git remote と一致する `github_repositories` metadata を持つ item を自動検出します。
+* `<ITEM>...` - secret を取得する任意のアイテムタイトル。省略時は、現在の git remote と一致する `github_repositories` metadata を持つ item を 1 件だけ自動検出します。
 
 `--env-file` を指定すると、env ファイルはコマンド終了後も残ります。既存ファイルはマージされ、無関係な行は残り、重複キーは上書きされ、新しいキーは末尾に追加されます。複数アイテムで同じキーがある場合は後勝ちです（`opz run foo bar ...` では `bar` の値が優先）。
 
@@ -170,6 +178,7 @@ opz migrate [OPTIONS]
 * `opz <ITEM> -- <COMMAND>` も同様に `opz -- <COMMAND>` へ書き換えます。
 * `op item get <ITEM>` は metadata 登録の手がかりとして使いますが、`opz run` と等価ではないため書き換えません。
 * `.env` ベースの script は `--new` 指定時だけ書き換えます。指定がない場合は報告してスキップします。
+* `package.json` は該当する script 文字列だけを置き換えるため、それ以外の key 順や整形は維持します。
 
 例:
 ```bash
@@ -290,12 +299,13 @@ opz cloudflare-secret --name worker-app --env production my-service shared-secre
 
 ## 仕組み
 
-1. 1Password からアイテムリストを取得し、そのメタデータを 60 秒キャッシュします。
-2. タイトルで一致するアイテムを 1 件探します。まず完全一致、見つからなければタイトルの部分一致を使います。
-3. 一致したアイテムを取得し、有効な env ラベルを持つフィールドから `op://<vault_id>/<item_id>/<field>` 参照を作ります。
-4. env ファイル指定があれば、既存ファイルとマージして書き込みます。推奨は file-free な `opz run` で、env ファイルは `op://` 参照を必要とする tool 向けです。
-5. `op run --env-file <temp> -- sh -c 'env -0'` で secret をまとめて解決し、失敗した場合は参照ごとに `op read` へフォールバックします。
-6. 解決済みの値を環境変数に入れてコマンドを実行します。コマンド引数内の `$VAR` と `${VAR}` は、選択したアイテムから解決できた変数だけ展開します。
+1. item title が指定されている場合、1Password から item list を取得し、その metadata を 60 秒キャッシュします。
+2. title lookup はまず完全一致、見つからなければタイトルの部分一致を使います。
+3. item title が省略されている場合、git remote を読み、cached `github_repositories` index から一致 item を探します。1 件だけ一致した場合に限って採用します。
+4. item が決まると、その item を取得し、有効な env ラベルを持つフィールドから `op://<vault_id>/<item_id>/<field>` 参照を作ります。
+5. `--env-file` 指定があれば、参照をファイルに書き込み、既存ファイルの無関係な行は残します。通常は file-free な `opz run` を使い、env ファイルは `op://` 参照を必要とする tool 向けです。
+6. `op run --env-file <temp> -- sh -c 'env -0'` で secret をまとめて解決し、失敗した場合は参照ごとに `op read` へフォールバックします。
+7. 解決済みの値を環境変数に入れてコマンドを実行します。コマンド引数内の `$VAR` と `${VAR}` は、選択した item から解決できた変数だけ展開します。
 
 `gen` は参照を書いたところで終了します。`show` は secret 値を解決せず、有効なラベルだけを表示します。
 
@@ -325,7 +335,7 @@ sequenceDiagram
     op-->>opz: 終了ステータス
 ```
 
-セキュリティ: `opz` は secret へのアクセスと認証を `op` CLI に任せます。60 秒キャッシュするのはアイテムリストのメタデータだけで、secret 値は保存しません。
+セキュリティ: `opz` は secret へのアクセスと認証を `op` CLI に任せます。60 秒キャッシュするのは item list と repository metadata だけで、secret 値は保存しません。
 
 ## Tracing（OpenTelemetry + Jaeger）
 
@@ -394,10 +404,9 @@ Jaeger の Search で service `opz`（または `OTEL_SERVICE_NAME`）を選び�
 
 ## 要件
 
-* [1Password CLI](https://developer.1password.com/docs/cli/) (`op`) がインストールされ、認証されていること
-* 任意: `github-secret` 用の GitHub CLI (`gh`)
-* 任意: `cloudflare-secret` 用の Wrangler (`wrangler`)
-* 任意: `migrate` と `note` 用の Git (`git`)
+[1Password CLI](https://developer.1password.com/docs/cli/) (`op`) をインストールし、認証してから secret-backed command を使います。
+
+`github-secret` には GitHub CLI (`gh`) が必要です。`cloudflare-secret` には Wrangler (`wrangler`) が必要です。`migrate` と `note` は repository remote を読むために Git (`git`) を使います。
 
 ## E2Eテスト
 
