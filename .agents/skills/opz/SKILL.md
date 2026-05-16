@@ -15,7 +15,7 @@ Use this skill when you need to work with 1Password-backed secrets through the `
 ## Global Options
 
 - `--vault <NAME>` limits item lookup to a specific 1Password vault.
-- `--env-file <ENV>` writes generated env references to a file for `run` and `gen`.
+- `--env-file <ENV>` writes generated `op://` references to a file for `run` and `gen`; prefer file-free `run` unless another tool requires an env file.
 
 ## Commands
 
@@ -38,7 +38,7 @@ opz show --with-item <ITEM>...
 
 ### `doctor`
 
-Check `op` authentication and external command dependencies. Required `op` failures exit non-zero; missing optional tools are warnings.
+Check `op` authentication, external command dependencies, and plaintext `.env`-style credential files. Required `op` failures exit non-zero; missing optional tools and credential-file findings are warnings.
 
 ```bash
 opz doctor
@@ -55,7 +55,7 @@ opz gen --env-file .env.local <ITEM>...
 
 ### `create`
 
-Create a 1Password item from `.env` or another private config file. Exact `.env` input creates an `API_CREDENTIAL` titled with `<ITEM>`. Other files create `SECURE_NOTE` items titled from parseable git remotes such as `org/repo`.
+Create a 1Password item from `.env` or another private config file. Exact `.env` input creates an `API_CREDENTIAL` titled with `<ITEM>` and records parseable git remotes in `github_repositories`. Other files create `SECURE_NOTE` items titled from parseable git remotes such as `org/repo`.
 
 ```bash
 opz create <ITEM> [ENV]
@@ -72,12 +72,22 @@ opz [OPTIONS] <ITEM>... -- <COMMAND>...
 
 ### `github-secret`
 
-Store valid item fields as GitHub repository secrets.
+Store valid item fields as GitHub repository secrets. If an item has `github_repositories` metadata, the target repository must match before secrets are resolved or written.
 
 ```bash
 opz github-secret [OPTIONS] <ITEM>...
 opz github-secret --repo owner/repo <ITEM>...
 opz github-secret --dry-run <ITEM>...
+```
+
+### `github-repo`
+
+Add or update `github_repositories` metadata on existing 1Password items. `--repo` can be repeated; if omitted, parseable git remotes from the current repository are used.
+
+```bash
+opz github-repo [OPTIONS] <ITEM>...
+opz github-repo --repo owner/repo --repo other/service <ITEM>...
+opz github-repo --dry-run <ITEM>...
 ```
 
 ### `cloudflare-secret`
@@ -101,9 +111,11 @@ opz skills
 ## Behavior Notes
 
 - When multiple items define the same env key, later items win.
-- `doctor` checks `op` as required and reports `gh`, `wrangler`, `git`, and `sh` as optional dependencies.
+- `doctor` checks `op` as required and reports `gh`, `wrangler`, `git`, `sh`, `secretlint`, and plaintext `.env`-style files as optional warnings.
 - `github-secret` also uses later-item-wins and passes values to `gh secret set` through stdin.
-- `github-secret` rejects names starting with `GITHUB_`.
+- `github-secret` rejects names starting with `GITHUB_` and blocks writes when item `github_repositories` metadata does not include the target repo.
+- `github-repo` migrates existing items by merging repository metadata into `github_repositories`.
+- `github_repositories` is metadata, not an env label or deployable secret.
 - `cloudflare-secret` also uses later-item-wins and passes a JSON payload to `wrangler secret bulk` through stdin.
 - `cloudflare-secret` supports `--name`, `--env`, and `--config` for Wrangler target selection.
 - `gen` stdout uses `op://<vault_id>/<item_id>/<field>` references, not resolved secret values.
@@ -117,7 +129,8 @@ opz skills
 1. Discover candidate items with `opz find`.
 2. Run `opz doctor` if `op` authentication or a dependency CLI looks suspicious.
 3. Inspect available labels with `opz show`.
-4. Use `opz gen --env-file ...` when another tool needs `op://` references in a file.
-5. Use `opz github-secret --dry-run ...` before writing GitHub repository secrets.
-6. Use `opz cloudflare-secret --dry-run ...` before writing Cloudflare Worker secrets.
-7. Use `opz run ... -- <COMMAND>` when you want to execute a command with injected secrets directly.
+4. Use `opz run ... -- <COMMAND>` for the normal file-free workflow.
+5. Use `opz gen --env-file ...` only when another tool needs `op://` references in a file.
+6. Use `opz github-repo --dry-run ...` to preview repository metadata migration for older items.
+7. Use `opz github-secret --dry-run ...` before writing GitHub repository secrets.
+8. Use `opz cloudflare-secret --dry-run ...` before writing Cloudflare Worker secrets.

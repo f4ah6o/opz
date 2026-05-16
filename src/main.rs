@@ -9,7 +9,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env,
     ffi::OsString,
     fs,
@@ -86,6 +86,21 @@ enum Cmd {
             help = "Source file path (defaults to .env). Non-.env creates Secure Note(s) named from git remotes."
         )]
         source_file: Option<PathBuf>,
+    },
+
+    /// Add or update GitHub repository metadata on existing 1Password items
+    GithubRepo {
+        /// Repository in OWNER/REPO form. Repeat for multiple repositories. Defaults to current git remotes.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Vec<String>,
+
+        /// Print updates without editing 1Password items
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Item titles
+        #[arg(value_name = "ITEM", num_args = 1..)]
+        items: Vec<String>,
     },
 
     /// Run command with secrets from 1Password item
@@ -189,6 +204,7 @@ struct ItemCreateField {
 }
 
 static OPZ_SKILL: &str = include_str!("../.agents/skills/opz/SKILL.md");
+const GITHUB_REPOSITORIES_LABEL: &str = "github_repositories";
 
 #[derive(Debug)]
 struct DoctorFailure;
@@ -291,11 +307,19 @@ fn run_cli(args: &[OsString]) -> Result<()> {
         Some(Cmd::Doctor) => run_doctor(),
         Some(Cmd::Skills) => print_bundled_skill(),
         Some(Cmd::Show { with_item, items }) => show_item_labels(&cli, items, *with_item),
-        Some(Cmd::Gen { items, env_file }) => generate_env_output(&cli, items, env_file.as_deref()),
+        Some(Cmd::Gen { items, env_file }) => {
+            print_credential_file_advice_for_secret_command("gen");
+            generate_env_output(&cli, items, env_file.as_deref())
+        }
         Some(Cmd::Create { item, source_file }) => {
             let env_path = source_file.as_deref().unwrap_or_else(|| Path::new(".env"));
             create_item_from_env(&cli, item, env_path)
         }
+        Some(Cmd::GithubRepo {
+            repo,
+            dry_run,
+            items,
+        }) => update_github_repositories_metadata(&cli, repo, *dry_run, items),
         Some(Cmd::Run {
             items,
             env_file,
@@ -306,29 +330,36 @@ fn run_cli(args: &[OsString]) -> Result<()> {
                     "Command required after '--'. Usage: opz run [OPTIONS] [--env-file <ENV>] <ITEM>... -- <COMMAND>..."
                 ));
             }
+            print_credential_file_advice_for_secret_command("run");
             run_with_items(&cli, items, env_file.as_deref(), command)
         }
         Some(Cmd::GithubSecret {
             repo,
             dry_run,
             items,
-        }) => set_github_secrets(&cli, repo.as_deref(), *dry_run, items),
+        }) => {
+            print_credential_file_advice_for_secret_command("github-secret");
+            set_github_secrets(&cli, repo.as_deref(), *dry_run, items)
+        }
         Some(Cmd::CloudflareSecret {
             name,
             env,
             config,
             dry_run,
             items,
-        }) => set_cloudflare_secrets(
-            &cli,
-            CloudflareSecretTarget {
-                name: name.as_deref(),
-                env: env.as_deref(),
-                config: config.as_deref(),
-            },
-            *dry_run,
-            items,
-        ),
+        }) => {
+            print_credential_file_advice_for_secret_command("cloudflare-secret");
+            set_cloudflare_secrets(
+                &cli,
+                CloudflareSecretTarget {
+                    name: name.as_deref(),
+                    env: env.as_deref(),
+                    config: config.as_deref(),
+                },
+                *dry_run,
+                items,
+            )
+        }
         None => {
             if cli.items.is_empty() {
                 return Err(anyhow!(
@@ -341,6 +372,7 @@ fn run_cli(args: &[OsString]) -> Result<()> {
                     "Command required after '--'. Usage: opz [OPTIONS] [--env-file <ENV>] <ITEM>... -- <COMMAND>..."
                 ));
             }
+            print_credential_file_advice_for_secret_command("run");
             run_with_items(&cli, &cli.items, cli.env_file.as_deref(), &cli.command)
         }
     }
@@ -386,6 +418,7 @@ fn detect_command_hint(args: &[OsString]) -> &'static str {
             "show" => "show",
             "gen" => "gen",
             "create" => "create",
+            "github-repo" => "github-repo",
             "run" => "run",
             "github-secret" => "github-secret",
             "cloudflare-secret" => "cloudflare-secret",
@@ -488,6 +521,12 @@ fn collect_doctor_checks() -> Vec<DoctorCheck> {
                 "needed by create",
             ));
             checks.push(optional_cli_check("sh", &["--version"], "needed by run"));
+            checks.push(optional_cli_check(
+                "secretlint",
+                &["--version"],
+                "needed by doctor plaintext credential scan",
+            ));
+            checks.push(check_credential_files());
             return checks;
         }
     }
@@ -510,8 +549,249 @@ fn collect_doctor_checks() -> Vec<DoctorCheck> {
         "needed by create",
     ));
     checks.push(optional_cli_check("sh", &["--version"], "needed by run"));
+    checks.push(optional_cli_check(
+        "secretlint",
+        &["--version"],
+        "needed by doctor plaintext credential scan",
+    ));
+    checks.push(check_credential_files());
 
     checks
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CredentialFileFinding {
+    path: PathBuf,
+    plaintext_entries: usize,
+}
+
+fn print_credential_file_advice_for_secret_command(command: &str) {
+    if env::var_os("OPZ_SKIP_CREDENTIAL_SCAN").is_some() {
+        return;
+    }
+    let Ok(findings) = find_plaintext_credential_files_in_project() else {
+        return;
+    };
+    if findings.is_empty() {
+        return;
+    }
+
+    eprintln!(
+        "Advice: found plaintext credential env file(s) while running `{command}`: {}. Prefer `opz run <ITEM> -- <COMMAND>` without an env file; use `opz create <ITEM> .env` to import plaintext values and `opz gen --env-file <FILE> <ITEM>` only when a tool requires op:// references.",
+        credential_finding_path_list(&findings)
+    );
+}
+
+fn check_credential_files() -> DoctorCheck {
+    let findings = match find_plaintext_credential_files_in_project() {
+        Ok(findings) => findings,
+        Err(err) => return DoctorCheck::warn("credential files", err.to_string()),
+    };
+
+    if findings.is_empty() {
+        return DoctorCheck::ok(
+            "credential files",
+            "no plaintext env credential files found",
+            false,
+        );
+    }
+
+    let advice = credential_file_advice(&findings);
+    if find_command_path("secretlint").is_none() {
+        return DoctorCheck::warn(
+            "credential files",
+            format!("{advice}; secretlint not found in PATH"),
+        );
+    }
+
+    match run_secretlint_on_files(&findings) {
+        Ok(SecretlintOutcome::Clean) => DoctorCheck::warn(
+            "credential files",
+            format!("{advice}; secretlint found no configured rule violations"),
+        ),
+        Ok(SecretlintOutcome::Findings) => DoctorCheck::warn(
+            "credential files",
+            format!("{advice}; secretlint reported possible plaintext secrets"),
+        ),
+        Err(err) => DoctorCheck::warn("credential files", format!("{advice}; {err}")),
+    }
+}
+
+fn credential_file_advice(findings: &[CredentialFileFinding]) -> String {
+    format!(
+        "found plaintext credential env file(s): {}; prefer `opz run <ITEM> -- <COMMAND>` without an env file, import with `opz create <ITEM> .env`, and generate files only with `opz gen --env-file <FILE> <ITEM>` when required",
+        credential_finding_path_list(findings)
+    )
+}
+
+fn credential_finding_path_list(findings: &[CredentialFileFinding]) -> String {
+    findings
+        .iter()
+        .take(5)
+        .map(|finding| {
+            format!(
+                "{} ({} entr{})",
+                finding.path.display(),
+                finding.plaintext_entries,
+                if finding.plaintext_entries == 1 {
+                    "y"
+                } else {
+                    "ies"
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecretlintOutcome {
+    Clean,
+    Findings,
+}
+
+fn run_secretlint_on_files(
+    findings: &[CredentialFileFinding],
+) -> std::result::Result<SecretlintOutcome, String> {
+    let mut cmd = Command::new("secretlint");
+    cmd.arg("--format").arg("json").arg("--no-color");
+    for finding in findings {
+        cmd.arg(&finding.path);
+    }
+
+    let out = cmd
+        .output()
+        .map_err(|err| format!("failed to run `secretlint`: {err}"))?;
+
+    match out.status.code() {
+        Some(0) => Ok(SecretlintOutcome::Clean),
+        Some(1) => Ok(SecretlintOutcome::Findings),
+        _ => {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            Err(if stderr.is_empty() {
+                format!("secretlint failed with status {}", out.status)
+            } else {
+                format!("secretlint failed: {stderr}")
+            })
+        }
+    }
+}
+
+fn find_plaintext_credential_files_in_project() -> Result<Vec<CredentialFileFinding>> {
+    let root = project_scan_root()?;
+    let mut findings = Vec::new();
+    collect_plaintext_credential_files(&root, &root, &mut findings)?;
+    findings.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(findings)
+}
+
+fn project_scan_root() -> Result<PathBuf> {
+    if let Ok(out) = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+    {
+        if out.status.success() {
+            let root = String::from_utf8(out.stdout)
+                .context("git rev-parse output was not valid UTF-8")?
+                .trim()
+                .to_string();
+            if !root.is_empty() {
+                return Ok(PathBuf::from(root));
+            }
+        }
+    }
+    env::current_dir().context("failed to read current directory")
+}
+
+fn collect_plaintext_credential_files(
+    root: &Path,
+    dir: &Path,
+    findings: &mut Vec<CredentialFileFinding>,
+) -> Result<()> {
+    for entry in fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+
+        if file_type.is_dir() {
+            if should_skip_scan_dir(&name) {
+                continue;
+            }
+            collect_plaintext_credential_files(root, &path, findings)?;
+            continue;
+        }
+
+        if !file_type.is_file() || !is_credential_env_file_name(&name) {
+            continue;
+        }
+
+        let plaintext_entries = count_plaintext_env_entries(&path)?;
+        if plaintext_entries == 0 {
+            continue;
+        }
+
+        let relative = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
+        findings.push(CredentialFileFinding {
+            path: relative,
+            plaintext_entries,
+        });
+    }
+
+    Ok(())
+}
+
+fn should_skip_scan_dir(name: &str) -> bool {
+    matches!(
+        name,
+        ".git" | "target" | "node_modules" | ".cache" | "dist" | "build"
+    )
+}
+
+fn is_credential_env_file_name(name: &str) -> bool {
+    if is_example_credential_env_file_name(name) {
+        return false;
+    }
+    name == ".env" || name.starts_with(".env.") || name.ends_with(".env") || name.contains(".env.")
+}
+
+fn is_example_credential_env_file_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.ends_with(".example")
+        || lower.ends_with(".sample")
+        || lower.ends_with(".template")
+        || lower.ends_with(".bak")
+        || lower.ends_with(".old")
+}
+
+fn count_plaintext_env_entries(path: &Path) -> Result<usize> {
+    let content = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let label_re = Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*$")?;
+    let mut count = 0;
+
+    for raw_line in content.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let normalized = match line.strip_prefix("export") {
+            Some(rest) if rest.chars().next().is_some_and(char::is_whitespace) => rest.trim_start(),
+            _ => line,
+        };
+        let Some((raw_key, raw_value)) = normalized.split_once('=') else {
+            continue;
+        };
+        if !label_re.is_match(raw_key.trim()) {
+            continue;
+        }
+        let value = normalize_env_value(raw_value);
+        if !value.is_empty() && !is_op_reference(&value) {
+            count += 1;
+        }
+    }
+
+    Ok(count)
 }
 
 fn check_required_cli_version(
@@ -704,6 +984,28 @@ fn collect_item_env_sections(cli: &Cli, items: &[String]) -> Result<Vec<(String,
     }
 
     Ok(sections)
+}
+
+fn collect_item_env_sections_with_github_repos(
+    cli: &Cli,
+    items: &[String],
+) -> Result<(Vec<(String, Vec<String>)>, Vec<ItemGithubRepositories>)> {
+    let mut sections = Vec::with_capacity(items.len());
+    let mut repositories = Vec::with_capacity(items.len());
+
+    for item_title in items {
+        let (item_id, vault_id, resolved_title, item) =
+            find_item(cli.vault.as_deref(), item_title)?;
+        let env_lines = item_to_env_lines(&item, &vault_id, &item_id)?;
+        let github_repositories = item_github_repositories(&item);
+        sections.push((resolved_title.clone(), env_lines));
+        repositories.push(ItemGithubRepositories {
+            item_title: resolved_title,
+            repositories: github_repositories,
+        });
+    }
+
+    Ok((sections, repositories))
 }
 
 fn collect_item_label_sections(cli: &Cli, items: &[String]) -> Result<Vec<(String, Vec<String>)>> {
@@ -928,10 +1230,11 @@ fn create_api_credential_item_from_env(cli: &Cli, item_title: &str, env_file: &P
         ));
     }
 
+    let github_repositories = list_remote_repo_names().unwrap_or_default();
     let (args, template) = telemetry_span::with_span("main_operation", vec![], || {
         (
             build_create_item_args(cli.vault.as_deref()),
-            build_api_credential_template(item_title, &env_pairs),
+            build_api_credential_template(item_title, &env_pairs, &github_repositories),
         )
     });
     telemetry_span::with_span_result("write_outputs", vec![], || {
@@ -956,14 +1259,25 @@ fn build_create_item_args(vault: Option<&str>) -> Vec<String> {
 fn build_api_credential_template(
     item_title: &str,
     env_pairs: &[(String, String)],
+    github_repositories: &[String],
 ) -> ItemCreateTemplate {
-    let mut fields = Vec::with_capacity(env_pairs.len());
+    let mut fields =
+        Vec::with_capacity(env_pairs.len() + usize::from(!github_repositories.is_empty()));
     for (key, value) in env_pairs {
         fields.push(ItemCreateField {
             id: key.clone(),
             field_type: "STRING".to_string(),
             label: key.clone(),
             value: value.clone(),
+            purpose: None,
+        });
+    }
+    if !github_repositories.is_empty() {
+        fields.push(ItemCreateField {
+            id: GITHUB_REPOSITORIES_LABEL.to_string(),
+            field_type: "STRING".to_string(),
+            label: GITHUB_REPOSITORIES_LABEL.to_string(),
+            value: github_repositories.join("\n"),
             purpose: None,
         });
     }
@@ -1008,6 +1322,135 @@ fn create_secure_notes_from_file(cli: &Cli, file_path: &Path) -> Result<()> {
         invalidate_item_list_cache_best_effort();
         Ok(())
     })
+}
+
+fn update_github_repositories_metadata(
+    cli: &Cli,
+    repos: &[String],
+    dry_run: bool,
+    items: &[String],
+) -> Result<()> {
+    let requested_repos = resolve_requested_github_repositories(repos)?;
+    if requested_repos.is_empty() {
+        return Err(anyhow!(
+            "No GitHub repositories found. Run inside a git repository with a parseable remote, or pass --repo owner/repo."
+        ));
+    }
+
+    telemetry_span::with_span_result(
+        "write_outputs.github_repo_metadata",
+        vec![
+            KeyValue::new("item.count", items.len() as i64),
+            KeyValue::new("github.repo_count", requested_repos.len() as i64),
+        ],
+        || {
+            for item_title in items {
+                let (item_id, _, resolved_title, item) =
+                    find_item(cli.vault.as_deref(), item_title)?;
+                let merged_repos = merge_github_repository_lists(
+                    &item_github_repositories(&item),
+                    &requested_repos,
+                );
+                if dry_run {
+                    println!(
+                        "Would set {} on {} to {}",
+                        GITHUB_REPOSITORIES_LABEL,
+                        resolved_title,
+                        merged_repos.join(", ")
+                    );
+                    continue;
+                }
+
+                run_op_item_edit_github_repositories(
+                    cli.vault.as_deref(),
+                    &item_id,
+                    &merged_repos,
+                )?;
+                println!(
+                    "Set {} on {} to {}",
+                    GITHUB_REPOSITORIES_LABEL,
+                    resolved_title,
+                    merged_repos.join(", ")
+                );
+            }
+            if !dry_run {
+                invalidate_item_list_cache_best_effort();
+            }
+            Ok(())
+        },
+    )
+}
+
+fn resolve_requested_github_repositories(repos: &[String]) -> Result<Vec<String>> {
+    let raw_repos = if repos.is_empty() {
+        list_remote_repo_names()?
+    } else {
+        repos.to_vec()
+    };
+    let normalized: Vec<String> = raw_repos
+        .iter()
+        .filter_map(|repo| normalize_github_repo_spec(repo))
+        .collect();
+    if normalized.len() != raw_repos.len() {
+        return Err(anyhow!(
+            "Invalid GitHub repository. Expected owner/repo, https://github.com/owner/repo.git, or git@github.com:owner/repo.git"
+        ));
+    }
+    Ok(dedupe_github_repositories(&normalized))
+}
+
+fn merge_github_repository_lists(existing: &[String], requested: &[String]) -> Vec<String> {
+    let mut repos = Vec::with_capacity(existing.len() + requested.len());
+    repos.extend(existing.iter().cloned());
+    repos.extend(requested.iter().cloned());
+    dedupe_github_repositories(&repos)
+}
+
+fn dedupe_github_repositories(repos: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    repos
+        .iter()
+        .filter_map(|repo| normalize_github_repo_spec(repo))
+        .filter(|repo| seen.insert(repo.clone()))
+        .collect()
+}
+
+fn build_op_item_edit_github_repositories_args(
+    vault: Option<&str>,
+    item_id: &str,
+    repositories: &[String],
+) -> Vec<String> {
+    let mut args = vec!["item".to_string(), "edit".to_string(), item_id.to_string()];
+    if let Some(vault) = vault {
+        args.push("--vault".to_string());
+        args.push(vault.to_string());
+    }
+    args.push(format!(
+        "{}={}",
+        GITHUB_REPOSITORIES_LABEL,
+        repositories.join("\n")
+    ));
+    args
+}
+
+fn run_op_item_edit_github_repositories(
+    vault: Option<&str>,
+    item_id: &str,
+    repositories: &[String],
+) -> Result<()> {
+    let args = build_op_item_edit_github_repositories_args(vault, item_id, repositories);
+    let status = Command::new("op")
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .context("failed to run `op item edit`")?;
+
+    if !status.success() {
+        return Err(anyhow!("op item edit failed with status: {}", status));
+    }
+    Ok(())
 }
 
 fn build_secure_note_body(file_name: &str, content: &str) -> String {
@@ -1353,10 +1796,10 @@ fn set_github_secrets(
     dry_run: bool,
     items: &[String],
 ) -> Result<()> {
-    let sections = telemetry_span::with_span_result(
+    let (sections, item_repositories) = telemetry_span::with_span_result(
         "load_inputs",
         vec![KeyValue::new("item.count", items.len() as i64)],
-        || collect_item_env_sections(cli, items),
+        || collect_item_env_sections_with_github_repos(cli, items),
     )?;
     let merged_env_lines =
         telemetry_span::with_span("main_operation", vec![], || merge_env_lines(&sections));
@@ -1370,6 +1813,8 @@ fn set_github_secrets(
             Some(repo) => Ok(repo.to_string()),
             None => resolve_current_github_repo(),
         })?;
+
+    guard_github_secret_repo(&resolved_repo, &item_repositories)?;
 
     if dry_run {
         return telemetry_span::with_span("write_outputs", vec![], || {
@@ -1401,6 +1846,52 @@ fn set_github_secrets(
             Ok(())
         },
     )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ItemGithubRepositories {
+    item_title: String,
+    repositories: Vec<String>,
+}
+
+fn guard_github_secret_repo(
+    resolved_repo: &str,
+    item_repositories: &[ItemGithubRepositories],
+) -> Result<()> {
+    let normalized_target = normalize_github_repo_spec(resolved_repo)
+        .ok_or_else(|| anyhow!("Invalid GitHub repository: {resolved_repo}"))?;
+    let mut missing_metadata = Vec::new();
+
+    for item in item_repositories {
+        if item.repositories.is_empty() {
+            missing_metadata.push(item.item_title.as_str());
+            continue;
+        }
+
+        let allowed: HashSet<String> = item
+            .repositories
+            .iter()
+            .filter_map(|repo| normalize_github_repo_spec(repo))
+            .collect();
+        if !allowed.contains(&normalized_target) {
+            return Err(anyhow!(
+                "GitHub repository mismatch for item `{}`: target `{}` is not listed in `{}`. Add the repository to the item metadata or pass a matching --repo.",
+                item.item_title,
+                resolved_repo,
+                GITHUB_REPOSITORIES_LABEL
+            ));
+        }
+    }
+
+    if !missing_metadata.is_empty() {
+        eprintln!(
+            "Warning: item(s) missing `{}` metadata: {}. Add one owner/repo per line to prevent GitHub secret misdelivery.",
+            GITHUB_REPOSITORIES_LABEL,
+            missing_metadata.join(", ")
+        );
+    }
+
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -1797,6 +2288,77 @@ fn item_to_env_lines(item: &ItemGet, vault_id: &str, item_id: &str) -> Result<Ve
     Ok(out)
 }
 
+fn item_github_repositories(item: &ItemGet) -> Vec<String> {
+    let mut repositories = Vec::new();
+    for field in &item.fields {
+        let Some(label) = field.label.as_deref() else {
+            continue;
+        };
+        if !label.eq_ignore_ascii_case(GITHUB_REPOSITORIES_LABEL) {
+            continue;
+        }
+        let Some(value) = item_field_string_value(field) else {
+            continue;
+        };
+        repositories.extend(parse_github_repositories_value(&value));
+    }
+
+    let mut seen = HashSet::new();
+    repositories
+        .into_iter()
+        .filter(|repo| seen.insert(repo.to_ascii_lowercase()))
+        .collect()
+}
+
+fn item_field_string_value(field: &ItemField) -> Option<String> {
+    match field.value.as_ref()? {
+        serde_json::Value::String(value) => Some(value.clone()),
+        value => value.as_str().map(str::to_string),
+    }
+}
+
+fn parse_github_repositories_value(value: &str) -> Vec<String> {
+    value
+        .split(|ch: char| ch == ',' || ch == '\n' || ch == '\r' || ch == '\t')
+        .filter_map(normalize_github_repo_spec)
+        .collect()
+}
+
+fn normalize_github_repo_spec(value: &str) -> Option<String> {
+    let mut text = value.trim();
+    if text.is_empty() {
+        return None;
+    }
+
+    text = text.trim_end_matches('/');
+    let path = if let Some((_, rest)) = text.split_once("://") {
+        let (_, path_part) = rest.split_once('/')?;
+        path_part
+    } else if text.contains('@') && text.contains(':') {
+        let (_, path_part) = text.split_once(':')?;
+        path_part
+    } else {
+        text
+    };
+
+    let normalized = path
+        .split(['?', '#'])
+        .next()?
+        .trim_matches('/')
+        .trim_end_matches(".git");
+    let segments: Vec<&str> = normalized
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    if segments.len() < 2 {
+        return None;
+    }
+
+    let owner = segments[segments.len() - 2].to_ascii_lowercase();
+    let repo = segments[segments.len() - 1].to_ascii_lowercase();
+    Some(format!("{owner}/{repo}"))
+}
+
 fn collect_item_labels(item: &ItemGet) -> Result<Vec<String>> {
     let re = Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*$")?;
     let mut labels = Vec::new();
@@ -1805,6 +2367,9 @@ fn collect_item_labels(item: &ItemGet) -> Result<Vec<String>> {
         let Some(label) = f.label.as_ref() else {
             continue;
         };
+        if is_metadata_label(label) {
+            continue;
+        }
         if !re.is_match(label) || f.value.is_none() {
             continue;
         }
@@ -1822,6 +2387,9 @@ fn item_to_valid_labels(item: &ItemGet) -> Result<Vec<String>> {
         let Some(label) = f.label.as_ref() else {
             continue;
         };
+        if is_metadata_label(label) {
+            continue;
+        }
         if !re.is_match(label) {
             continue;
         }
@@ -1829,6 +2397,10 @@ fn item_to_valid_labels(item: &ItemGet) -> Result<Vec<String>> {
     }
 
     Ok(out)
+}
+
+fn is_metadata_label(label: &str) -> bool {
+    label.eq_ignore_ascii_case(GITHUB_REPOSITORIES_LABEL)
 }
 
 /// Parse env line to extract key name (e.g., "KEY=value" -> "KEY")
@@ -2119,6 +2691,7 @@ mod tests {
             make_field(Some("NO_VALUE"), false),
             make_field(None, true),
             make_field(Some("DB_HOST"), true),
+            make_field(Some(GITHUB_REPOSITORIES_LABEL), true),
         ]);
 
         let labels = collect_item_labels(&item).unwrap();
@@ -2197,9 +2770,48 @@ mod tests {
             make_field(Some("VALID_KEY"), false),
             make_field(Some("invalid-key"), true),
             make_field(None, true),
+            make_field(Some(GITHUB_REPOSITORIES_LABEL), true),
         ]);
         let labels = valid_labels(&item);
         assert_eq!(labels, vec!["VALID_KEY".to_string()]);
+    }
+
+    #[test]
+    fn test_item_github_repositories_parses_metadata_field() {
+        let item = make_item(vec![ItemField {
+            label: Some(GITHUB_REPOSITORIES_LABEL.to_string()),
+            value: Some(serde_json::Value::String(
+                "Owner/Repo\nhttps://github.com/Other/Service.git, git@github.com:Org/App.git"
+                    .to_string(),
+            )),
+        }]);
+
+        let repos = item_github_repositories(&item);
+        assert_eq!(
+            repos,
+            vec![
+                "owner/repo".to_string(),
+                "other/service".to_string(),
+                "org/app".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_normalize_github_repo_spec_accepts_urls_and_owner_repo() {
+        assert_eq!(
+            normalize_github_repo_spec("Owner/Repo"),
+            Some("owner/repo".to_string())
+        );
+        assert_eq!(
+            normalize_github_repo_spec("https://github.com/Owner/Repo.git"),
+            Some("owner/repo".to_string())
+        );
+        assert_eq!(
+            normalize_github_repo_spec("git@github.com:Owner/Repo.git"),
+            Some("owner/repo".to_string())
+        );
+        assert_eq!(normalize_github_repo_spec("not-a-repo"), None);
     }
 
     #[test]
@@ -2605,7 +3217,7 @@ SINGLE='value # kept'
         ];
 
         let args = build_create_item_args(Some("Private"));
-        let template = build_api_credential_template("my-item", &env_pairs);
+        let template = build_api_credential_template("my-item", &env_pairs, &[]);
 
         assert_eq!(args, vec!["item", "create", "--vault", "Private", "-"]);
         assert!(!args.iter().any(|arg| arg.contains("secret")));
@@ -2618,6 +3230,107 @@ SINGLE='value # kept'
         assert_eq!(template.fields[0].value, "secret");
         assert_eq!(template.fields[1].id, "DB_HOST");
         assert_eq!(template.fields[1].value, "localhost");
+    }
+
+    #[test]
+    fn test_build_create_item_adds_github_repository_metadata() {
+        let env_pairs = vec![("API_KEY".to_string(), "secret".to_string())];
+        let template = build_api_credential_template(
+            "my-item",
+            &env_pairs,
+            &["owner/repo".to_string(), "other/service".to_string()],
+        );
+
+        let metadata = template
+            .fields
+            .iter()
+            .find(|field| field.label == GITHUB_REPOSITORIES_LABEL)
+            .unwrap();
+        assert_eq!(metadata.value, "owner/repo\nother/service");
+        assert_eq!(metadata.field_type, "STRING");
+    }
+
+    #[test]
+    fn test_merge_github_repository_lists_dedupes_and_normalizes() {
+        let merged = merge_github_repository_lists(
+            &["Owner/Repo".to_string(), "old/service".to_string()],
+            &[
+                "https://github.com/owner/repo.git".to_string(),
+                "git@github.com:New/App.git".to_string(),
+            ],
+        );
+
+        assert_eq!(
+            merged,
+            vec![
+                "owner/repo".to_string(),
+                "old/service".to_string(),
+                "new/app".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_build_op_item_edit_github_repositories_args() {
+        let args = build_op_item_edit_github_repositories_args(
+            Some("Private"),
+            "item-id",
+            &["owner/repo".to_string(), "other/service".to_string()],
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                "item".to_string(),
+                "edit".to_string(),
+                "item-id".to_string(),
+                "--vault".to_string(),
+                "Private".to_string(),
+                "github_repositories=owner/repo\nother/service".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_credential_env_file_name_patterns() {
+        assert!(is_credential_env_file_name(".env"));
+        assert!(is_credential_env_file_name(".env.local"));
+        assert!(is_credential_env_file_name("service.env"));
+        assert!(is_credential_env_file_name("service.env.production"));
+        assert!(!is_credential_env_file_name(".env.example"));
+        assert!(!is_credential_env_file_name(".env.sample"));
+        assert!(!is_credential_env_file_name(".env.template"));
+        assert!(!is_credential_env_file_name("backup.env.old"));
+        assert!(!is_credential_env_file_name("foo.env.bak"));
+        assert!(!is_credential_env_file_name(".envrc"));
+        assert!(!is_credential_env_file_name("README.md"));
+    }
+
+    #[test]
+    fn test_count_plaintext_env_entries_ignores_op_references() {
+        let tmp_dir = TempDir::new().unwrap();
+        let file_path = tmp_dir.path().join(".env");
+        fs::write(
+            &file_path,
+            "API_KEY=plain\nEXISTING=op://vault/item/EXISTING\nEMPTY=\n# COMMENT=ignored\n",
+        )
+        .unwrap();
+
+        assert_eq!(count_plaintext_env_entries(&file_path).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_collect_plaintext_credential_files_skips_generated_dirs() {
+        let tmp_dir = TempDir::new().unwrap();
+        fs::write(tmp_dir.path().join(".env"), "API_KEY=plain\n").unwrap();
+        fs::create_dir(tmp_dir.path().join("target")).unwrap();
+        fs::write(tmp_dir.path().join("target").join(".env"), "TOKEN=plain\n").unwrap();
+
+        let mut findings = Vec::new();
+        collect_plaintext_credential_files(tmp_dir.path(), tmp_dir.path(), &mut findings).unwrap();
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].path, PathBuf::from(".env"));
     }
 
     #[test]
@@ -2898,6 +3611,12 @@ SINGLE='value # kept'
     }
 
     #[test]
+    fn test_detect_command_hint_github_repo() {
+        let args = vec![OsString::from("opz"), OsString::from("github-repo")];
+        assert_eq!(detect_command_hint(&args), "github-repo");
+    }
+
+    #[test]
     fn test_render_doctor_checks() {
         let checks = vec![
             DoctorCheck::ok("op", "/bin/op (2.0.0)", true),
@@ -2945,6 +3664,7 @@ SINGLE='value # kept'
         assert!(OPZ_SKILL.contains("opz show [OPTIONS] <ITEM>..."));
         assert!(OPZ_SKILL.contains("opz gen [OPTIONS] <ITEM>..."));
         assert!(OPZ_SKILL.contains("opz create <ITEM> [ENV]"));
+        assert!(OPZ_SKILL.contains("opz github-repo [OPTIONS] <ITEM>..."));
         assert!(OPZ_SKILL.contains("opz run [OPTIONS] <ITEM>... -- <COMMAND>..."));
         assert!(OPZ_SKILL.contains("opz github-secret [OPTIONS] <ITEM>..."));
         assert!(OPZ_SKILL.contains("opz cloudflare-secret [OPTIONS] <ITEM>..."));
@@ -3043,6 +3763,37 @@ SINGLE='value # kept'
     }
 
     #[test]
+    fn test_cli_parse_github_repo() {
+        let cli = Cli::try_parse_from([
+            "opz",
+            "github-repo",
+            "--repo",
+            "owner/repo",
+            "--repo",
+            "other/service",
+            "--dry-run",
+            "foo",
+            "bar",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Some(Cmd::GithubRepo {
+                repo,
+                dry_run,
+                items,
+            }) => {
+                assert_eq!(
+                    repo,
+                    vec!["owner/repo".to_string(), "other/service".to_string()]
+                );
+                assert!(dry_run);
+                assert_eq!(items, vec!["foo".to_string(), "bar".to_string()]);
+            }
+            _ => panic!("expected github-repo command"),
+        }
+    }
+
+    #[test]
     fn test_cli_parse_cloudflare_secret() {
         let cli = Cli::try_parse_from([
             "opz",
@@ -3082,6 +3833,37 @@ SINGLE='value # kept'
         validate_github_secret_name("_TOKEN").unwrap();
         assert!(validate_github_secret_name("GITHUB_TOKEN").is_err());
         assert!(validate_github_secret_name("github_token").is_err());
+    }
+
+    #[test]
+    fn test_guard_github_secret_repo_allows_matching_metadata() {
+        let items = vec![ItemGithubRepositories {
+            item_title: "service".to_string(),
+            repositories: vec!["Owner/Repo".to_string(), "other/service".to_string()],
+        }];
+
+        guard_github_secret_repo("owner/repo", &items).unwrap();
+    }
+
+    #[test]
+    fn test_guard_github_secret_repo_rejects_mismatch() {
+        let items = vec![ItemGithubRepositories {
+            item_title: "service".to_string(),
+            repositories: vec!["owner/repo".to_string()],
+        }];
+
+        let err = guard_github_secret_repo("other/repo", &items).unwrap_err();
+        assert!(err.to_string().contains("GitHub repository mismatch"));
+    }
+
+    #[test]
+    fn test_guard_github_secret_repo_allows_missing_metadata_with_warning_path() {
+        let items = vec![ItemGithubRepositories {
+            item_title: "service".to_string(),
+            repositories: vec![],
+        }];
+
+        guard_github_secret_repo("owner/repo", &items).unwrap();
     }
 
     #[test]

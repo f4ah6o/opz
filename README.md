@@ -10,12 +10,13 @@
 ## Features
 
 * Search 1Password items by title keyword.
-* Check `op` authentication and optional CLI dependencies with `doctor`.
+* Check `op` authentication, optional CLI dependencies, and plaintext `.env`-style credential files with `doctor`.
 * Show item field labels that are valid shell environment variable names.
 * Run a command with secrets from one or more 1Password items.
 * Generate env files containing `op://...` references, preserving unrelated existing lines.
 * Create 1Password items from `.env` files or save private config files as Secure Notes.
-* Store valid item fields as GitHub repository secrets.
+* Add GitHub repository metadata to existing items for migration.
+* Store valid item fields as GitHub repository secrets, guarded by item repository metadata when present.
 * Store valid item fields as Cloudflare Worker secrets through Wrangler.
 * Print the bundled `opz` Agent Skill.
 * Cache item lists for 60 seconds and fall back to title contains matching when exact lookup misses.
@@ -56,7 +57,7 @@ Check 1Password CLI status and external command dependencies:
 opz doctor
 ```
 
-`doctor` exits non-zero when required `op` checks fail. Missing optional tools such as `gh`, `wrangler`, `git`, or `sh` are reported as warnings.
+`doctor` exits non-zero when required `op` checks fail. Missing optional tools such as `gh`, `wrangler`, `git`, `sh`, or `secretlint` are reported as warnings. It also checks for plaintext `.env`-style credential files and, when `secretlint` is available, runs it against those files.
 
 ### Show Item Labels
 
@@ -109,13 +110,13 @@ When `--env-file` is set, the file remains after the command exits. Existing fil
 
 Examples:
 ```bash
-# Run command with one item (no .env file generated)
+# Recommended: run with one item and no .env file generated
 opz run example-item -- your-command
 
 # Run command with multiple items (later items win on duplicate keys)
 opz run foo bar -- your-command
 
-# Run with secrets and generate .env file
+# Generate an env file only when another tool requires op:// references
 opz run --env-file .env foo bar -- your-command
 
 # Top-level shorthand also supports multiple items
@@ -170,6 +171,7 @@ Behavior:
   * Creates an `API_CREDENTIAL` item.
   * Uses `<ITEM>` as the title.
   * Adds each `KEY=VALUE` as a custom text field named `KEY`.
+  * Records parseable git remotes in a `github_repositories` metadata field, one `owner/repo` per line.
   * Supports `export KEY=...`, inline comments (`KEY=value # note`), and `#` inside quotes.
   * Skips invalid env keys and existing `op://...` values.
   * For duplicate keys, the last entry wins.
@@ -191,6 +193,33 @@ opz create ignored-item app.conf
 # Create item in specific vault
 opz --vault Private create my-service .env
 ```
+
+### Add GitHub Repository Metadata to Existing Items
+
+Add or update `github_repositories` metadata on existing 1Password items:
+
+```bash
+opz github-repo [OPTIONS] <ITEM>...
+```
+
+Options:
+* `--repo <OWNER/REPO>` - Repository to record. Repeat for multiple repositories. Defaults to parseable git remotes from the current repository.
+* `--dry-run` - Print the metadata update without editing items.
+* `--vault <NAME>` - Vault name (optional, searches all vaults if omitted)
+
+Examples:
+```bash
+# Preview migration using current git remotes
+opz github-repo --dry-run my-service shared-secrets
+
+# Add current git remote repository metadata
+opz github-repo my-service shared-secrets
+
+# Add explicit repositories
+opz github-repo --repo owner/repo --repo other/service my-service
+```
+
+Existing `github_repositories` entries are preserved and merged with the requested repositories.
 
 ### Store GitHub Repository Secrets
 
@@ -218,6 +247,8 @@ opz github-secret --repo owner/repo my-service shared-secrets
 ```
 
 `github-secret` uses the same valid field labels as `gen` and `run`. Duplicate names across multiple items use the later item. Secret values are resolved in memory and passed to `gh secret set` through stdin; values are not printed or passed as command arguments. Names starting with `GITHUB_` are rejected because GitHub reserves that prefix.
+
+If a selected 1Password item has a `github_repositories` field, the target repository must match one of its `owner/repo` entries before `opz` resolves or writes secret values. Multiple repositories are allowed by separating entries with newlines or commas. Items without this metadata are still allowed, but `opz` prints a warning because the repository guard cannot be applied.
 
 ### Store Cloudflare Worker Secrets
 
@@ -253,7 +284,7 @@ opz cloudflare-secret --name worker-app --env production my-service shared-secre
 1. Fetches the item list from 1Password and caches that metadata for 60 seconds.
 2. Finds one matching title. Exact match is tried first; title contains matching is used as a fallback.
 3. Fetches the matched item and builds `op://<vault_id>/<item_id>/<field>` references for fields with valid env labels.
-4. Writes an env file when requested, merging with any existing file.
+4. Writes an env file when requested, merging with any existing file. The recommended path is file-free `opz run`; env files are for tools that require `op://` references.
 5. Resolves secrets with `op run --env-file <temp> -- sh -c 'env -0'`, falling back to `op read` per reference if batch resolution fails.
 6. Runs the command with resolved values in the environment. `$VAR` and `${VAR}` in command arguments are expanded only for variables resolved from the selected items.
 
