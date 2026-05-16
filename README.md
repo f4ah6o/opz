@@ -10,11 +10,13 @@
 ## Features
 
 * Search 1Password items by title keyword.
+* Check `op` authentication and optional CLI dependencies with `doctor`.
 * Show item field labels that are valid shell environment variable names.
 * Run a command with secrets from one or more 1Password items.
 * Generate env files containing `op://...` references, preserving unrelated existing lines.
 * Create 1Password items from `.env` files or save private config files as Secure Notes.
 * Store valid item fields as GitHub repository secrets.
+* Store valid item fields as Cloudflare Worker secrets through Wrangler.
 * Print the bundled `opz` Agent Skill.
 * Cache item lists for 60 seconds and fall back to title contains matching when exact lookup misses.
 
@@ -45,6 +47,16 @@ Example:
 opz find github
 # Output: <item-id>    <vault-name>    github-token
 ```
+
+### Doctor
+
+Check 1Password CLI status and external command dependencies:
+
+```bash
+opz doctor
+```
+
+`doctor` exits non-zero when required `op` checks fail. Missing optional tools such as `gh`, `wrangler`, `git`, or `sh` are reported as warnings.
 
 ### Show Item Labels
 
@@ -207,6 +219,35 @@ opz github-secret --repo owner/repo my-service shared-secrets
 
 `github-secret` uses the same valid field labels as `gen` and `run`. Duplicate names across multiple items use the later item. Secret values are resolved in memory and passed to `gh secret set` through stdin; values are not printed or passed as command arguments. Names starting with `GITHUB_` are rejected because GitHub reserves that prefix.
 
+### Store Cloudflare Worker Secrets
+
+Store valid item fields as Cloudflare Worker secrets through Wrangler:
+
+```bash
+opz cloudflare-secret [OPTIONS] <ITEM>...
+```
+
+Options:
+* `--name <WORKER>` - Worker name passed to `wrangler secret bulk --name`
+* `--env <ENV>` - Wrangler environment passed to `wrangler secret bulk --env`
+* `--config <PATH>` - Wrangler config path passed to `wrangler secret bulk --config`
+* `--dry-run` - Print the secret names that would be set without writing values
+* `--vault <NAME>` - Vault name (optional, searches all vaults if omitted)
+
+Examples:
+```bash
+# Preview secret names
+opz cloudflare-secret --dry-run my-service
+
+# Store secrets using the current Wrangler project config
+opz cloudflare-secret my-service
+
+# Store secrets for a specific Worker environment
+opz cloudflare-secret --name worker-app --env production my-service shared-secrets
+```
+
+`cloudflare-secret` uses the same valid field labels as `gen` and `run`. Duplicate names across multiple items use the later item. Secret values are resolved in memory and passed to `wrangler secret bulk` through stdin as JSON; values are not printed or passed as command arguments.
+
 ## How It Works
 
 1. Fetches the item list from 1Password and caches that metadata for 60 seconds.
@@ -314,6 +355,9 @@ Then open Jaeger Search and select service `opz` (or your `OTEL_SERVICE_NAME`) t
 ## Requirements
 
 * [1Password CLI](https://developer.1password.com/docs/cli/) (`op`) installed and authenticated
+* Optional: GitHub CLI (`gh`) for `github-secret`
+* Optional: Wrangler (`wrangler`) for `cloudflare-secret`
+* Optional: Git (`git`) for private config `create`
 
 ## E2E Test
 

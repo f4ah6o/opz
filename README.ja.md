@@ -5,11 +5,13 @@
 ## 機能
 
 * タイトルのキーワードで 1Password アイテムを検索します。
+* `doctor` で `op` の認証状態と任意の依存 CLI をチェックします。
 * shell の環境変数名として使えるフィールドラベルを表示します。
 * 1 つ以上の 1Password アイテムから secret を取得してコマンドを実行します。
 * `op://...` 参照を含む env ファイルを生成し、既存ファイルの無関係な行は残します。
 * `.env` から 1Password アイテムを作成し、private 設定ファイルは Secure Note として保存します。
 * 有効なアイテムフィールドを GitHub repository secrets に保存します。
+* 有効なアイテムフィールドを Wrangler 経由で Cloudflare Worker secrets に保存します。
 * bundled `opz` Agent Skill を出力します。
 * アイテムリストを 60 秒キャッシュし、完全一致がない場合はタイトルの部分一致で探します。
 
@@ -40,6 +42,16 @@ opz find <query>
 opz find github
 # 出力: <item-id>    <vault-name>    github-token
 ```
+
+### Doctor
+
+1Password CLI の状態と外部コマンド依存をチェックします:
+
+```bash
+opz doctor
+```
+
+`doctor` は必須の `op` チェックが失敗した場合だけ非 0 で終了します。`gh`、`wrangler`、`git`、`sh` など任意ツールの欠落は警告として表示します。
 
 ### アイテムラベル表示
 
@@ -202,6 +214,35 @@ opz github-secret --repo owner/repo my-service shared-secrets
 
 `github-secret` は `gen` や `run` と同じ有効フィールドラベルを使います。複数 item で同名がある場合は後勝ちです。Secret 値はメモリ上で解決し、`gh secret set` の stdin に渡します。値を表示したりコマンド引数に載せたりしません。GitHub が予約しているため、`GITHUB_` で始まる名前は拒否します。
 
+### Cloudflare Worker Secrets に保存
+
+有効なアイテムフィールドを Wrangler 経由で Cloudflare Worker secrets に保存します:
+
+```bash
+opz cloudflare-secret [OPTIONS] <ITEM>...
+```
+
+オプション:
+* `--name <WORKER>` - `wrangler secret bulk --name` に渡す Worker 名
+* `--env <ENV>` - `wrangler secret bulk --env` に渡す Wrangler environment
+* `--config <PATH>` - `wrangler secret bulk --config` に渡す Wrangler config path
+* `--dry-run` - 値を書き込まず、保存対象の secret 名だけを表示
+* `--vault <NAME>` - Vault 名（省略時はすべての Vault を検索）
+
+例:
+```bash
+# secret 名を事前確認
+opz cloudflare-secret --dry-run my-service
+
+# 現在の Wrangler project config を使って保存
+opz cloudflare-secret my-service
+
+# Worker と environment を指定して保存
+opz cloudflare-secret --name worker-app --env production my-service shared-secrets
+```
+
+`cloudflare-secret` は `gen` や `run` と同じ有効フィールドラベルを使います。複数 item で同名がある場合は後勝ちです。Secret 値はメモリ上で解決し、JSON として `wrangler secret bulk` の stdin に渡します。値を表示したりコマンド引数に載せたりしません。
+
 ## 仕組み
 
 1. 1Password からアイテムリストを取得し、そのメタデータを 60 秒キャッシュします。
@@ -309,6 +350,9 @@ Jaeger の Search で service `opz`（または `OTEL_SERVICE_NAME`）を選び�
 ## 要件
 
 * [1Password CLI](https://developer.1password.com/docs/cli/) (`op`) がインストールされ、認証されていること
+* 任意: `github-secret` 用の GitHub CLI (`gh`)
+* 任意: `cloudflare-secret` 用の Wrangler (`wrangler`)
+* 任意: private 設定ファイルの `create` 用の Git (`git`)
 
 ## E2Eテスト
 

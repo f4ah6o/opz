@@ -1,6 +1,6 @@
 ---
 name: opz
-description: Use the opz CLI to search 1Password items, inspect valid env labels, generate env files, create items from local files, store GitHub repository secrets, and run commands with secrets injected as environment variables.
+description: Use the opz CLI to search 1Password items, inspect valid env labels, diagnose op and dependency status, generate env files, create items from local files, store GitHub repository secrets, store Cloudflare Worker secrets, and run commands with secrets injected as environment variables.
 ---
 
 # opz
@@ -34,6 +34,14 @@ List valid environment variable labels from one or more 1Password items.
 ```bash
 opz show [OPTIONS] <ITEM>...
 opz show --with-item <ITEM>...
+```
+
+### `doctor`
+
+Check `op` authentication and external command dependencies. Required `op` failures exit non-zero; missing optional tools are warnings.
+
+```bash
+opz doctor
 ```
 
 ### `gen`
@@ -72,6 +80,16 @@ opz github-secret --repo owner/repo <ITEM>...
 opz github-secret --dry-run <ITEM>...
 ```
 
+### `cloudflare-secret`
+
+Store valid item fields as Cloudflare Worker secrets through Wrangler.
+
+```bash
+opz cloudflare-secret [OPTIONS] <ITEM>...
+opz cloudflare-secret --name worker-app --env production <ITEM>...
+opz cloudflare-secret --dry-run <ITEM>...
+```
+
 ### `skills`
 
 Print this bundled Agent Skills `SKILL.md` to stdout.
@@ -83,8 +101,11 @@ opz skills
 ## Behavior Notes
 
 - When multiple items define the same env key, later items win.
+- `doctor` checks `op` as required and reports `gh`, `wrangler`, `git`, and `sh` as optional dependencies.
 - `github-secret` also uses later-item-wins and passes values to `gh secret set` through stdin.
 - `github-secret` rejects names starting with `GITHUB_`.
+- `cloudflare-secret` also uses later-item-wins and passes a JSON payload to `wrangler secret bulk` through stdin.
+- `cloudflare-secret` supports `--name`, `--env`, and `--config` for Wrangler target selection.
 - `gen` stdout uses `op://<vault_id>/<item_id>/<field>` references, not resolved secret values.
 - When `--env-file` points to an existing file, `opz` appends new keys and overwrites duplicate keys while preserving unrelated lines.
 - `show` only prints labels that are valid shell environment variable names.
@@ -94,7 +115,9 @@ opz skills
 ## Suggested Workflow
 
 1. Discover candidate items with `opz find`.
-2. Inspect available labels with `opz show`.
-3. Use `opz gen --env-file ...` when another tool needs `op://` references in a file.
-4. Use `opz github-secret --dry-run ...` before writing GitHub repository secrets.
-5. Use `opz run ... -- <COMMAND>` when you want to execute a command with injected secrets directly.
+2. Run `opz doctor` if `op` authentication or a dependency CLI looks suspicious.
+3. Inspect available labels with `opz show`.
+4. Use `opz gen --env-file ...` when another tool needs `op://` references in a file.
+5. Use `opz github-secret --dry-run ...` before writing GitHub repository secrets.
+6. Use `opz cloudflare-secret --dry-run ...` before writing Cloudflare Worker secrets.
+7. Use `opz run ... -- <COMMAND>` when you want to execute a command with injected secrets directly.
