@@ -3020,20 +3020,40 @@ impl Drop for TempEnvFile {
     }
 }
 
+#[derive(Clone, Copy)]
+enum CachePlatform {
+    Windows,
+    Macos,
+    Other,
+}
+
 fn item_list_cache_dir() -> Result<PathBuf> {
-    if let Some(cache_home) = env::var_os("XDG_CACHE_HOME").filter(|value| !value.is_empty()) {
+    let platform = if cfg!(target_os = "windows") {
+        CachePlatform::Windows
+    } else if cfg!(target_os = "macos") {
+        CachePlatform::Macos
+    } else {
+        CachePlatform::Other
+    };
+    item_list_cache_dir_from_env(platform, |key| env::var_os(key))
+}
+
+fn item_list_cache_dir_from_env(
+    platform: CachePlatform,
+    mut var: impl FnMut(&str) -> Option<OsString>,
+) -> Result<PathBuf> {
+    if let Some(cache_home) = var("XDG_CACHE_HOME").filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(cache_home).join("opz"));
     }
 
-    if cfg!(target_os = "windows") {
-        if let Some(local_app_data) = env::var_os("LOCALAPPDATA").filter(|value| !value.is_empty())
-        {
+    if matches!(platform, CachePlatform::Windows) {
+        if let Some(local_app_data) = var("LOCALAPPDATA").filter(|value| !value.is_empty()) {
             return Ok(PathBuf::from(local_app_data).join("opz"));
         }
-        if let Some(app_data) = env::var_os("APPDATA").filter(|value| !value.is_empty()) {
+        if let Some(app_data) = var("APPDATA").filter(|value| !value.is_empty()) {
             return Ok(PathBuf::from(app_data).join("opz"));
         }
-        if let Some(profile) = env::var_os("USERPROFILE").filter(|value| !value.is_empty()) {
+        if let Some(profile) = var("USERPROFILE").filter(|value| !value.is_empty()) {
             return Ok(PathBuf::from(profile)
                 .join("AppData")
                 .join("Local")
@@ -3041,9 +3061,9 @@ fn item_list_cache_dir() -> Result<PathBuf> {
         }
     }
 
-    let home = env::var_os("HOME").ok_or_else(|| anyhow!("no cache dir"))?;
+    let home = var("HOME").ok_or_else(|| anyhow!("no cache dir"))?;
     let home = PathBuf::from(home);
-    if cfg!(target_os = "macos") {
+    if matches!(platform, CachePlatform::Macos) {
         Ok(home.join("Library").join("Caches").join("dev.opz.opz"))
     } else {
         Ok(home.join(".cache").join("opz"))
@@ -3531,6 +3551,129 @@ mod tests {
         let path3 = cache_file_path(None).unwrap();
         let path4 = cache_file_path(None).unwrap();
         assert_eq!(path3, path4);
+    }
+
+    #[test]
+    fn test_stable_hex_hash_has_fixed_values() {
+        assert_eq!(stable_hex_hash(""), "cbf29ce484222325");
+        assert_eq!(stable_hex_hash("_all_"), "3e0d70f177ee4766");
+        assert_eq!(stable_hex_hash("test-vault"), "18e1186c195d50bc");
+        assert_eq!(
+            stable_hex_hash("github_repositories:_all_"),
+            "63aa79d753dde420"
+        );
+    }
+
+    #[test]
+    fn test_temp_env_file_writes_and_cleans_up() {
+        let path = {
+            let mut temp_env = TempEnvFile::create().unwrap();
+            let path = temp_env.path().to_path_buf();
+            writeln!(temp_env, "API_KEY=op://vault/item/API_KEY").unwrap();
+            temp_env.flush().unwrap();
+
+            assert_eq!(
+                fs::read_to_string(&path).unwrap(),
+                "API_KEY=op://vault/item/API_KEY\n"
+            );
+            path
+        };
+
+        assert!(!path.exists(), "temp env file should be removed on drop");
+    }
+
+    #[test]
+    fn test_item_list_cache_dir_prefers_xdg_cache_home() {
+        let dir = item_list_cache_dir_from_env(CachePlatform::Other, |key| match key {
+            "XDG_CACHE_HOME" => Some(OsString::from("/tmp/xdg-cache")),
+            "HOME" => Some(OsString::from("/home/user")),
+            _ => None,
+        })
+        .unwrap();
+
+        assert_eq!(dir, PathBuf::from("/tmp/xdg-cache").join("opz"));
+    }
+
+    #[test]
+    fn test_item_list_cache_dir_uses_macos_cache_path() {
+        let dir = item_list_cache_dir_from_env(CachePlatform::Macos, |key| match key {
+            "HOME" => Some(OsString::from("/Users/alice")),
+            _ => None,
+        })
+        .unwrap();
+
+        assert_eq!(
+            dir,
+            PathBuf::from("/Users/alice")
+                .join("Library")
+                .join("Caches")
+                .join("dev.opz.opz")
+        );
+    }
+
+    #[test]
+    fn test_item_list_cache_dir_uses_linux_home_cache_path() {
+        let dir = item_list_cache_dir_from_env(CachePlatform::Other, |key| match key {
+            "HOME" => Some(OsString::from("/home/alice")),
+            _ => None,
+        })
+        .unwrap();
+
+        assert_eq!(dir, PathBuf::from("/home/alice").join(".cache").join("opz"));
+    }
+
+    #[test]
+    fn test_item_list_cache_dir_uses_windows_local_app_data() {
+        let dir = item_list_cache_dir_from_env(CachePlatform::Windows, |key| match key {
+            "LOCALAPPDATA" => Some(OsString::from(r"C:\Users\alice\AppData\Local")),
+            "APPDATA" => Some(OsString::from(r"C:\Users\alice\AppData\Roaming")),
+            "USERPROFILE" => Some(OsString::from(r"C:\Users\alice")),
+            _ => None,
+        })
+        .unwrap();
+
+        assert_eq!(
+            dir,
+            PathBuf::from(r"C:\Users\alice\AppData\Local").join("opz")
+        );
+    }
+
+    #[test]
+    fn test_item_list_cache_dir_uses_windows_app_data_fallback() {
+        let dir = item_list_cache_dir_from_env(CachePlatform::Windows, |key| match key {
+            "APPDATA" => Some(OsString::from(r"C:\Users\alice\AppData\Roaming")),
+            "USERPROFILE" => Some(OsString::from(r"C:\Users\alice")),
+            _ => None,
+        })
+        .unwrap();
+
+        assert_eq!(
+            dir,
+            PathBuf::from(r"C:\Users\alice\AppData\Roaming").join("opz")
+        );
+    }
+
+    #[test]
+    fn test_item_list_cache_dir_uses_windows_userprofile_fallback() {
+        let dir = item_list_cache_dir_from_env(CachePlatform::Windows, |key| match key {
+            "USERPROFILE" => Some(OsString::from(r"C:\Users\alice")),
+            _ => None,
+        })
+        .unwrap();
+
+        assert_eq!(
+            dir,
+            PathBuf::from(r"C:\Users\alice")
+                .join("AppData")
+                .join("Local")
+                .join("opz")
+        );
+    }
+
+    #[test]
+    fn test_item_list_cache_dir_errors_without_home_like_env() {
+        let err = item_list_cache_dir_from_env(CachePlatform::Other, |_| None).unwrap_err();
+        assert_eq!(err.to_string(), "no cache dir");
     }
 
     // ============================================
