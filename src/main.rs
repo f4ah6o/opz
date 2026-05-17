@@ -1262,6 +1262,7 @@ fn create_api_credential_item_from_env(cli: &Cli, item_title: &str, env_file: &P
 struct ScriptMigration {
     items: Vec<String>,
     uses_dotenv: bool,
+    detected_opz: bool,
     rewritten: String,
 }
 
@@ -1272,13 +1273,18 @@ fn migrate_scripts(cli: &Cli, dry_run: bool, create_new: bool) -> Result<()> {
     for path in migration_script_paths()? {
         let content =
             fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-        let migrated = if path.file_name().and_then(|name| name.to_str()) == Some("package.json") {
-            migrate_package_json_scripts(&content)?
-        } else {
-            migrate_script_text(&content)?
+        let migrated = match path.file_name().and_then(|name| name.to_str()) {
+            Some("package.json") => migrate_package_json_scripts(&content)?,
+            Some("justfile" | "Justfile") => migrate_justfile_scripts(&content)?,
+            _ => migrate_script_text(&content)?,
         };
         if !migrated.items.is_empty() || migrated.uses_dotenv || migrated.rewritten != content {
             migrations.push((path, content, migrated));
+        } else if migrated.detected_opz {
+            println!(
+                "{} contains opz commands, but no supported migration pattern matched or the usage is already up to date.",
+                path.display()
+            );
         }
     }
 
@@ -1382,9 +1388,14 @@ fn migrate_scripts(cli: &Cli, dry_run: bool, create_new: bool) -> Result<()> {
 
 fn migration_script_paths() -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
+    let mut seen = HashSet::new();
     for name in ["justfile", "Justfile", "package.json"] {
         let path = PathBuf::from(name);
         if path.exists() {
+            let canonical = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+            if !seen.insert(canonical) {
+                continue;
+            }
             paths.push(path);
         }
     }
@@ -1398,6 +1409,7 @@ fn migrate_package_json_scripts(content: &str) -> Result<ScriptMigration> {
         return Ok(ScriptMigration {
             items: Vec::new(),
             uses_dotenv: false,
+            detected_opz: content.contains("opz"),
             rewritten: content.to_string(),
         });
     };
@@ -1420,6 +1432,7 @@ fn migrate_package_json_scripts(content: &str) -> Result<ScriptMigration> {
     Ok(ScriptMigration {
         items: dedupe_preserve_order(all_items),
         uses_dotenv,
+        detected_opz: content.contains("opz"),
         rewritten,
     })
 }
@@ -1431,6 +1444,56 @@ fn replace_json_string_literal(content: &str, old: &str, new: &str) -> Result<St
 }
 
 fn migrate_script_text(content: &str) -> Result<ScriptMigration> {
+    migrate_script_text_with_items(content, &HashMap::new())
+}
+
+fn migrate_justfile_scripts(content: &str) -> Result<ScriptMigration> {
+    let mut global_values = HashMap::new();
+    let mut recipe_values = HashMap::new();
+    let mut all_items = Vec::new();
+    let mut uses_dotenv = false;
+    let mut detected_opz = content.contains("opz");
+    let mut rewritten = String::with_capacity(content.len());
+
+    for line in content.split_inclusive('\n') {
+        let (body, newline) = line
+            .strip_suffix('\n')
+            .map(|body| (body, "\n"))
+            .unwrap_or((line, ""));
+
+        if is_just_top_level_line(body) {
+            if let Some((name, value)) = parse_just_assignment(body, &global_values) {
+                global_values.insert(name, value);
+            }
+            recipe_values = parse_just_recipe_values(body, &global_values).unwrap_or_default();
+        }
+
+        let active_values = if recipe_values.is_empty() {
+            &global_values
+        } else {
+            &recipe_values
+        };
+        let migration = migrate_script_text_with_items(body, active_values)?;
+        collect_just_opz_metadata_items(body, active_values, &mut all_items)?;
+        all_items.extend(migration.items);
+        uses_dotenv |= migration.uses_dotenv;
+        detected_opz |= migration.detected_opz;
+        rewritten.push_str(&migration.rewritten);
+        rewritten.push_str(newline);
+    }
+
+    Ok(ScriptMigration {
+        items: dedupe_preserve_order(all_items),
+        uses_dotenv,
+        detected_opz,
+        rewritten,
+    })
+}
+
+fn migrate_script_text_with_items(
+    content: &str,
+    item_values: &HashMap<String, String>,
+) -> Result<ScriptMigration> {
     let opz_run_re =
         Regex::new(r"\bopz\s+run(?P<opts>(?:\s+--env-file\s+\S+)?)\s+(?P<item>[^\s-][^\s]*)\s+--")?;
     let shorthand_re = Regex::new(r"\bopz\s+(?P<item>[^\s-][^\s]*)\s+--")?;
@@ -1441,8 +1504,8 @@ fn migrate_script_text(content: &str) -> Result<ScriptMigration> {
     let rewritten = opz_run_re
         .replace_all(content, |caps: &regex::Captures| {
             let item = caps["item"].to_string();
-            if is_static_item_token(&item) {
-                items.push(item);
+            if let Some(resolved) = resolve_migration_item_token(&item, item_values) {
+                items.push(resolved);
                 format!("opz run{} --", &caps["opts"])
             } else {
                 caps[0].to_string()
@@ -1468,8 +1531,8 @@ fn migrate_script_text(content: &str) -> Result<ScriptMigration> {
                     | "cloudflare-secret"
             ) {
                 caps[0].to_string()
-            } else if is_static_item_token(&item) {
-                items.push(item);
+            } else if let Some(resolved) = resolve_migration_item_token(&item, item_values) {
+                items.push(resolved);
                 "opz --".to_string()
             } else {
                 caps[0].to_string()
@@ -1478,8 +1541,8 @@ fn migrate_script_text(content: &str) -> Result<ScriptMigration> {
         .to_string();
     for caps in op_item_get_re.captures_iter(&rewritten) {
         let item = caps["item"].to_string();
-        if is_static_item_token(&item) {
-            items.push(item);
+        if let Some(resolved) = resolve_migration_item_token(&item, item_values) {
+            items.push(resolved);
         }
     }
     let uses_dotenv = op_run_env_re.is_match(&rewritten);
@@ -1490,8 +1553,133 @@ fn migrate_script_text(content: &str) -> Result<ScriptMigration> {
     Ok(ScriptMigration {
         items: dedupe_preserve_order(items),
         uses_dotenv,
+        detected_opz: content.contains("opz"),
         rewritten,
     })
+}
+
+fn is_just_top_level_line(line: &str) -> bool {
+    !line.trim().is_empty()
+        && !line.trim_start().starts_with('#')
+        && line
+            .chars()
+            .next()
+            .is_some_and(|ch| !ch.is_ascii_whitespace())
+}
+
+fn parse_just_assignment(line: &str, values: &HashMap<String, String>) -> Option<(String, String)> {
+    let (name, value) = line.split_once(":=")?;
+    let name = name.trim();
+    if !is_just_identifier(name) {
+        return None;
+    }
+    resolve_just_value(value.trim(), values).map(|value| (name.to_string(), value))
+}
+
+fn parse_just_recipe_values(
+    line: &str,
+    global_values: &HashMap<String, String>,
+) -> Option<HashMap<String, String>> {
+    if line.contains(":=") {
+        return None;
+    }
+    let (header, _) = line.split_once(':')?;
+    let mut parts = header.split_whitespace();
+    parts.next()?;
+
+    let mut values = global_values.clone();
+    for part in parts {
+        let Some((name, value)) = part.split_once('=') else {
+            continue;
+        };
+        if !is_just_identifier(name) {
+            continue;
+        }
+        if let Some(value) = resolve_just_value(value, &values) {
+            values.insert(name.to_string(), value);
+        }
+    }
+
+    Some(values)
+}
+
+fn resolve_just_value(value: &str, values: &HashMap<String, String>) -> Option<String> {
+    let value = value.trim();
+    if let Some(stripped) = value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .or_else(|| {
+            value
+                .strip_prefix('\'')
+                .and_then(|value| value.strip_suffix('\''))
+        })
+    {
+        return Some(stripped.to_string());
+    }
+    values.get(value).cloned()
+}
+
+fn collect_just_opz_metadata_items(
+    line: &str,
+    item_values: &HashMap<String, String>,
+    items: &mut Vec<String>,
+) -> Result<()> {
+    let gen_re = Regex::new(r"\bopz\s+gen\b(?P<args>[^\n]*)")?;
+    let create_re = Regex::new(r"\bopz\s+create\s+(?P<item>[^\s-][^\s]*)")?;
+
+    for caps in gen_re.captures_iter(line) {
+        if let Some(item) = first_opz_gen_item_token(&caps["args"]) {
+            if let Some(resolved) = resolve_migration_item_token(item, item_values) {
+                items.push(resolved);
+            }
+        }
+    }
+    for caps in create_re.captures_iter(line) {
+        let item = caps["item"].to_string();
+        if let Some(resolved) = resolve_migration_item_token(&item, item_values) {
+            items.push(resolved);
+        }
+    }
+
+    Ok(())
+}
+
+fn first_opz_gen_item_token(args: &str) -> Option<&str> {
+    let mut tokens = args.split_whitespace();
+    while let Some(token) = tokens.next() {
+        if token == "--env-file" {
+            tokens.next();
+            continue;
+        }
+        if token.starts_with("--env-file=") || token.starts_with('-') {
+            continue;
+        }
+        return Some(token);
+    }
+    None
+}
+
+fn resolve_migration_item_token(
+    value: &str,
+    item_values: &HashMap<String, String>,
+) -> Option<String> {
+    if is_static_item_token(value) {
+        return Some(value.to_string());
+    }
+    let name = value
+        .strip_prefix("{{")
+        .and_then(|value| value.strip_suffix("}}"))?
+        .trim();
+    item_values.get(name).cloned()
+}
+
+fn is_just_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
 }
 
 fn is_static_item_token(value: &str) -> bool {
@@ -4059,6 +4247,103 @@ SINGLE='value # kept'
 
         assert!(migration.items.is_empty());
         assert_eq!(migration.rewritten, "test:\n    opz run $(item) -- env\n");
+    }
+
+    #[test]
+    fn test_migrate_justfile_scripts_resolves_recipe_default_item() {
+        let content = r#"docs_item := "papyr-docs-cloudflare-dev"
+docs_env_example := "apps/docs/.env.opz.example"
+docs_env_file := "apps/docs/.env.opz"
+
+docs-build item=docs_item:
+  opz run {{item}} -- just _docs-build
+
+docs-dev item=docs_item:
+  opz run {{item}} -- just _docs-dev
+
+docs-op-create item=docs_item:
+  tmpdir="$(mktemp -d)"; trap "rm -rf "$tmpdir"" EXIT; cp {{docs_env_example}} "$tmpdir/.env"; cd "$tmpdir"; opz create {{item}} .env
+
+docs-op-env item=docs_item:
+  rm -f {{docs_env_file}}
+  opz gen {{item}} --env-file {{docs_env_file}}
+"#;
+        let migration = migrate_justfile_scripts(content).unwrap();
+
+        assert_eq!(
+            migration.items,
+            vec!["papyr-docs-cloudflare-dev".to_string()]
+        );
+        assert!(migration.detected_opz);
+        assert_eq!(
+            migration.rewritten,
+            r#"docs_item := "papyr-docs-cloudflare-dev"
+docs_env_example := "apps/docs/.env.opz.example"
+docs_env_file := "apps/docs/.env.opz"
+
+docs-build item=docs_item:
+  opz run -- just _docs-build
+
+docs-dev item=docs_item:
+  opz run -- just _docs-dev
+
+docs-op-create item=docs_item:
+  tmpdir="$(mktemp -d)"; trap "rm -rf "$tmpdir"" EXIT; cp {{docs_env_example}} "$tmpdir/.env"; cd "$tmpdir"; opz create {{item}} .env
+
+docs-op-env item=docs_item:
+  rm -f {{docs_env_file}}
+  opz gen {{item}} --env-file {{docs_env_file}}
+"#
+        );
+    }
+
+    #[test]
+    fn test_migrate_justfile_scripts_resolves_after_set_shell_directive() {
+        let content = r#"set shell := ["bash", "-euo", "pipefail", "-c"]
+
+docs_item := "papyr-docs-cloudflare-dev"
+
+docs-build item=docs_item:
+  opz run {{item}} -- just _docs-build
+"#;
+        let migration = migrate_justfile_scripts(content).unwrap();
+
+        assert_eq!(
+            migration.items,
+            vec!["papyr-docs-cloudflare-dev".to_string()]
+        );
+        assert_eq!(
+            migration.rewritten,
+            r#"set shell := ["bash", "-euo", "pipefail", "-c"]
+
+docs_item := "papyr-docs-cloudflare-dev"
+
+docs-build item=docs_item:
+  opz run -- just _docs-build
+"#
+        );
+    }
+
+    #[test]
+    fn test_migrate_justfile_scripts_reports_up_to_date_opz_usage() {
+        let migration = migrate_justfile_scripts("test:\n  opz run -- env\n").unwrap();
+
+        assert!(migration.items.is_empty());
+        assert!(migration.detected_opz);
+        assert_eq!(migration.rewritten, "test:\n  opz run -- env\n");
+    }
+
+    #[test]
+    fn test_migrate_justfile_scripts_keeps_unresolved_template_item() {
+        let migration =
+            migrate_justfile_scripts("test item:\n  opz run {{item}} -- env\n").unwrap();
+
+        assert!(migration.items.is_empty());
+        assert!(migration.detected_opz);
+        assert_eq!(
+            migration.rewritten,
+            "test item:\n  opz run {{item}} -- env\n"
+        );
     }
 
     #[test]
