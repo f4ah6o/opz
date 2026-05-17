@@ -183,6 +183,7 @@ Behavior:
 * `opz <ITEM> -- <COMMAND>` becomes `opz -- <COMMAND>` with the same metadata update.
 * `op item get <ITEM>` is used as a metadata registration signal, but is not rewritten because it is not equivalent to `opz run`.
 * `.env`-based scripts are rewritten only with `--new`; without it, they are reported and skipped.
+* `--dry-run` reports the repository metadata that would be ensured without fetching full item details.
 * `package.json` is patched at the matching script string, so key order and formatting outside the changed value stay intact.
 
 Examples:
@@ -313,6 +314,8 @@ opz cloudflare-secret --name worker-app --env production my-service shared-secre
 7. `opz` runs the command with the resolved values in the environment. `$VAR` and `${VAR}` in command arguments are expanded only for variables resolved from the selected items.
 
 `gen` stops after writing references. `show` fetches items and prints valid labels without resolving secret values.
+
+Secret-resolution `op` calls time out after 30 seconds by default. Set `OPZ_OP_TIMEOUT_SECONDS=<seconds>` to allow slower 1Password CLI operations.
 
 ## `op` Command Usage
 

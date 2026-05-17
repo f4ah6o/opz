@@ -130,7 +130,7 @@ opz skills
 - `github-secret` also uses later-item-wins and passes values to `gh secret set` through stdin.
 - `github-secret` rejects names starting with `GITHUB_` and blocks writes when item `github_repositories` metadata does not include the target repo.
 - `github-repo` migrates existing items by merging repository metadata into `github_repositories`.
-- `migrate` rewrites supported scripts and updates item metadata by default; use `--dry-run` to preview.
+- `migrate` rewrites supported scripts and updates item metadata by default; use `--dry-run` to preview. Dry runs do not fetch full item details; they report the repository metadata that would be ensured.
 - `migrate` treats `op item get <ITEM>` as a metadata signal but does not rewrite it.
 - `migrate` patches matching `package.json` script strings without reserializing the whole file.
 - `run` auto-detects an item when no item is passed and exactly one item matches the current git remote through `github_repositories`.
@@ -141,6 +141,7 @@ opz skills
 - When `--env-file` points to an existing file, `opz` appends new keys and overwrites duplicate keys while preserving unrelated lines.
 - `show` only prints labels that are valid shell environment variable names.
 - Item lists and the auto-detect repository index are cached for 60 seconds. Creating or editing items invalidates those caches best-effort.
+- Secret-resolution `op` calls time out after 30 seconds by default. Set `OPZ_OP_TIMEOUT_SECONDS=<seconds>` to allow slower 1Password CLI operations.
 - OTLP tracing is disabled unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set.
 
 ## Suggested Workflow

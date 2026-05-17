@@ -12,8 +12,9 @@ use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
-    time::{Duration, SystemTime},
+    process::{Command, Output, Stdio},
+    thread,
+    time::{Duration, Instant, SystemTime},
 };
 
 #[derive(Parser, Debug)]
@@ -1120,17 +1121,20 @@ fn resolve_env_vars_batch(references: &[(String, String)]) -> Result<HashMap<Str
             }
             temp_env.flush()?;
 
-            let out = Command::new("op")
-                .arg("run")
+            let mut cmd = Command::new("op");
+            cmd.arg("run")
                 .arg("--no-masking")
                 .arg("--env-file")
                 .arg(temp_env.path())
                 .arg("--")
                 .arg("sh")
                 .arg("-c")
-                .arg("env -0")
-                .output()
-                .context("failed to run `op run` for batch secret resolution")?;
+                .arg("env -0");
+            let out = command_output_with_timeout(
+                cmd,
+                "`op run` for batch secret resolution",
+                op_command_timeout(),
+            )?;
 
             if !out.status.success() {
                 return Err(anyhow!(
@@ -1338,17 +1342,11 @@ fn migrate_scripts(cli: &Cli, dry_run: bool, create_new: bool) -> Result<()> {
     item_titles = dedupe_preserve_order(item_titles);
     for item_title in &item_titles {
         if dry_run {
-            let merged_repos = match find_item(cli.vault.as_deref(), item_title) {
-                Ok((_, _, _, item)) => {
-                    merge_github_repository_lists(&item_github_repositories(&item), &repositories)
-                }
-                Err(_) => repositories.clone(),
-            };
             println!(
-                "Would set {} on {} to {}",
+                "Would ensure {} on {} includes {}",
                 GITHUB_REPOSITORIES_LABEL,
                 item_title,
-                merged_repos.join(", ")
+                repositories.join(", ")
             );
         } else {
             let (item_id, _, resolved_title, item) = find_item(cli.vault.as_deref(), item_title)?;
@@ -2937,11 +2935,9 @@ fn parse_env_line_kv(line: &str) -> Option<(&str, &str)> {
 /// Read a secret from 1Password using op read
 fn op_read(reference: &str) -> Result<String> {
     instrumentation::with_span_result("load_inputs.op_read", vec![], || {
-        let out = Command::new("op")
-            .arg("read")
-            .arg(reference)
-            .output()
-            .context("failed to run `op read`")?;
+        let mut cmd = Command::new("op");
+        cmd.arg("read").arg(reference);
+        let out = command_output_with_timeout(cmd, "`op read`", op_command_timeout())?;
 
         if !out.status.success() {
             return Err(anyhow!(
@@ -3022,10 +3018,10 @@ fn op_json(args: &[&str]) -> Result<serde_json::Value> {
         "load_inputs.op_json",
         vec![KeyValue::new("op.operation", operation)],
         || {
-            let out = Command::new("op")
-                .args(args)
-                .output()
-                .with_context(|| format!("failed to run op {}", args.join(" ")))?;
+            let mut cmd = Command::new("op");
+            cmd.args(args);
+            let display = format!("`op {}`", args.join(" "));
+            let out = command_output_with_timeout(cmd, &display, op_command_timeout())?;
 
             if !out.status.success() {
                 return Err(anyhow!(
@@ -3040,6 +3036,51 @@ fn op_json(args: &[&str]) -> Result<serde_json::Value> {
             Ok(v)
         },
     )
+}
+
+fn op_command_timeout() -> Duration {
+    env::var("OPZ_OP_TIMEOUT_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(30))
+}
+
+fn command_output_with_timeout(
+    mut command: Command,
+    display: &str,
+    timeout: Duration,
+) -> Result<Output> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to run {display}"))?;
+    let started = Instant::now();
+
+    loop {
+        if child
+            .try_wait()
+            .with_context(|| format!("failed to poll {display}"))?
+            .is_some()
+        {
+            return child
+                .wait_with_output()
+                .with_context(|| format!("failed to wait for {display}"));
+        }
+
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait_with_output();
+            return Err(anyhow!(
+                "{display} timed out after {} seconds. Check 1Password CLI authentication with `op whoami`, or set OPZ_OP_TIMEOUT_SECONDS to a larger value.",
+                timeout.as_secs()
+            ));
+        }
+
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// Cache `op item list --format json` to speed up repeated runs.
@@ -4190,6 +4231,18 @@ SINGLE='value # kept'
                 "github_repositories=owner/repo\nother/service".to_string(),
             ]
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_command_output_with_timeout_kills_slow_command() {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("sleep 5");
+
+        let err = command_output_with_timeout(cmd, "`slow command`", Duration::from_millis(100))
+            .unwrap_err();
+
+        assert!(err.to_string().contains("timed out"), "{err}");
     }
 
     #[test]

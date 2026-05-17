@@ -178,6 +178,7 @@ opz migrate [OPTIONS]
 * `opz <ITEM> -- <COMMAND>` も同様に `opz -- <COMMAND>` へ書き換えます。
 * `op item get <ITEM>` は metadata 登録の手がかりとして使いますが、`opz run` と等価ではないため書き換えません。
 * `.env` ベースの script は `--new` 指定時だけ書き換えます。指定がない場合は報告してスキップします。
+* `--dry-run` は item 詳細を取得せず、追加される repository metadata を表示します。
 * `package.json` は該当する script 文字列だけを置き換えるため、それ以外の key 順や整形は維持します。
 
 例:
@@ -308,6 +309,8 @@ opz cloudflare-secret --name worker-app --env production my-service shared-secre
 7. 解決済みの値を環境変数に入れてコマンドを実行します。コマンド引数内の `$VAR` と `${VAR}` は、選択した item から解決できた変数だけ展開します。
 
 `gen` は参照を書いたところで終了します。`show` は secret 値を解決せず、有効なラベルだけを表示します。
+
+secret 解決用の `op` 呼び出しはデフォルトで 30 秒 timeout します。遅い 1Password CLI 操作を許可するには `OPZ_OP_TIMEOUT_SECONDS=<秒>` を設定してください。
 
 ## `op` コマンドの利用
 
