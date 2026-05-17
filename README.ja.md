@@ -7,14 +7,14 @@
 * タイトルのキーワードで 1Password アイテムを検索します。
 * `doctor` で `op` の認証状態、任意の依存 CLI、平文の `.env` 系 credential ファイルをチェックします。
 * shell の環境変数名として使えるフィールドラベルを表示します。
-* 1 つ以上の 1Password アイテムから secret を取得してコマンドを実行します。repository metadata による item 自動検出にも対応します。
+* 1 つ以上の 1Password アイテムから secret を取得してコマンドを実行します。repository title による item 自動検出にも対応します。
 * `op://...` 参照を含む env ファイルを生成し、既存ファイルの無関係な行は残します。
-* 既存 script を、明示 item や `.env` から repository metadata ベースの実行へ migrate できます。
+* 既存 script を、明示 item や `.env` から repository title と metadata ベースの管理へ migrate できます。
 * private 設定ファイルを Secure Note として保存します。
 * 有効なアイテムフィールドを GitHub repository secrets に保存し、item 側の repository metadata があれば誤配を防ぎます。
 * 有効なアイテムフィールドを Wrangler 経由で Cloudflare Worker secrets に保存します。
 * bundled `opz` Agent Skill を出力します。
-* アイテムリストと repository metadata を 60 秒キャッシュし、完全一致がない場合はタイトルの部分一致で探します。
+* 明示 item lookup と legacy migration path 用に、アイテムリストと repository metadata を 60 秒キャッシュします。
 
 ## インストール
 
@@ -107,7 +107,7 @@ opz [OPTIONS] [--env-file <ENV>] [<ITEM>...] -- <COMMAND>...
 * `--env-file <ENV>` - 出力 env ファイルパス。省略時はファイルを書きません。
 
 引数:
-* `<ITEM>...` - secret を取得する任意のアイテムタイトル。省略時は、現在の git remote と一致する `github_repositories` metadata を持つ item を 1 件だけ自動検出します。
+* `<ITEM>...` - secret を取得する任意のアイテムタイトル。省略時は、現在の git remote repository 名（例: `owner/repo`）と完全一致する title の item を 1 件だけ自動検出します。
 
 `--env-file` を指定すると、env ファイルはコマンド終了後も残ります。既存ファイルはマージされ、無関係な行は残り、重複キーは上書きされ、新しいキーは末尾に追加されます。複数アイテムで同じキーがある場合は後勝ちです（`opz run foo bar ...` では `bar` の値が優先）。
 
@@ -116,7 +116,7 @@ opz [OPTIONS] [--env-file <ENV>] [<ITEM>...] -- <COMMAND>...
 # .env ファイルを生成せずに1アイテムで実行
 opz run example-item -- your-command
 
-# migrate 後の推奨: git remote metadata から item を自動検出
+# git remote title から item を自動検出
 opz run -- your-command
 
 # 複数アイテムで実行（重複キーは後勝ち）
@@ -162,7 +162,7 @@ opz --vault Private gen foo bar
 
 ### Script と `.env` の migrate
 
-`justfile` / `Justfile` の recipe と `package.json` の scripts を、repository metadata と item 自動検出へ移行します:
+`justfile` / `Justfile` の recipe と `package.json` の scripts を、repository item title と metadata へ移行します:
 
 ```bash
 opz migrate [OPTIONS]
@@ -171,11 +171,12 @@ opz migrate [OPTIONS]
 オプション:
 * `--dry-run` - 1Password item やファイルを編集せず、変更内容だけを表示
 * `--new` - `.env` から新しい `API_CREDENTIAL` item を作成してから `.env` ベースの script を書き換えます。item 名は先頭の git remote repository 名です。
+* `--restore` - itemless な `opz run --` に移行済みの script を、明示 item 付きの呼び出しに戻します。
 * `--vault <NAME>` - Vault 名（省略時はすべての Vault を検索）
 
 挙動:
-* `opz run <ITEM> -- <COMMAND>` は、現在の git remote を `<ITEM>` の metadata に記録してから `opz run -- <COMMAND>` に書き換えます。
-* `opz <ITEM> -- <COMMAND>` も同様に `opz -- <COMMAND>` へ書き換えます。
+* `opz run <ITEM> -- <COMMAND>` と `opz <ITEM> -- <COMMAND>` は、デフォルトでは明示 item のまま残します。`migrate` は repository metadata を記録し、item と repository がそれぞれ 1 件だけなら item title と対応する Just item 変数を `owner/repo` に揃えます。
+* `opz migrate --restore` は、itemless な `opz run -- <COMMAND>` を、Just recipe parameter または現在の repository title から推定した `opz run <ITEM> -- <COMMAND>` に戻します。
 * `op item get <ITEM>` は metadata 登録の手がかりとして使いますが、`opz run` と等価ではないため書き換えません。
 * `.env` ベースの script は `--new` 指定時だけ書き換えます。指定がない場合は報告してスキップします。
 * `--dry-run` は item 詳細を取得せず、追加される repository metadata を表示します。
@@ -191,6 +192,9 @@ opz migrate
 
 # .env から新しい item を作成して migrate
 opz migrate --new
+
+# itemless auto-detection に移行済みの script を戻す
+opz migrate --restore
 ```
 
 ### Private 設定ファイルを Secure Note として保存
@@ -302,7 +306,7 @@ opz cloudflare-secret --name worker-app --env production my-service shared-secre
 
 1. item title が指定されている場合、1Password から item list を取得し、その metadata を 60 秒キャッシュします。
 2. title lookup はまず完全一致、見つからなければタイトルの部分一致を使います。
-3. item title が省略されている場合、git remote を読み、cached `github_repositories` index から一致 item を探します。1 件だけ一致した場合に限って採用します。
+3. item title が省略されている場合、git remote を読み、`owner/repo` のような item title を直接 lookup します。legacy の `github_repositories` scan は `OPZ_AUTODETECT_LEGACY_SCAN=1` の場合だけ使います。
 4. item が決まると、その item を取得し、有効な env ラベルを持つフィールドから `op://<vault_id>/<item_id>/<field>` 参照を作ります。
 5. `--env-file` 指定があれば、参照をファイルに書き込み、既存ファイルの無関係な行は残します。通常は file-free な `opz run` を使い、env ファイルは `op://` 参照を必要とする tool 向けです。
 6. `op run --env-file <temp> -- sh -c 'env -0'` で secret をまとめて解決し、失敗した場合は参照ごとに `op read` へフォールバックします。

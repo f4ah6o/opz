@@ -74,7 +74,7 @@ enum Cmd {
         items: Vec<String>,
     },
 
-    /// Migrate scripts to repository metadata and item auto-detection
+    /// Migrate scripts to repository item titles and metadata
     Migrate {
         /// Print changes without editing 1Password items or files
         #[arg(long)]
@@ -83,6 +83,10 @@ enum Cmd {
         /// Create a new item from .env before rewriting .env-based scripts
         #[arg(long)]
         new: bool,
+
+        /// Restore explicit item arguments for scripts that rely on auto-detection
+        #[arg(long)]
+        restore: bool,
     },
 
     /// Store a private config file as Secure Note(s) named from git remotes
@@ -182,6 +186,10 @@ struct ItemVault {
 
 #[derive(Deserialize, Debug)]
 struct ItemGet {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
     #[serde(default)]
     fields: Vec<ItemField>,
     #[serde(default)]
@@ -309,7 +317,11 @@ fn run_cli(args: &[OsString]) -> Result<()> {
             print_credential_file_advice_for_secret_command("gen");
             generate_env_output(&cli, items, env_file.as_deref())
         }
-        Some(Cmd::Migrate { dry_run, new }) => migrate_scripts(&cli, *dry_run, *new),
+        Some(Cmd::Migrate {
+            dry_run,
+            new,
+            restore,
+        }) => migrate_scripts(&cli, *dry_run, *new, *restore),
         Some(Cmd::Note { file }) => create_secure_notes_from_file(&cli, file),
         Some(Cmd::Create { .. }) => Err(anyhow!(
             "`opz create` was removed. Use `opz migrate --new` to create an item from .env, or `opz note <FILE>` to store a private config file."
@@ -1024,20 +1036,57 @@ fn resolve_run_items(cli: &Cli, items: &[String]) -> Result<Vec<String>> {
 
     let repositories = list_remote_repo_names()
         .context("No item specified and failed to auto-detect a repository from git remotes")?;
-    let candidates = item_github_repository_index_cached(cli.vault.as_deref())?;
-    let matches = match_item_titles_by_github_repositories(&candidates, &repositories);
+    let matches =
+        match_item_titles_by_github_repository_titles(cli.vault.as_deref(), &repositories)?;
     match matches.as_slice() {
         [title] => Ok(vec![title.clone()]),
         [] => Err(anyhow!(
-            "No 1Password item matched git remote repository metadata: {}. Run `opz migrate`, `opz migrate --new`, or pass an item title explicitly.",
+            "No 1Password item matched git remote repository title: {}. Run `opz migrate`, `opz migrate --new`, or pass an item title explicitly.",
             repositories.join(", ")
         )),
         _ => Err(anyhow!(
-            "Multiple 1Password items matched git remote repository metadata ({}): {}. Pass an item title explicitly.",
+            "Multiple 1Password items matched git remote repository title ({}): {}. Pass an item title explicitly.",
             repositories.join(", "),
             matches.join(", ")
         )),
     }
+}
+
+fn match_item_titles_by_github_repository_titles(
+    vault: Option<&str>,
+    repositories: &[String],
+) -> Result<Vec<String>> {
+    let mut matches = Vec::new();
+    for repo in repositories {
+        let Some(repo) = normalize_github_repo_spec(repo) else {
+            continue;
+        };
+        match find_item_exact(vault, &repo) {
+            Ok((_, _, title, _)) => matches.push(title),
+            Err(err) if is_op_lookup_miss(&err) => {}
+            Err(err) => return Err(err),
+        }
+    }
+    if matches.is_empty() && legacy_autodetect_scan_enabled() {
+        let candidates = item_github_repository_index_cached(vault)?;
+        matches = match_item_titles_by_github_repositories(&candidates, repositories);
+    }
+    Ok(dedupe_preserve_order(matches))
+}
+
+fn is_op_lookup_miss(err: &anyhow::Error) -> bool {
+    let text = err.to_string();
+    text.contains("isn't an item")
+        || text.contains("is not an item")
+        || text.contains("No item matched")
+        || text.contains("No exact item matched")
+        || text.contains("not found")
+}
+
+fn legacy_autodetect_scan_enabled() -> bool {
+    env::var("OPZ_AUTODETECT_LEGACY_SCAN")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
 }
 
 fn match_item_titles_by_github_repositories(
@@ -1270,19 +1319,44 @@ struct ScriptMigration {
     rewritten: String,
 }
 
-fn migrate_scripts(cli: &Cli, dry_run: bool, create_new: bool) -> Result<()> {
+#[derive(Debug, Clone, Copy)]
+enum ScriptMigrationMode<'a> {
+    Collect,
+    RenameItems { title: &'a str },
+    Restore { title: &'a str },
+}
+
+fn migrate_scripts(cli: &Cli, dry_run: bool, create_new: bool, restore: bool) -> Result<()> {
     let repositories = resolve_requested_github_repositories(&[])?;
+    let canonical_item_title = repositories
+        .first()
+        .cloned()
+        .ok_or_else(|| anyhow!("No GitHub repositories found for migrate"))?;
+    if repositories.len() > 1 && restore {
+        return Err(anyhow!(
+            "`opz migrate --restore` requires exactly one git remote repository. Found: {}",
+            repositories.join(", ")
+        ));
+    }
     let mut migrations = Vec::new();
 
     for path in migration_script_paths()? {
         let content =
             fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
         let migrated = match path.file_name().and_then(|name| name.to_str()) {
-            Some("package.json") => migrate_package_json_scripts(&content)?,
-            Some("justfile" | "Justfile") => migrate_justfile_scripts(&content)?,
-            _ => migrate_script_text(&content)?,
+            Some("package.json") => {
+                migrate_package_json_scripts(&content, ScriptMigrationMode::Collect)?
+            }
+            Some("justfile" | "Justfile") => {
+                migrate_justfile_scripts(&content, ScriptMigrationMode::Collect)?
+            }
+            _ => migrate_script_text(&content, ScriptMigrationMode::Collect)?,
         };
-        if !migrated.items.is_empty() || migrated.uses_dotenv || migrated.rewritten != content {
+        if !migrated.items.is_empty()
+            || migrated.uses_dotenv
+            || migrated.rewritten != content
+            || (restore && migrated.detected_opz)
+        {
             migrations.push((path, content, migrated));
         } else if migrated.detected_opz {
             println!(
@@ -1340,6 +1414,19 @@ fn migrate_scripts(cli: &Cli, dry_run: bool, create_new: bool) -> Result<()> {
     }
 
     item_titles = dedupe_preserve_order(item_titles);
+    if item_titles.len() > 1 && !create_new {
+        return Err(anyhow!(
+            "`opz migrate` found multiple item titles ({}). Pass explicit items manually or split the migration.",
+            item_titles.join(", ")
+        ));
+    }
+
+    let rename_item = !restore
+        && !create_new
+        && repositories.len() == 1
+        && item_titles.len() == 1
+        && item_titles[0] != canonical_item_title;
+
     for item_title in &item_titles {
         if dry_run {
             println!(
@@ -1348,6 +1435,9 @@ fn migrate_scripts(cli: &Cli, dry_run: bool, create_new: bool) -> Result<()> {
                 item_title,
                 repositories.join(", ")
             );
+            if rename_item {
+                println!("Would rename item {item_title} to {canonical_item_title}");
+            }
         } else {
             let (item_id, _, resolved_title, item) = find_item(cli.vault.as_deref(), item_title)?;
             let merged_repos =
@@ -1359,21 +1449,40 @@ fn migrate_scripts(cli: &Cli, dry_run: bool, create_new: bool) -> Result<()> {
                 resolved_title,
                 merged_repos.join(", ")
             );
+            if rename_item {
+                run_op_item_edit_title(cli.vault.as_deref(), &item_id, &canonical_item_title)?;
+                println!("Renamed item {resolved_title} to {canonical_item_title}");
+            }
         }
     }
 
     for (path, original, migration) in migrations {
-        let should_write = migration.rewritten != original
+        let mode = if restore {
+            ScriptMigrationMode::Restore {
+                title: &canonical_item_title,
+            }
+        } else if rename_item {
+            ScriptMigrationMode::RenameItems {
+                title: &canonical_item_title,
+            }
+        } else {
+            ScriptMigrationMode::Collect
+        };
+        let rewritten = match path.file_name().and_then(|name| name.to_str()) {
+            Some("package.json") => migrate_package_json_scripts(&original, mode)?.rewritten,
+            Some("justfile" | "Justfile") => migrate_justfile_scripts(&original, mode)?.rewritten,
+            _ => migrate_script_text(&original, mode)?.rewritten,
+        };
+        let should_write = rewritten != original
             && (!migration.uses_dotenv || create_new)
-            && (!migration.items.is_empty() || create_new);
+            && (!migration.items.is_empty() || create_new || restore || rename_item);
         if !should_write {
             continue;
         }
         if dry_run {
             println!("Would rewrite {}", path.display());
         } else {
-            fs::write(&path, migration.rewritten)
-                .with_context(|| format!("write {}", path.display()))?;
+            fs::write(&path, rewritten).with_context(|| format!("write {}", path.display()))?;
             println!("Rewrote {}", path.display());
         }
     }
@@ -1400,7 +1509,10 @@ fn migration_script_paths() -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-fn migrate_package_json_scripts(content: &str) -> Result<ScriptMigration> {
+fn migrate_package_json_scripts(
+    content: &str,
+    mode: ScriptMigrationMode<'_>,
+) -> Result<ScriptMigration> {
     let value: serde_json::Value =
         serde_json::from_str(content).context("failed to parse package.json")?;
     let Some(scripts) = value.get("scripts").and_then(|value| value.as_object()) else {
@@ -1419,7 +1531,7 @@ fn migrate_package_json_scripts(content: &str) -> Result<ScriptMigration> {
         let Some(text) = script.as_str() else {
             continue;
         };
-        let migration = migrate_script_text(text)?;
+        let migration = migrate_script_text(text, mode)?;
         all_items.extend(migration.items);
         uses_dotenv |= migration.uses_dotenv;
         if migration.rewritten != text {
@@ -1441,11 +1553,14 @@ fn replace_json_string_literal(content: &str, old: &str, new: &str) -> Result<St
     Ok(content.replacen(&old_literal, &new_literal, 1))
 }
 
-fn migrate_script_text(content: &str) -> Result<ScriptMigration> {
-    migrate_script_text_with_items(content, &HashMap::new())
+fn migrate_script_text(content: &str, mode: ScriptMigrationMode<'_>) -> Result<ScriptMigration> {
+    migrate_script_text_with_items(content, &HashMap::new(), mode)
 }
 
-fn migrate_justfile_scripts(content: &str) -> Result<ScriptMigration> {
+fn migrate_justfile_scripts(
+    content: &str,
+    mode: ScriptMigrationMode<'_>,
+) -> Result<ScriptMigration> {
     let mut global_values = HashMap::new();
     let mut recipe_values = HashMap::new();
     let mut all_items = Vec::new();
@@ -1471,7 +1586,7 @@ fn migrate_justfile_scripts(content: &str) -> Result<ScriptMigration> {
         } else {
             &recipe_values
         };
-        let migration = migrate_script_text_with_items(body, active_values)?;
+        let migration = migrate_script_text_with_items(body, active_values, mode)?;
         collect_just_opz_metadata_items(body, active_values, &mut all_items)?;
         all_items.extend(migration.items);
         uses_dotenv |= migration.uses_dotenv;
@@ -1491,10 +1606,13 @@ fn migrate_justfile_scripts(content: &str) -> Result<ScriptMigration> {
 fn migrate_script_text_with_items(
     content: &str,
     item_values: &HashMap<String, String>,
+    mode: ScriptMigrationMode<'_>,
 ) -> Result<ScriptMigration> {
     let opz_run_re =
         Regex::new(r"\bopz\s+run(?P<opts>(?:\s+--env-file\s+\S+)?)\s+(?P<item>[^\s-][^\s]*)\s+--")?;
     let shorthand_re = Regex::new(r"\bopz\s+(?P<item>[^\s-][^\s]*)\s+--")?;
+    let itemless_run_re = Regex::new(r"\bopz\s+run(?P<opts>(?:\s+--env-file\s+\S+)?)\s+--")?;
+    let itemless_shorthand_re = Regex::new(r"\bopz\s+--")?;
     let op_item_get_re = Regex::new(r"\bop\s+item\s+get\s+(?P<item>[^\s-][^\s]*)")?;
     let op_run_env_re = Regex::new(r"\bop\s+run\s+--env-file\s+\.env\s+--")?;
 
@@ -1504,7 +1622,12 @@ fn migrate_script_text_with_items(
             let item = caps["item"].to_string();
             if let Some(resolved) = resolve_migration_item_token(&item, item_values) {
                 items.push(resolved);
-                format!("opz run{} --", &caps["opts"])
+                match mode {
+                    ScriptMigrationMode::RenameItems { title } if is_static_item_token(&item) => {
+                        format!("opz run{} {} --", &caps["opts"], title)
+                    }
+                    _ => caps[0].to_string(),
+                }
             } else {
                 caps[0].to_string()
             }
@@ -1531,12 +1654,35 @@ fn migrate_script_text_with_items(
                 caps[0].to_string()
             } else if let Some(resolved) = resolve_migration_item_token(&item, item_values) {
                 items.push(resolved);
-                "opz --".to_string()
+                match mode {
+                    ScriptMigrationMode::RenameItems { title } if is_static_item_token(&item) => {
+                        format!("opz {title} --")
+                    }
+                    _ => caps[0].to_string(),
+                }
             } else {
                 caps[0].to_string()
             }
         })
         .to_string();
+    let rewritten = match mode {
+        ScriptMigrationMode::Restore { title } => itemless_run_re
+            .replace_all(&rewritten, |caps: &regex::Captures| {
+                let item = preferred_restore_item_token(item_values, title);
+                format!("opz run{} {} --", &caps["opts"], item)
+            })
+            .to_string(),
+        _ => rewritten,
+    };
+    let rewritten = match mode {
+        ScriptMigrationMode::Restore { title } => itemless_shorthand_re
+            .replace_all(&rewritten, |_: &regex::Captures| {
+                let item = preferred_restore_item_token(item_values, title);
+                format!("opz {item} --")
+            })
+            .to_string(),
+        _ => rewritten,
+    };
     for caps in op_item_get_re.captures_iter(&rewritten) {
         let item = caps["item"].to_string();
         if let Some(resolved) = resolve_migration_item_token(&item, item_values) {
@@ -1544,9 +1690,15 @@ fn migrate_script_text_with_items(
         }
     }
     let uses_dotenv = op_run_env_re.is_match(&rewritten);
-    let rewritten = op_run_env_re
-        .replace_all(&rewritten, "opz run --")
-        .to_string();
+    let rewritten = match mode {
+        ScriptMigrationMode::RenameItems { title } | ScriptMigrationMode::Restore { title } => {
+            op_run_env_re
+                .replace_all(&rewritten, format!("opz run {title} --"))
+                .to_string()
+        }
+        ScriptMigrationMode::Collect => rewritten,
+    };
+    let rewritten = rewrite_just_item_assignments(&rewritten, item_values, mode);
 
     Ok(ScriptMigration {
         items: dedupe_preserve_order(items),
@@ -1669,6 +1821,56 @@ fn resolve_migration_item_token(
         .and_then(|value| value.strip_suffix("}}"))?
         .trim();
     item_values.get(name).cloned()
+}
+
+fn preferred_restore_item_token(
+    item_values: &HashMap<String, String>,
+    fallback_title: &str,
+) -> String {
+    if item_values
+        .get("item")
+        .is_some_and(|value| !value.is_empty())
+    {
+        return "{{item}}".to_string();
+    }
+    for (name, value) in item_values {
+        if name.contains("item") && !value.is_empty() {
+            return format!("{{{{{name}}}}}");
+        }
+    }
+    for (name, value) in item_values {
+        if !value.is_empty() {
+            return format!("{{{{{name}}}}}");
+        }
+    }
+    fallback_title.to_string()
+}
+
+fn rewrite_just_item_assignments(
+    content: &str,
+    item_values: &HashMap<String, String>,
+    mode: ScriptMigrationMode<'_>,
+) -> String {
+    let ScriptMigrationMode::RenameItems { title } = mode else {
+        return content.to_string();
+    };
+
+    let Some((lhs, rhs)) = content.split_once(":=") else {
+        return content.to_string();
+    };
+    let lhs_name = lhs.trim();
+    if !item_values
+        .keys()
+        .any(|name| name == lhs_name && name.contains("item"))
+    {
+        return content.to_string();
+    }
+    let prefix = &content[..content.find(":=").unwrap_or(content.len()) + 2];
+    let rhs_trimmed = rhs.trim();
+    if !(rhs_trimmed.starts_with('"') || rhs_trimmed.starts_with('\'')) {
+        return content.to_string();
+    }
+    format!("{prefix} \"{title}\"")
 }
 
 fn is_just_identifier(value: &str) -> bool {
@@ -1894,6 +2096,31 @@ fn run_op_item_edit_github_repositories(
     repositories: &[String],
 ) -> Result<()> {
     let args = build_op_item_edit_github_repositories_args(vault, item_id, repositories);
+    let status = Command::new("op")
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .context("failed to run `op item edit`")?;
+
+    if !status.success() {
+        return Err(anyhow!("op item edit failed with status: {}", status));
+    }
+    Ok(())
+}
+
+fn run_op_item_edit_title(vault: Option<&str>, item_id: &str, title: &str) -> Result<()> {
+    let mut args = vec![
+        "item".to_string(),
+        "edit".to_string(),
+        item_id.to_string(),
+        format!("title={title}"),
+    ];
+    if let Some(vault) = vault {
+        args.push("--vault".to_string());
+        args.push(vault.to_string());
+    }
     let status = Command::new("op")
         .args(&args)
         .stdin(Stdio::null())
@@ -2253,6 +2480,30 @@ fn find_item(vault: Option<&str>, item_title: &str) -> Result<(String, String, S
     .ok_or_else(|| anyhow!("Vault ID is required. Try specifying --vault."))?;
 
     Ok((item_id, vault_id, matches[0].title.clone(), item))
+}
+
+/// Find an item by exact title without scanning every item. This is the preferred
+/// path for repository-title auto-detection.
+fn find_item_exact(
+    vault: Option<&str>,
+    item_title: &str,
+) -> Result<(String, String, String, ItemGet)> {
+    let item = item_get_with_vault(vault, item_title)?;
+    let item_id = item
+        .id
+        .clone()
+        .ok_or_else(|| anyhow!("Item ID is required for `{item_title}`"))?;
+    let vault_id = item
+        .vault
+        .as_ref()
+        .map(|vault| vault.id.clone())
+        .ok_or_else(|| anyhow!("Vault ID is required. Try specifying --vault."))?;
+    let resolved_title = item.title.clone().unwrap_or_else(|| item_title.to_string());
+    if resolved_title != item_title {
+        return Err(anyhow!("No exact item matched title: {item_title}"));
+    }
+
+    Ok((item_id, vault_id, resolved_title, item))
 }
 
 fn resolve_vault_id(
@@ -3364,6 +3615,19 @@ fn item_get(item_id: &str) -> Result<ItemGet> {
     })
 }
 
+fn item_get_with_vault(vault: Option<&str>, item: &str) -> Result<ItemGet> {
+    instrumentation::with_span_result("load_inputs.item_get_with_vault", vec![], || {
+        let mut args = vec!["item", "get", item, "--format", "json"];
+        if let Some(vault) = vault {
+            args.push("--vault");
+            args.push(vault);
+        }
+        let v = op_json(&args)?;
+        let item: ItemGet = serde_json::from_value(v)?;
+        Ok(item)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3387,6 +3651,8 @@ mod tests {
 
     fn make_item(fields: Vec<ItemField>) -> ItemGet {
         ItemGet {
+            id: None,
+            title: None,
             fields,
             vault: None,
         }
@@ -4247,34 +4513,52 @@ SINGLE='value # kept'
 
     #[test]
     fn test_migrate_script_text_rewrites_explicit_opz_run_item() {
-        let migration = migrate_script_text("test:\n    opz run service -- env\n").unwrap();
+        let migration = migrate_script_text(
+            "test:\n    opz run service -- env\n",
+            ScriptMigrationMode::Collect,
+        )
+        .unwrap();
 
         assert_eq!(migration.items, vec!["service".to_string()]);
         assert!(!migration.uses_dotenv);
-        assert_eq!(migration.rewritten, "test:\n    opz run -- env\n");
+        assert_eq!(migration.rewritten, "test:\n    opz run service -- env\n");
     }
 
     #[test]
     fn test_migrate_script_text_rewrites_top_level_shorthand_item() {
-        let migration = migrate_script_text("test:\n    opz service -- env\n").unwrap();
+        let migration = migrate_script_text(
+            "test:\n    opz service -- env\n",
+            ScriptMigrationMode::Collect,
+        )
+        .unwrap();
 
         assert_eq!(migration.items, vec!["service".to_string()]);
-        assert_eq!(migration.rewritten, "test:\n    opz -- env\n");
+        assert_eq!(migration.rewritten, "test:\n    opz service -- env\n");
     }
 
     #[test]
     fn test_migrate_script_text_detects_dotenv_op_run() {
-        let migration = migrate_script_text("test:\n    op run --env-file .env -- env\n").unwrap();
+        let migration = migrate_script_text(
+            "test:\n    op run --env-file .env -- env\n",
+            ScriptMigrationMode::Collect,
+        )
+        .unwrap();
 
         assert!(migration.items.is_empty());
         assert!(migration.uses_dotenv);
-        assert_eq!(migration.rewritten, "test:\n    opz run -- env\n");
+        assert_eq!(
+            migration.rewritten,
+            "test:\n    op run --env-file .env -- env\n"
+        );
     }
 
     #[test]
     fn test_migrate_script_text_collects_op_item_get_without_rewrite() {
-        let migration =
-            migrate_script_text("test:\n    op item get service --format json\n").unwrap();
+        let migration = migrate_script_text(
+            "test:\n    op item get service --format json\n",
+            ScriptMigrationMode::Collect,
+        )
+        .unwrap();
 
         assert_eq!(migration.items, vec!["service".to_string()]);
         assert_eq!(
@@ -4285,7 +4569,11 @@ SINGLE='value # kept'
 
     #[test]
     fn test_migrate_script_text_skips_template_item_tokens() {
-        let migration = migrate_script_text("test item:\n    opz run {{item}} -- env\n").unwrap();
+        let migration = migrate_script_text(
+            "test item:\n    opz run {{item}} -- env\n",
+            ScriptMigrationMode::Collect,
+        )
+        .unwrap();
 
         assert!(migration.items.is_empty());
         assert_eq!(
@@ -4296,7 +4584,11 @@ SINGLE='value # kept'
 
     #[test]
     fn test_migrate_script_text_skips_command_substitution_item_tokens() {
-        let migration = migrate_script_text("test:\n    opz run $(item) -- env\n").unwrap();
+        let migration = migrate_script_text(
+            "test:\n    opz run $(item) -- env\n",
+            ScriptMigrationMode::Collect,
+        )
+        .unwrap();
 
         assert!(migration.items.is_empty());
         assert_eq!(migration.rewritten, "test:\n    opz run $(item) -- env\n");
@@ -4321,7 +4613,7 @@ docs-op-env item=docs_item:
   rm -f {{docs_env_file}}
   opz gen {{item}} --env-file {{docs_env_file}}
 "#;
-        let migration = migrate_justfile_scripts(content).unwrap();
+        let migration = migrate_justfile_scripts(content, ScriptMigrationMode::Collect).unwrap();
 
         assert_eq!(
             migration.items,
@@ -4335,10 +4627,10 @@ docs_env_example := "apps/docs/.env.opz.example"
 docs_env_file := "apps/docs/.env.opz"
 
 docs-build item=docs_item:
-  opz run -- just _docs-build
+  opz run {{item}} -- just _docs-build
 
 docs-dev item=docs_item:
-  opz run -- just _docs-dev
+  opz run {{item}} -- just _docs-dev
 
 docs-op-create item=docs_item:
   tmpdir="$(mktemp -d)"; trap "rm -rf "$tmpdir"" EXIT; cp {{docs_env_example}} "$tmpdir/.env"; cd "$tmpdir"; opz create {{item}} .env
@@ -4359,7 +4651,7 @@ docs_item := "papyr-docs-cloudflare-dev"
 docs-build item=docs_item:
   opz run {{item}} -- just _docs-build
 "#;
-        let migration = migrate_justfile_scripts(content).unwrap();
+        let migration = migrate_justfile_scripts(content, ScriptMigrationMode::Collect).unwrap();
 
         assert_eq!(
             migration.items,
@@ -4372,14 +4664,16 @@ docs-build item=docs_item:
 docs_item := "papyr-docs-cloudflare-dev"
 
 docs-build item=docs_item:
-  opz run -- just _docs-build
+  opz run {{item}} -- just _docs-build
 "#
         );
     }
 
     #[test]
     fn test_migrate_justfile_scripts_reports_up_to_date_opz_usage() {
-        let migration = migrate_justfile_scripts("test:\n  opz run -- env\n").unwrap();
+        let migration =
+            migrate_justfile_scripts("test:\n  opz run -- env\n", ScriptMigrationMode::Collect)
+                .unwrap();
 
         assert!(migration.items.is_empty());
         assert!(migration.detected_opz);
@@ -4388,8 +4682,11 @@ docs-build item=docs_item:
 
     #[test]
     fn test_migrate_justfile_scripts_keeps_unresolved_template_item() {
-        let migration =
-            migrate_justfile_scripts("test item:\n  opz run {{item}} -- env\n").unwrap();
+        let migration = migrate_justfile_scripts(
+            "test item:\n  opz run {{item}} -- env\n",
+            ScriptMigrationMode::Collect,
+        )
+        .unwrap();
 
         assert!(migration.items.is_empty());
         assert!(migration.detected_opz);
@@ -4400,14 +4697,73 @@ docs-build item=docs_item:
     }
 
     #[test]
+    fn test_migrate_justfile_scripts_renames_item_title_without_removing_explicit_item() {
+        let content = r#"docs_item := "papyr-docs-cloudflare-dev"
+docs_env_file := "apps/docs/.env.opz"
+
+docs-build item=docs_item:
+  opz run {{item}} -- just _docs-build
+
+docs-op-env item=docs_item:
+  opz gen {{item}} --env-file {{docs_env_file}}
+"#;
+        let migration = migrate_justfile_scripts(
+            content,
+            ScriptMigrationMode::RenameItems {
+                title: "f4ah6o/papyr.mbt",
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            migration.rewritten,
+            r#"docs_item := "f4ah6o/papyr.mbt"
+docs_env_file := "apps/docs/.env.opz"
+
+docs-build item=docs_item:
+  opz run {{item}} -- just _docs-build
+
+docs-op-env item=docs_item:
+  opz gen {{item}} --env-file {{docs_env_file}}
+"#
+        );
+    }
+
+    #[test]
+    fn test_migrate_justfile_scripts_restores_itemless_run_from_recipe_item() {
+        let content = r#"docs_item := "f4ah6o/papyr.mbt"
+
+docs-build item=docs_item:
+  opz run -- just _docs-build
+"#;
+        let migration = migrate_justfile_scripts(
+            content,
+            ScriptMigrationMode::Restore {
+                title: "f4ah6o/papyr.mbt",
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            migration.rewritten,
+            r#"docs_item := "f4ah6o/papyr.mbt"
+
+docs-build item=docs_item:
+  opz run {{item}} -- just _docs-build
+"#
+        );
+    }
+
+    #[test]
     fn test_migrate_package_json_scripts_rewrites_script_values() {
         let content = r#"{"name":"app","scripts":{"dev":"opz run service -- vite","test":"echo ok"},"dependencies":{"z":"1"}}"#;
-        let migration = migrate_package_json_scripts(content).unwrap();
+        let migration =
+            migrate_package_json_scripts(content, ScriptMigrationMode::Collect).unwrap();
 
         assert_eq!(migration.items, vec!["service".to_string()]);
         assert_eq!(
             migration.rewritten,
-            r#"{"name":"app","scripts":{"dev":"opz run -- vite","test":"echo ok"},"dependencies":{"z":"1"}}"#
+            r#"{"name":"app","scripts":{"dev":"opz run service -- vite","test":"echo ok"},"dependencies":{"z":"1"}}"#
         );
     }
 
@@ -4861,9 +5217,31 @@ docs-build item=docs_item:
     fn test_cli_parse_migrate_flags() {
         let cli = Cli::try_parse_from(["opz", "migrate", "--dry-run", "--new"]).unwrap();
         match cli.cmd {
-            Some(Cmd::Migrate { dry_run, new }) => {
+            Some(Cmd::Migrate {
+                dry_run,
+                new,
+                restore,
+            }) => {
                 assert!(dry_run);
                 assert!(new);
+                assert!(!restore);
+            }
+            _ => panic!("expected migrate command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_migrate_restore() {
+        let cli = Cli::try_parse_from(["opz", "migrate", "--dry-run", "--restore"]).unwrap();
+        match cli.cmd {
+            Some(Cmd::Migrate {
+                dry_run,
+                new,
+                restore,
+            }) => {
+                assert!(dry_run);
+                assert!(!new);
+                assert!(restore);
             }
             _ => panic!("expected migrate command"),
         }

@@ -12,14 +12,14 @@
 * Search 1Password items by title keyword.
 * Check `op` authentication, optional CLI dependencies, and plaintext `.env`-style credential files with `doctor`.
 * Show item field labels that are valid shell environment variable names.
-* Run a command with secrets from one or more 1Password items, with repository-based item auto-detection.
+* Run a command with secrets from one or more 1Password items, with repository-title auto-detection.
 * Generate env files containing `op://...` references, preserving unrelated existing lines.
 * Migrate scripts from explicit items or `.env` files to repository metadata.
 * Save private config files as Secure Notes.
 * Store valid item fields as GitHub repository secrets, guarded by item repository metadata when present.
 * Store valid item fields as Cloudflare Worker secrets through Wrangler.
 * Print the bundled `opz` Agent Skill.
-* Cache item lists and repository metadata for 60 seconds, then fall back to title contains matching when exact lookup misses.
+* Cache item lists and repository metadata for 60 seconds for explicit lookup and legacy migration paths.
 
 ## Installation
 
@@ -112,7 +112,7 @@ Options:
 * `--env-file <ENV>` - Output env file path. If omitted, no file is written.
 
 Arguments:
-* `<ITEM>...` - Optional item titles to fetch secrets from. When omitted, `opz` auto-detects one item whose `github_repositories` metadata matches a current git remote.
+* `<ITEM>...` - Optional item titles to fetch secrets from. When omitted, `opz` auto-detects one item whose title exactly matches a current git remote repository name such as `owner/repo`.
 
 When `--env-file` is set, the file remains after the command exits. Existing files are merged: unrelated lines stay in place, duplicate keys are overwritten, and new keys are appended. If multiple items define the same key, later items win (`opz run foo bar ...` prefers values from `bar`).
 
@@ -121,7 +121,7 @@ Examples:
 # Run with one item and no .env file generated
 opz run example-item -- your-command
 
-# Recommended after migration: auto-detect item from git remote metadata
+# Auto-detect item from git remote title
 opz run -- your-command
 
 # Run command with multiple items (later items win on duplicate keys)
@@ -167,7 +167,7 @@ Stdout uses per-item comment headers such as `# --- item: <title> ---`. File out
 
 ### Migrate Scripts and `.env`
 
-Migrate `justfile`/`Justfile` recipes and `package.json` scripts to repository metadata and item auto-detection:
+Migrate `justfile`/`Justfile` recipes and `package.json` scripts to repository item titles and metadata:
 
 ```bash
 opz migrate [OPTIONS]
@@ -176,11 +176,12 @@ opz migrate [OPTIONS]
 Options:
 * `--dry-run` - Print metadata and file changes without editing 1Password items or files.
 * `--new` - Create a new API_CREDENTIAL item from `.env` before rewriting `.env`-based scripts. The item title defaults to the first git remote repository name.
+* `--restore` - Restore explicit item arguments in scripts that currently use itemless `opz run --`.
 * `--vault <NAME>` - Vault name (optional, searches all vaults if omitted)
 
 Behavior:
-* `opz run <ITEM> -- <COMMAND>` becomes `opz run -- <COMMAND>` after recording the current git remote in `<ITEM>` metadata.
-* `opz <ITEM> -- <COMMAND>` becomes `opz -- <COMMAND>` with the same metadata update.
+* `opz run <ITEM> -- <COMMAND>` and `opz <ITEM> -- <COMMAND>` stay explicit by default. `migrate` records repository metadata and, when there is exactly one item and one repository, renames the item and matching Just item variable to `owner/repo`.
+* `opz migrate --restore` changes itemless `opz run -- <COMMAND>` back to explicit `opz run <ITEM> -- <COMMAND>` where the item can be inferred from a Just recipe parameter or the current repository title.
 * `op item get <ITEM>` is used as a metadata registration signal, but is not rewritten because it is not equivalent to `opz run`.
 * `.env`-based scripts are rewritten only with `--new`; without it, they are reported and skipped.
 * `--dry-run` reports the repository metadata that would be ensured without fetching full item details.
@@ -196,6 +197,9 @@ opz migrate
 
 # Create a new item from .env and migrate .env-based scripts
 opz migrate --new
+
+# Restore scripts that were previously migrated to itemless auto-detection
+opz migrate --restore
 ```
 
 ### Save Private Config as Secure Note
@@ -307,7 +311,7 @@ opz cloudflare-secret --name worker-app --env production my-service shared-secre
 
 1. When item titles are provided, `opz` fetches the item list from 1Password and caches that metadata for 60 seconds.
 2. Title lookup tries exact match first, then title contains matching.
-3. When item titles are omitted, `opz` reads git remotes, loads a cached `github_repositories` index, and accepts the result only when exactly one item matches.
+3. When item titles are omitted, `opz` reads git remotes and tries exact item titles such as `owner/repo` directly. The legacy `github_repositories` scan is only used when `OPZ_AUTODETECT_LEGACY_SCAN=1`.
 4. After the item is selected, `opz` fetches it and builds `op://<vault_id>/<item_id>/<field>` references for fields with valid env labels.
 5. If `--env-file` is set, `opz` writes references to that file and preserves unrelated existing lines. The usual path is file-free `opz run`; env files are for tools that require `op://` references.
 6. Secret values are resolved with `op run --env-file <temp> -- sh -c 'env -0'`, with `op read` per reference as a fallback.
