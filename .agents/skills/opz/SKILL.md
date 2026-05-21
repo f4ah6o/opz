@@ -1,11 +1,11 @@
 ---
 name: opz
-description: Use the opz CLI to search 1Password items, inspect valid env labels, diagnose op and dependency status, generate env files, migrate scripts to repository item titles and metadata, store private files as notes, store GitHub repository secrets, store Cloudflare Worker secrets, and run commands with secrets injected as environment variables.
+description: Use the opz CLI to search 1Password items, inspect valid env labels, diagnose op and dependency status, generate env files, migrate scripts to repository item titles and metadata, store private files as notes, store GitHub repository secrets, store Cloudflare Worker secrets, and run commands with item-backed or 1Password Environment-backed secret injection.
 ---
 
 # opz
 
-Use this skill when you need to work with 1Password-backed secrets through the `opz` CLI. `opz` reads item metadata from `op`, builds `op://<vault_id>/<item_id>/<field>` references for valid env labels, and can resolve those references while running another command.
+Use this skill when you need to work with 1Password-backed secrets through the `opz` CLI. `opz` reads item metadata from `op`, builds `op://<vault_id>/<item_id>/<field>` references for valid env labels, and can resolve those references while running another command. When using 1Password Environments, `opz run --environment <ENV> -- <COMMAND>` delegates to native `op run` so `opz` does not read Environment secret values.
 
 ## Prerequisites
 
@@ -16,6 +16,7 @@ Use this skill when you need to work with 1Password-backed secrets through the `
 
 - `--vault <NAME>` limits item lookup to a specific 1Password vault.
 - `--env-file <ENV>` writes generated `op://` references to a file for `run` and `gen`; prefer file-free `run` unless another tool requires an env file.
+- `--environment <ENV>` / `--environments <ENV>` uses native 1Password Environments injection through `op run`; do not combine it with item arguments or `--env-file`.
 
 ## Commands
 
@@ -80,6 +81,8 @@ When no item is passed, `run` auto-detects exactly one item whose title matches 
 ```bash
 opz run [OPTIONS] [<ITEM>...] -- <COMMAND>...
 opz [OPTIONS] [<ITEM>...] -- <COMMAND>...
+opz run --environment <ENV> -- <COMMAND>...
+opz --environment <ENV> -- <COMMAND>...
 ```
 
 ### `github-secret`
@@ -136,6 +139,7 @@ opz skills
 - `migrate` treats `op item get <ITEM>` as a metadata signal but does not rewrite it.
 - `migrate` patches matching `package.json` script strings without reserializing the whole file.
 - `run` auto-detects an item when no item is passed and exactly one item title matches the current git remote repository. Legacy `github_repositories` scanning is opt-in with `OPZ_AUTODETECT_LEGACY_SCAN=1`.
+- Environment-backed `run` is delegated to `op run` and does not resolve secret values in `opz`. Use the 1Password MCP server for agent-side Environment creation, variable-name inspection, and local `.env` mounting.
 - `github_repositories` is metadata, not an env label or deployable secret.
 - `cloudflare-secret` also uses later-item-wins and passes a JSON payload to `wrangler secret bulk` through stdin.
 - `cloudflare-secret` supports `--name`, `--env`, and `--config` for Wrangler target selection.
@@ -153,8 +157,9 @@ opz skills
 2. Run `opz doctor` if `op` authentication or a dependency CLI looks suspicious.
 3. Inspect available labels with `opz show`.
 4. Use `opz run ... -- <COMMAND>` for the normal file-free workflow.
-5. Use `opz gen --env-file ...` only when another tool needs `op://` references in a file.
-6. Use `opz migrate --dry-run` to preview script migration, then `opz migrate`, `opz migrate --new`, or `opz migrate --restore`.
-7. Use `opz github-repo --dry-run ...` to manually add repository metadata for older items.
-8. Use `opz github-secret --dry-run ...` before writing GitHub repository secrets.
-9. Use `opz cloudflare-secret --dry-run ...` before writing Cloudflare Worker secrets.
+5. Use `opz run --environment <ENV> -- <COMMAND>` when the project is managed through 1Password Environments and the local `op` CLI supports native Environment injection.
+6. Use `opz gen --env-file ...` only when another tool needs `op://` references in a file.
+7. Use `opz migrate --dry-run` to preview script migration, then `opz migrate`, `opz migrate --new`, or `opz migrate --restore`.
+8. Use `opz github-repo --dry-run ...` to manually add repository metadata for older items.
+9. Use `opz github-secret --dry-run ...` before writing GitHub repository secrets.
+10. Use `opz cloudflare-secret --dry-run ...` before writing Cloudflare Worker secrets.

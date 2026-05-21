@@ -29,6 +29,10 @@ struct Cli {
     #[arg(long, value_name = "ENV")]
     env_file: Option<PathBuf>,
 
+    /// 1Password Environment name or ID for native op run injection
+    #[arg(long, alias = "environments", value_name = "ENV", global = true)]
+    environment: Vec<String>,
+
     #[command(subcommand)]
     cmd: Option<Cmd>,
 
@@ -285,6 +289,11 @@ fn run_cli(args: &[OsString]) -> Result<()> {
     instrumentation::with_span("load_config", vec![], || {
         let _ = std::env::current_dir();
     });
+    if !cli.environment.is_empty() && !matches!(cli.cmd, Some(Cmd::Run { .. }) | None) {
+        return Err(anyhow!(
+            "`--environment` is only supported with `opz run` or top-level command execution."
+        ));
+    }
 
     match &cli.cmd {
         Some(Cmd::Find { query }) => {
@@ -338,8 +347,17 @@ fn run_cli(args: &[OsString]) -> Result<()> {
         }) => {
             if command.is_empty() {
                 return Err(anyhow!(
-                    "Command required after '--'. Usage: opz run [OPTIONS] [--env-file <ENV>] [<ITEM>...] -- <COMMAND>..."
+                    "Command required after '--'. Usage: opz run [OPTIONS] [--env-file <ENV>] [--environment <ENV>] [<ITEM>...] -- <COMMAND>..."
                 ));
+            }
+            if !cli.environment.is_empty() {
+                return run_with_environments(
+                    cli.vault.as_deref(),
+                    &cli.environment,
+                    items,
+                    env_file.as_deref(),
+                    command,
+                );
             }
             print_credential_file_advice_for_secret_command("run");
             let resolved_items = resolve_run_items(&cli, items)?;
@@ -375,8 +393,17 @@ fn run_cli(args: &[OsString]) -> Result<()> {
         None => {
             if cli.command.is_empty() {
                 return Err(anyhow!(
-                    "Command required after '--'. Usage: opz [OPTIONS] [--env-file <ENV>] [<ITEM>...] -- <COMMAND>..."
+                    "Command required after '--'. Usage: opz [OPTIONS] [--env-file <ENV>] [--environment <ENV>] [<ITEM>...] -- <COMMAND>..."
                 ));
+            }
+            if !cli.environment.is_empty() {
+                return run_with_environments(
+                    cli.vault.as_deref(),
+                    &cli.environment,
+                    &cli.items,
+                    cli.env_file.as_deref(),
+                    &cli.command,
+                );
             }
             print_credential_file_advice_for_secret_command("run");
             let resolved_items = resolve_run_items(&cli, &cli.items)?;
@@ -409,7 +436,15 @@ fn detect_command_hint(args: &[OsString]) -> &'static str {
             idx += 2;
             continue;
         }
-        if arg.starts_with("--vault=") || arg.starts_with("--env-file=") {
+        if arg == "--environment" || arg == "--environments" {
+            idx += 2;
+            continue;
+        }
+        if arg.starts_with("--vault=")
+            || arg.starts_with("--env-file=")
+            || arg.starts_with("--environment=")
+            || arg.starts_with("--environments=")
+        {
             idx += 1;
             continue;
         }
@@ -542,6 +577,7 @@ fn collect_doctor_checks() -> Vec<DoctorCheck> {
 
     checks.push(check_op_auth());
     checks.push(check_op_accounts());
+    checks.push(check_op_run_environments_support());
     checks.push(optional_cli_check(
         "gh",
         &["--version"],
@@ -566,6 +602,36 @@ fn collect_doctor_checks() -> Vec<DoctorCheck> {
     checks.push(check_credential_files());
 
     checks
+}
+
+fn check_op_run_environments_support() -> DoctorCheck {
+    let mut cmd = Command::new("op");
+    cmd.arg("run").arg("--help");
+    cmd.stdin(Stdio::null());
+    match command_output_with_timeout(cmd, "`op run --help`", op_command_timeout()) {
+        Ok(out) if out.status.success() => {
+            let help = String::from_utf8_lossy(&out.stdout);
+            match detect_environment_flag_from_help(&help) {
+                Some(flag) => DoctorCheck::ok(
+                    "op run environments",
+                    format!("supported via {flag}"),
+                    false,
+                ),
+                None => DoctorCheck::warn(
+                    "op run environments",
+                    "not exposed by this op CLI; item-backed opz run remains available",
+                ),
+            }
+        }
+        Ok(out) => DoctorCheck::warn(
+            "op run environments",
+            format!(
+                "could not inspect `op run --help`: {}",
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        ),
+        Err(err) => DoctorCheck::warn("op run environments", err.to_string()),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3067,6 +3133,96 @@ fn run_with_items(
     })
 }
 
+fn run_with_environments(
+    vault: Option<&str>,
+    environments: &[String],
+    items: &[String],
+    env_file: Option<&Path>,
+    command: &[String],
+) -> Result<()> {
+    if let Some(vault) = vault {
+        return Err(anyhow!(
+            "`--vault {vault}` cannot be combined with `--environment` because 1Password Environments are not vault item lookups. Remove `--vault` or use item-backed `opz run <ITEM> -- <COMMAND>`."
+        ));
+    }
+    if !items.is_empty() {
+        return Err(anyhow!(
+            "`--environment` cannot be combined with item arguments in v1. Use either `opz run --environment <ENV> -- <COMMAND>` or item-backed `opz run <ITEM> -- <COMMAND>`."
+        ));
+    }
+    if let Some(path) = env_file {
+        return Err(anyhow!(
+            "`--environment` cannot be combined with `--env-file` in v1 because Environment execution is delegated to `op run`. Remove `--env-file` or use item-backed `opz gen --env-file {}`.",
+            path.display()
+        ));
+    }
+
+    let flag = detect_op_run_environment_flag()?;
+    let args = build_op_run_environment_args(flag, environments, command);
+
+    instrumentation::with_span_result("write_outputs.command_exec", vec![], || {
+        let status = Command::new("op")
+            .args(&args)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .context("failed to run `op run` with 1Password Environment")?;
+
+        if !status.success() {
+            return Err(anyhow!("op run failed with status: {}", status));
+        }
+        Ok(())
+    })
+}
+
+fn detect_op_run_environment_flag() -> Result<&'static str> {
+    let mut cmd = Command::new("op");
+    cmd.arg("run").arg("--help");
+    cmd.stdin(Stdio::null());
+    let out = command_output_with_timeout(cmd, "`op run --help`", op_command_timeout())?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "failed to inspect `op run --help`: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+
+    let help = String::from_utf8_lossy(&out.stdout);
+    match detect_environment_flag_from_help(&help) {
+        Some(flag) => Ok(flag),
+        None => Err(anyhow!(
+            "This 1Password CLI does not expose Environment runtime injection in `op run --help`. Use item-backed `opz run <ITEM> -- <COMMAND>`, or use the 1Password MCP server to mount a local .env file for this project."
+        )),
+    }
+}
+
+fn detect_environment_flag_from_help(help: &str) -> Option<&'static str> {
+    if help.contains("--environments") {
+        Some("--environments")
+    } else if help.contains("--environment") {
+        Some("--environment")
+    } else {
+        None
+    }
+}
+
+fn build_op_run_environment_args(
+    flag: &str,
+    environments: &[String],
+    command: &[String],
+) -> Vec<String> {
+    let mut args = Vec::with_capacity(environments.len() * 2 + command.len() + 2);
+    args.push("run".to_string());
+    for environment in environments {
+        args.push(flag.to_string());
+        args.push(environment.clone());
+    }
+    args.push("--".to_string());
+    args.extend(command.iter().cloned());
+    args
+}
+
 fn item_to_env_lines(item: &ItemGet, vault_id: &str, item_id: &str) -> Result<Vec<String>> {
     let labels = collect_item_labels(item)?;
     let mut out = Vec::new();
@@ -5263,6 +5419,179 @@ docs-build item=docs_item:
         assert!(cli.cmd.is_none());
         assert!(cli.items.is_empty());
         assert_eq!(cli.command, vec!["echo".to_string(), "ok".to_string()]);
+    }
+
+    #[test]
+    fn test_cli_parse_run_with_environment() {
+        let cli = Cli::try_parse_from(["opz", "run", "--environment", "dev", "--", "env"]).unwrap();
+        assert_eq!(cli.environment, vec!["dev".to_string()]);
+        match cli.cmd {
+            Some(Cmd::Run { items, command, .. }) => {
+                assert!(items.is_empty());
+                assert_eq!(command, vec!["env".to_string()]);
+            }
+            _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_run_with_environments_alias() {
+        let cli =
+            Cli::try_parse_from(["opz", "run", "--environments", "dev", "--", "env"]).unwrap();
+        assert_eq!(cli.environment, vec!["dev".to_string()]);
+    }
+
+    #[test]
+    fn test_cli_parse_run_with_multiple_environments() {
+        let cli = Cli::try_parse_from([
+            "opz",
+            "run",
+            "--environment",
+            "dev",
+            "--environment",
+            "staging",
+            "--",
+            "env",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.environment,
+            vec!["dev".to_string(), "staging".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_cli_parse_top_level_with_environment() {
+        let cli = Cli::try_parse_from(["opz", "--environment", "dev", "--", "env"]).unwrap();
+        assert!(cli.cmd.is_none());
+        assert_eq!(cli.environment, vec!["dev".to_string()]);
+        assert!(cli.items.is_empty());
+        assert_eq!(cli.command, vec!["env".to_string()]);
+    }
+
+    #[test]
+    fn test_detect_environment_flag_from_help_prefers_plural() {
+        assert_eq!(
+            detect_environment_flag_from_help(
+                "Flags:\n  --environment string\n  --environments stringArray\n"
+            ),
+            Some("--environments")
+        );
+    }
+
+    #[test]
+    fn test_detect_environment_flag_from_help_accepts_singular() {
+        assert_eq!(
+            detect_environment_flag_from_help("Flags:\n  --environment string\n"),
+            Some("--environment")
+        );
+    }
+
+    #[test]
+    fn test_detect_environment_flag_from_help_rejects_unsupported() {
+        assert_eq!(
+            detect_environment_flag_from_help("Flags:\n  --env-file stringArray\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_build_op_run_environment_args_excludes_secret_values() {
+        let args = build_op_run_environment_args(
+            "--environment",
+            &["dev".to_string(), "staging".to_string()],
+            &["printenv".to_string(), "API_TOKEN".to_string()],
+        );
+        assert_eq!(
+            args,
+            vec![
+                "run".to_string(),
+                "--environment".to_string(),
+                "dev".to_string(),
+                "--environment".to_string(),
+                "staging".to_string(),
+                "--".to_string(),
+                "printenv".to_string(),
+                "API_TOKEN".to_string(),
+            ]
+        );
+        assert!(!args.contains(&"super-secret-value".to_string()));
+    }
+
+    #[test]
+    fn test_run_with_environments_rejects_items() {
+        let err = run_with_environments(
+            None,
+            &["dev".to_string()],
+            &["item".to_string()],
+            None,
+            &["env".to_string()],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("cannot be combined with item"));
+    }
+
+    #[test]
+    fn test_run_with_environments_rejects_env_file() {
+        let err = run_with_environments(
+            None,
+            &["dev".to_string()],
+            &[],
+            Some(Path::new(".env")),
+            &["env".to_string()],
+        )
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("cannot be combined with `--env-file`"));
+    }
+
+    #[test]
+    fn test_run_with_environments_rejects_vault() {
+        let err = run_with_environments(
+            Some("Private"),
+            &["dev".to_string()],
+            &[],
+            None,
+            &["env".to_string()],
+        )
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("cannot be combined with `--environment`"));
+    }
+
+    #[test]
+    fn test_detect_command_hint_skips_environment_options() {
+        let args = vec![
+            OsString::from("opz"),
+            OsString::from("--environment"),
+            OsString::from("dev"),
+            OsString::from("run"),
+            OsString::from("--"),
+            OsString::from("env"),
+        ];
+        assert_eq!(detect_command_hint(&args), "run");
+
+        let args = vec![
+            OsString::from("opz"),
+            OsString::from("--environments=dev"),
+            OsString::from("doctor"),
+        ];
+        assert_eq!(detect_command_hint(&args), "doctor");
+    }
+
+    #[test]
+    fn test_environment_option_rejected_for_non_run_commands() {
+        let args = vec![
+            OsString::from("opz"),
+            OsString::from("find"),
+            OsString::from("--environment"),
+            OsString::from("dev"),
+            OsString::from("query"),
+        ];
+        let err = run_cli(&args).unwrap_err();
+        assert!(err.to_string().contains("only supported with `opz run`"));
     }
 
     #[test]

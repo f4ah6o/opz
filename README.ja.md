@@ -8,6 +8,7 @@
 * `doctor` で `op` の認証状態、任意の依存 CLI、平文の `.env` 系 credential ファイルをチェックします。
 * shell の環境変数名として使えるフィールドラベルを表示します。
 * 1 つ以上の 1Password アイテムから secret を取得してコマンドを実行します。repository title による item 自動検出にも対応します。
+* `op` CLI が対応している場合、`--environment` で 1Password Environments の native injection に委譲してコマンドを実行します。
 * `op://...` 参照を含む env ファイルを生成し、既存ファイルの無関係な行は残します。
 * 既存 script を、明示 item や `.env` から repository title と metadata ベースの管理へ migrate できます。
 * private 設定ファイルを Secure Note として保存します。
@@ -100,11 +101,14 @@ opz note app.conf
 ```bash
 opz run [OPTIONS] [--env-file <ENV>] [<ITEM>...] -- <COMMAND>...
 opz [OPTIONS] [--env-file <ENV>] [<ITEM>...] -- <COMMAND>...
+opz run --environment <ENV> -- <COMMAND>...
+opz --environment <ENV> -- <COMMAND>...
 ```
 
 オプション:
 * `--vault <NAME>` - Vault 名（省略時はすべての Vault を検索）
 * `--env-file <ENV>` - 出力 env ファイルパス。省略時はファイルを書きません。
+* `--environment <ENV>` / `--environments <ENV>` - item lookup の代わりに、`op run` 経由で 1Password Environments の native injection を使います。
 
 引数:
 * `<ITEM>...` - secret を取得する任意のアイテムタイトル。省略時は、現在の git remote repository 名（例: `owner/repo`）と完全一致する title の item を 1 件だけ自動検出します。
@@ -133,7 +137,12 @@ opz run my-service -- curl -H 'Authorization: Bearer $API_TOKEN' https://api.exa
 
 # Vault を指定
 opz run --vault Private foo bar -- your-command
+
+# opz 側で値を解決せず、1Password Environment を使う
+opz run --environment dev -- your-command
 ```
+
+Environment mode は v1 では item 引数や `--env-file` と同時に使えません。`opz` は `op run` に実行を委譲し、Environment の secret 値を読みません。インストール済みの `op` CLI が Environment runtime injection を公開していない場合、`opz` は明確なエラーを返し、従来の item-backed workflow はそのまま使えます。
 
 ### Env ファイル生成
 
@@ -349,6 +358,10 @@ sequenceDiagram
 [1Password CLI](https://developer.1password.com/docs/cli/) (`op`) をインストールし、認証してから secret-backed command を使います。
 
 `github-secret` には GitHub CLI (`gh`) が必要です。`cloudflare-secret` には Wrangler (`wrangler`) が必要です。`migrate` と `note` は repository remote を読むために Git (`git`) を使います。
+
+## 1Password Environments と MCP
+
+`opz` は 1Password Environments を置き換えるのではなく、補完します。Codex などの agent では 1Password MCP server を使い、secret 値を agent に返さずに Environment 作成、変数名確認、local `.env` mount を行います。native `op run` Environment injection が使える環境では、repo-local な実行補助として `opz run --environment <ENV> -- <COMMAND>` を使います。既存の vault item workflow、repository title 自動検出、deploy secret sync には、item-backed な `opz run`、`migrate`、`github-secret`、`cloudflare-secret` を引き続き使います。
 
 ## E2Eテスト
 
