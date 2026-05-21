@@ -13,6 +13,7 @@
 * Check `op` authentication, optional CLI dependencies, and plaintext `.env`-style credential files with `doctor`.
 * Show item field labels that are valid shell environment variable names.
 * Run a command with secrets from one or more 1Password items, with repository-title auto-detection.
+* Delegate command execution to native 1Password Environments with `--environment` when your `op` CLI supports it.
 * Generate env files containing `op://...` references, preserving unrelated existing lines.
 * Migrate scripts from explicit items or `.env` files to repository metadata.
 * Save private config files as Secure Notes.
@@ -105,11 +106,14 @@ Run a command with secrets from one or more 1Password items:
 ```bash
 opz run [OPTIONS] [--env-file <ENV>] [<ITEM>...] -- <COMMAND>...
 opz [OPTIONS] [--env-file <ENV>] [<ITEM>...] -- <COMMAND>...
+opz run --environment <ENV> -- <COMMAND>...
+opz --environment <ENV> -- <COMMAND>...
 ```
 
 Options:
 * `--vault <NAME>` - Vault name (optional, searches all vaults if omitted)
 * `--env-file <ENV>` - Output env file path. If omitted, no file is written.
+* `--environment <ENV>` / `--environments <ENV>` - Use native 1Password Environments injection through `op run` instead of item lookup.
 
 Arguments:
 * `<ITEM>...` - Optional item titles to fetch secrets from. When omitted, `opz` auto-detects one item whose title exactly matches a current git remote repository name such as `owner/repo`.
@@ -138,7 +142,12 @@ opz run my-service -- curl -H 'Authorization: Bearer $API_TOKEN' https://api.exa
 
 # Specify vault
 opz run --vault Private foo bar -- your-command
+
+# Use a 1Password Environment without resolving values in opz
+opz run --environment dev -- your-command
 ```
+
+Environment mode is mutually exclusive with item arguments and `--env-file` in v1. `opz` delegates to `op run` and does not read Environment secret values. If your installed `op` CLI does not expose Environment runtime injection, `opz` reports a clear error and the item-backed workflow remains available.
 
 ### Generate Env File
 
@@ -354,6 +363,10 @@ Security: `opz` delegates secret access and authentication to the `op` CLI. The 
 Install and authenticate [1Password CLI](https://developer.1password.com/docs/cli/) (`op`) before using secret-backed commands.
 
 `github-secret` needs GitHub CLI (`gh`). `cloudflare-secret` needs Wrangler (`wrangler`). `migrate` and `note` need Git (`git`) when they read repository remotes.
+
+## 1Password Environments and MCP
+
+`opz` complements 1Password Environments instead of replacing them. Use the 1Password MCP server from agents such as Codex to create Environments, inspect variable names, and mount local `.env` files without exposing secret values to the agent. Use `opz run --environment <ENV> -- <COMMAND>` as repo-local command glue when native `op run` Environment injection is available. Keep item-backed `opz run`, `migrate`, `github-secret`, and `cloudflare-secret` for existing vault item workflows, repository-title auto-detection, and deploy secret sync.
 
 ## E2E Test
 
