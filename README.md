@@ -19,7 +19,7 @@
 * Store valid item fields as GitHub repository secrets, guarded by item repository metadata when present.
 * Store valid item fields as Cloudflare Worker secrets through Wrangler.
 * Print the bundled `opz` Agent Skill.
-* Cache item lists and repository metadata for 60 seconds for explicit lookup and legacy migration paths.
+* Cache item lists and repository metadata for fuzzy lookup and legacy migration paths.
 
 ## Installation
 
@@ -309,17 +309,17 @@ opz cloudflare-secret --name worker-app --env production my-service shared-secre
 
 ## How It Works
 
-1. When item titles are provided, `opz` fetches the item list from 1Password and caches that metadata for 60 seconds.
-2. Title lookup tries exact match first, then title contains matching.
+1. When item titles are provided, `opz` first tries `op item get <title>` directly.
+2. If direct lookup misses, `opz` fetches and caches the item list for title-contains fuzzy matching.
 3. When item titles are omitted, `opz` reads git remotes and tries exact item titles such as `owner/repo` directly. The legacy `github_repositories` scan is only used when `OPZ_AUTODETECT_LEGACY_SCAN=1`.
 4. After the item is selected, `opz` fetches it and builds `op://<vault_id>/<item_id>/<field>` references for fields with valid env labels.
 5. If `--env-file` is set, `opz` writes references to that file and preserves unrelated existing lines. The usual path is file-free `opz run`; env files are for tools that require `op://` references.
-6. Secret values are resolved with `op run --env-file <temp> -- sh -c 'env -0'`, with `op read` per reference as a fallback.
+6. Secret values are resolved with `op run --env-file <temp> -- sh -c 'env -0'`, with `op read` per reference as a fallback for non-timeout failures.
 7. `opz` runs the command with the resolved values in the environment. `$VAR` and `${VAR}` in command arguments are expanded only for variables resolved from the selected items.
 
 `gen` stops after writing references. `show` fetches items and prints valid labels without resolving secret values.
 
-Secret-resolution `op` calls time out after 30 seconds by default. Set `OPZ_OP_TIMEOUT_SECONDS=<seconds>` to allow slower 1Password CLI operations.
+Secret-resolution `op` calls time out after 30 seconds by default. Set `OPZ_OP_TIMEOUT_SECONDS=<seconds>` to allow slower 1Password CLI operations. If batch resolution times out, `opz` stops immediately instead of retrying once per secret.
 
 ## `op` Command Usage
 

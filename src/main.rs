@@ -1140,8 +1140,14 @@ fn resolve_env_vars(env_lines: &[String]) -> Result<HashMap<String, String>> {
         return Ok(HashMap::new());
     }
 
-    if let Ok(env_vars) = resolve_env_vars_batch(&references) {
-        return Ok(env_vars);
+    match resolve_env_vars_batch(&references) {
+        Ok(env_vars) => return Ok(env_vars),
+        Err(err) if !should_fallback_to_op_read(&err) => {
+            return Err(err.context(
+                "batch secret resolution timed out; skipped per-field fallback to avoid waiting once per secret",
+            ));
+        }
+        Err(_) => {}
     }
 
     // Fallback path for environments where batch resolution is unavailable.
@@ -1179,6 +1185,7 @@ fn resolve_env_vars_batch(references: &[(String, String)]) -> Result<HashMap<Str
                 .arg("sh")
                 .arg("-c")
                 .arg("env -0");
+            cmd.stdin(Stdio::null());
             let out = command_output_with_timeout(
                 cmd,
                 "`op run` for batch secret resolution",
@@ -1219,6 +1226,15 @@ fn resolve_env_vars_batch(references: &[(String, String)]) -> Result<HashMap<Str
             Ok(env_vars)
         },
     )
+}
+
+fn should_fallback_to_op_read(err: &anyhow::Error) -> bool {
+    !is_op_timeout_error(err)
+}
+
+fn is_op_timeout_error(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.to_string().contains("timed out after"))
 }
 
 fn print_sectioned_env_output(sections: &[(String, Vec<String>)]) {
@@ -2441,6 +2457,19 @@ fn is_op_reference(value: &str) -> bool {
 
 /// Find and match item by title, returns (item_id, vault_id, item_title)
 fn find_item(vault: Option<&str>, item_title: &str) -> Result<(String, String, String, ItemGet)> {
+    match find_item_exact(vault, item_title) {
+        Ok(item) => return Ok(item),
+        Err(err) if is_op_lookup_miss(&err) => {}
+        Err(err) => return Err(err),
+    }
+
+    find_item_from_cached_list(vault, item_title)
+}
+
+fn find_item_from_cached_list(
+    vault: Option<&str>,
+    item_title: &str,
+) -> Result<(String, String, String, ItemGet)> {
     let items = item_list_cached(vault)?;
 
     let mut matches: Vec<ItemListEntry> = items
@@ -3188,6 +3217,7 @@ fn op_read(reference: &str) -> Result<String> {
     instrumentation::with_span_result("load_inputs.op_read", vec![], || {
         let mut cmd = Command::new("op");
         cmd.arg("read").arg(reference);
+        cmd.stdin(Stdio::null());
         let out = command_output_with_timeout(cmd, "`op read`", op_command_timeout())?;
 
         if !out.status.success() {
@@ -3271,6 +3301,7 @@ fn op_json(args: &[&str]) -> Result<serde_json::Value> {
         || {
             let mut cmd = Command::new("op");
             cmd.args(args);
+            cmd.stdin(Stdio::null());
             let display = format!("`op {}`", args.join(" "));
             let out = command_output_with_timeout(cmd, &display, op_command_timeout())?;
 
@@ -4509,6 +4540,27 @@ SINGLE='value # kept'
             .unwrap_err();
 
         assert!(err.to_string().contains("timed out"), "{err}");
+    }
+
+    #[test]
+    fn test_secret_resolution_timeout_does_not_fallback_to_op_read() {
+        let err = anyhow!("`op run` for batch secret resolution timed out after 30 seconds");
+
+        assert!(!should_fallback_to_op_read(&err));
+    }
+
+    #[test]
+    fn test_secret_resolution_non_timeout_can_fallback_to_op_read() {
+        let err = anyhow!("op run failed: unsupported option");
+
+        assert!(should_fallback_to_op_read(&err));
+    }
+
+    #[test]
+    fn test_op_timeout_detection_checks_error_chain() {
+        let err = anyhow!("`op read` timed out after 30 seconds").context("resolve secret");
+
+        assert!(is_op_timeout_error(&err));
     }
 
     #[test]

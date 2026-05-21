@@ -14,7 +14,7 @@
 * 有効なアイテムフィールドを GitHub repository secrets に保存し、item 側の repository metadata があれば誤配を防ぎます。
 * 有効なアイテムフィールドを Wrangler 経由で Cloudflare Worker secrets に保存します。
 * bundled `opz` Agent Skill を出力します。
-* 明示 item lookup と legacy migration path 用に、アイテムリストと repository metadata を 60 秒キャッシュします。
+* fuzzy lookup と legacy migration path 用に、アイテムリストと repository metadata を 60 秒キャッシュします。
 
 ## インストール
 
@@ -304,17 +304,17 @@ opz cloudflare-secret --name worker-app --env production my-service shared-secre
 
 ## 仕組み
 
-1. item title が指定されている場合、1Password から item list を取得し、その metadata を 60 秒キャッシュします。
-2. title lookup はまず完全一致、見つからなければタイトルの部分一致を使います。
+1. item title が指定されている場合、まず `op item get <title>` で直接取得します。
+2. 直接 lookup で見つからない場合だけ item list を取得・キャッシュし、タイトルの部分一致を使います。
 3. item title が省略されている場合、git remote を読み、`owner/repo` のような item title を直接 lookup します。legacy の `github_repositories` scan は `OPZ_AUTODETECT_LEGACY_SCAN=1` の場合だけ使います。
 4. item が決まると、その item を取得し、有効な env ラベルを持つフィールドから `op://<vault_id>/<item_id>/<field>` 参照を作ります。
 5. `--env-file` 指定があれば、参照をファイルに書き込み、既存ファイルの無関係な行は残します。通常は file-free な `opz run` を使い、env ファイルは `op://` 参照を必要とする tool 向けです。
-6. `op run --env-file <temp> -- sh -c 'env -0'` で secret をまとめて解決し、失敗した場合は参照ごとに `op read` へフォールバックします。
+6. `op run --env-file <temp> -- sh -c 'env -0'` で secret をまとめて解決し、timeout 以外の失敗では参照ごとに `op read` へフォールバックします。
 7. 解決済みの値を環境変数に入れてコマンドを実行します。コマンド引数内の `$VAR` と `${VAR}` は、選択した item から解決できた変数だけ展開します。
 
 `gen` は参照を書いたところで終了します。`show` は secret 値を解決せず、有効なラベルだけを表示します。
 
-secret 解決用の `op` 呼び出しはデフォルトで 30 秒 timeout します。遅い 1Password CLI 操作を許可するには `OPZ_OP_TIMEOUT_SECONDS=<秒>` を設定してください。
+secret 解決用の `op` 呼び出しはデフォルトで 30 秒 timeout します。遅い 1Password CLI 操作を許可するには `OPZ_OP_TIMEOUT_SECONDS=<秒>` を設定してください。batch 解決が timeout した場合は、secret ごとの retry でさらに待たず即座に停止します。
 
 ## `op` コマンドの利用
 
