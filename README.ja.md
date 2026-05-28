@@ -7,6 +7,7 @@
 * タイトルのキーワードで 1Password アイテムを検索します。
 * `doctor` で `op` の認証状態、任意の依存 CLI、平文の `.env` 系 credential ファイルをチェックします。
 * shell の環境変数名として使えるフィールドラベルを表示します。
+* 1Password MCP server 経由で、secret 値を表示せずに 1Password Developer Environments を管理します。
 * 1 つ以上の 1Password アイテムから secret を取得してコマンドを実行します。repository title による item 自動検出にも対応します。
 * `op` CLI が対応している場合、`--environment` で 1Password Environments の native injection に委譲してコマンドを実行します。
 * `op://...` 参照を含む env ファイルを生成し、既存ファイルの無関係な行は残します。
@@ -47,7 +48,7 @@ opz find github
 opz doctor
 ```
 
-`doctor` は必須の `op` チェックが失敗した場合だけ非 0 で終了します。`gh`、`wrangler`、`git`、`sh`、`secretlint` など任意ツールの欠落は警告として表示します。平文の `.env` 系 credential ファイルもチェックし、`secretlint` が使える場合はそのファイルに対して実行します。
+`doctor` は必須の `op` チェックが失敗した場合だけ非 0 で終了します。1Password MCP server、`gh`、`wrangler`、`git`、`sh`、`secretlint` など任意ツールの欠落は警告として表示します。平文の `.env` 系 credential ファイルもチェックし、`secretlint` が使える場合はそのファイルに対して実行します。
 
 ### アイテムラベル表示
 
@@ -79,6 +80,24 @@ opz skills
 ```
 
 これにより、他の agent や tool は Agent Skills 標準形式で `opz` の利用コンテキストをそのまま読み込めます。
+
+### 1Password Environments 管理
+
+1Password MCP server を使って、Developer Environments の作成、リネーム、変数名確認、local `.env` mount を行います。`--account <ACCOUNT_ID>` を省略すると、MCP 経由で 1Password app に認証します。
+
+```bash
+opz environment list
+opz environment create dev
+opz environment rename dev staging
+opz environment variables dev
+opz environment mount dev .env.local
+opz environment mounts dev
+
+# 短縮 alias
+opz env list
+```
+
+`opz environment variables` は変数名だけを表示します。`opz environment mount` は MCP server に synced local `.env` mount の作成を依頼し、`opz` 自身は secret 値を書きません。MCP server executable が `onepassword-mcp` 以外の場合は `OPZ_1PASSWORD_MCP_COMMAND` を設定してください。
 
 ### 削除済みの `create` コマンド
 
@@ -359,9 +378,11 @@ sequenceDiagram
 
 `github-secret` には GitHub CLI (`gh`) が必要です。`cloudflare-secret` には Wrangler (`wrangler`) が必要です。`migrate` と `note` は repository remote を読むために Git (`git`) を使います。
 
+`opz environment` には、`onepassword-mcp` という名前の 1Password MCP server、または executable path を指す `OPZ_1PASSWORD_MCP_COMMAND` が必要です。
+
 ## 1Password Environments と MCP
 
-`opz` は 1Password Environments を置き換えるのではなく、補完します。Codex などの agent では 1Password MCP server を使い、secret 値を agent に返さずに Environment 作成、変数名確認、local `.env` mount を行います。native `op run` Environment injection が使える環境では、repo-local な実行補助として `opz run --environment <ENV> -- <COMMAND>` を使います。既存の vault item workflow、repository title 自動検出、deploy secret sync には、item-backed な `opz run`、`migrate`、`github-secret`、`cloudflare-secret` を引き続き使います。
+`opz` は 1Password Environments を置き換えるのではなく、補完します。`opz environment` は 1Password MCP server を使い、secret 値を agent に返さずに Environment 作成、変数名確認、local `.env` mount を行います。native `op run` Environment injection が使える環境では、repo-local な実行補助として `opz run --environment <ENV> -- <COMMAND>` を使います。既存の vault item workflow、repository title 自動検出、deploy secret sync には、item-backed な `opz run`、`migrate`、`github-secret`、`cloudflare-secret` を引き続き使います。
 
 ## E2Eテスト
 
