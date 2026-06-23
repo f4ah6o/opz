@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand};
 use instrumentation::KeyValue;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     env,
@@ -67,6 +68,12 @@ enum Cmd {
 
     /// Print bundled Agent Skills SKILL.md for opz
     Skills,
+
+    /// List, inspect, and run declarative launch profile plugins
+    Plugin {
+        #[command(subcommand)]
+        command: PluginCommand,
+    },
 
     /// Show valid env labels from 1Password items
     Show {
@@ -188,6 +195,32 @@ enum Cmd {
 }
 
 #[derive(Subcommand, Debug)]
+enum PluginCommand {
+    /// List bundled and locally configured plugins
+    List,
+
+    /// Show a plugin manifest
+    Show {
+        /// Plugin name or alias
+        name: String,
+    },
+
+    /// Run a command with a plugin applied
+    Run {
+        /// Plugin name or alias
+        name: String,
+
+        /// 1Password item title. Defaults to git remote auto-detection.
+        #[arg(long, value_name = "ITEM")]
+        item: Option<String>,
+
+        /// Command to run (after --)
+        #[arg(last = true)]
+        command: Vec<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum EnvironmentCommand {
     /// List 1Password Environments
     List,
@@ -281,6 +314,49 @@ struct ItemCreateField {
 
 static OPZ_SKILL: &str = include_str!("../.agents/skills/opz/SKILL.md");
 const GITHUB_REPOSITORIES_LABEL: &str = "github_repositories";
+const OPZ_PLUGIN_LABEL: &str = "OPZ_PLUGIN";
+const OPZ_PLUGIN_SOURCE_LABEL: &str = "OPZ_PLUGIN_SOURCE";
+const OPZ_PLUGIN_VERSION_LABEL: &str = "OPZ_PLUGIN_VERSION";
+const OPZ_PLUGIN_SHA256_LABEL: &str = "OPZ_PLUGIN_SHA256";
+const OPZ_PLUGIN_CONFIG_LABEL: &str = "OPZ_PLUGIN_CONFIG";
+const OPZ_PLUGIN_REGISTRY_DIR_ENV: &str = "OPZ_PLUGIN_REGISTRY_DIR";
+const BUNDLED_OPENCODE_GO_CODEX_MANIFEST: &str = r#"schema_version = 1
+name = "opencode-go-codex"
+version = "0.1.0"
+description = "Run Codex with OpenCode Go models"
+target_commands = ["codex"]
+
+required_env = ["OPENCODE_GO_API_KEY"]
+secret_env_allowlist = ["OPENCODE_GO_API_KEY"]
+
+[defaults]
+model = "kimi-k2.7"
+
+[defaults.opencode_go]
+base_url = "https://opencode.ai/zen/go/v1"
+
+[env]
+CODEX_HOME = "{tmp}/codex-home"
+
+[files."{env.CODEX_HOME}/config.toml"]
+mode = "0600"
+content = """
+model = "{config.model}"
+model_provider = "opencode_go"
+
+[model_providers.opencode_go]
+name = "OpenCode Go"
+base_url = "{config.opencode_go.base_url}"
+env_key = "OPENCODE_GO_API_KEY"
+requires_openai_auth = false
+"""
+
+[doctor]
+required_commands = ["codex"]
+required_env = ["OPENCODE_GO_API_KEY"]
+"#;
+const BUNDLED_OPENCODE_GO_CODEX_SHA256: &str =
+    "570d1aae0d54b0ace5bd33cba9a128f6157b854b99b8296260f7901f98bb7c48";
 
 #[derive(Debug)]
 struct DoctorFailure;
@@ -378,6 +454,7 @@ fn run_cli(args: &[OsString]) -> Result<()> {
             run_environment_cli(account.as_deref(), command)
         }
         Some(Cmd::Skills) => print_bundled_skill(),
+        Some(Cmd::Plugin { command }) => run_plugin_cli(&cli, command),
         Some(Cmd::Show { with_item, items }) => show_item_labels(&cli, items, *with_item),
         Some(Cmd::Gen { items, env_file }) => {
             print_credential_file_advice_for_secret_command("gen");
@@ -418,7 +495,7 @@ fn run_cli(args: &[OsString]) -> Result<()> {
             }
             print_credential_file_advice_for_secret_command("run");
             let resolved_items = resolve_run_items(&cli, items)?;
-            run_with_items(&cli, &resolved_items, env_file.as_deref(), command)
+            run_with_items_plugin_aware(&cli, &resolved_items, env_file.as_deref(), command)
         }
         Some(Cmd::GithubSecret {
             repo,
@@ -463,8 +540,16 @@ fn run_cli(args: &[OsString]) -> Result<()> {
                 );
             }
             print_credential_file_advice_for_secret_command("run");
+            if let Some((plugin_name, item_titles)) = split_top_level_plugin_shortcut(&cli.items)? {
+                if cli.env_file.is_some() {
+                    return Err(anyhow!(
+                        "`--env-file` is not supported with plugin execution because generated files live in a temporary plugin workspace."
+                    ));
+                }
+                return run_plugin_by_name(&cli, &plugin_name, &item_titles, &cli.command);
+            }
             let resolved_items = resolve_run_items(&cli, &cli.items)?;
-            run_with_items(&cli, &resolved_items, cli.env_file.as_deref(), &cli.command)
+            run_with_items_plugin_aware(&cli, &resolved_items, cli.env_file.as_deref(), &cli.command)
         }
     }
 }
@@ -514,6 +599,7 @@ fn detect_command_hint(args: &[OsString]) -> &'static str {
             "find" => "find",
             "doctor" => "doctor",
             "environment" | "env" => "environment",
+            "plugin" => "plugin",
             "skills" => "skills",
             "show" => "show",
             "gen" => "gen",
@@ -537,6 +623,783 @@ fn print_bundled_skill() -> Result<()> {
         print!("{OPZ_SKILL}");
     });
     Ok(())
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct PluginManifest {
+    schema_version: u32,
+    name: String,
+    version: String,
+    description: String,
+    #[serde(default)]
+    aliases: Vec<String>,
+    target_commands: Vec<String>,
+    required_env: Vec<String>,
+    secret_env_allowlist: Vec<String>,
+    #[serde(default)]
+    defaults: toml::value::Table,
+    #[serde(default)]
+    env: HashMap<String, String>,
+    #[serde(default)]
+    files: HashMap<String, PluginFile>,
+    #[serde(default)]
+    arguments: Vec<String>,
+    #[serde(default)]
+    doctor: Option<PluginDoctor>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct PluginFile {
+    mode: String,
+    content: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct PluginDoctor {
+    #[serde(default)]
+    required_commands: Vec<String>,
+    #[serde(default)]
+    required_env: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PluginRegistry {
+    #[serde(default)]
+    plugins: Vec<PluginRegistryEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PluginRegistryEntry {
+    name: String,
+    version: String,
+    source: String,
+    path: String,
+    sha256: String,
+    #[serde(default)]
+    target_commands: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedPlugin {
+    manifest: PluginManifest,
+    source: String,
+    sha256: String,
+    origin: PluginOrigin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PluginOrigin {
+    Bundled,
+    LocalRegistry,
+}
+
+impl PluginOrigin {
+    fn label(self) -> &'static str {
+        match self {
+            PluginOrigin::Bundled => "bundled",
+            PluginOrigin::LocalRegistry => "local",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ResolvedItemContext {
+    item_id: String,
+    vault_id: String,
+    title: String,
+    item: ItemGet,
+    env_lines: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ItemPluginConfig {
+    plugin: String,
+    plugin_source: String,
+    plugin_version: String,
+    plugin_sha256: String,
+    plugin_config: toml::Value,
+}
+
+fn run_plugin_cli(cli: &Cli, command: &PluginCommand) -> Result<()> {
+    match command {
+        PluginCommand::List => {
+            let plugins = load_available_plugins()?;
+            for plugin in plugins {
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    plugin.manifest.name,
+                    plugin.manifest.version,
+                    plugin.origin.label(),
+                    plugin.manifest.description
+                );
+            }
+            Ok(())
+        }
+        PluginCommand::Show { name } => {
+            let plugin = resolve_plugin(name)?;
+            print!("{}", plugin_manifest_to_toml(&plugin.manifest)?);
+            Ok(())
+        }
+        PluginCommand::Run {
+            name,
+            item,
+            command,
+        } => {
+            if command.is_empty() {
+                return Err(anyhow!(
+                    "Command required after '--'. Usage: opz plugin run <PLUGIN> [--item <ITEM>] -- <COMMAND>..."
+                ));
+            }
+            let items = item.iter().cloned().collect::<Vec<_>>();
+            run_plugin_by_name(cli, name, &items, command)
+        }
+    }
+}
+
+fn split_top_level_plugin_shortcut(items: &[String]) -> Result<Option<(String, Vec<String>)>> {
+    let Some(first) = items.first() else {
+        return Ok(None);
+    };
+    if resolve_plugin(first).is_ok() {
+        return Ok(Some((first.clone(), items[1..].to_vec())));
+    }
+    Ok(None)
+}
+
+fn run_with_items_plugin_aware(
+    cli: &Cli,
+    items: &[String],
+    env_file: Option<&Path>,
+    command: &[String],
+) -> Result<()> {
+    let contexts = instrumentation::with_span_result(
+        "load_inputs",
+        vec![KeyValue::new("item.count", items.len() as i64)],
+        || collect_item_contexts(cli, items),
+    )?;
+    let plugin_config = match contexts.as_slice() {
+        [context] => item_plugin_config(&context.item)?,
+        _ => None,
+    };
+
+    if let Some(item_config) = plugin_config {
+        if env_file.is_some() {
+            return Err(anyhow!(
+                "`--env-file` is not supported when item metadata selects OPZ_PLUGIN because plugin files are generated in a temporary workspace."
+            ));
+        }
+        let plugin_name = item_config.plugin.clone();
+        let context = contexts
+            .first()
+            .ok_or_else(|| anyhow!("OPZ_PLUGIN_CONFIG_INVALID: no resolved item"))?;
+        return run_plugin_with_item(cli, &plugin_name, Some(item_config), context, command);
+    }
+
+    run_with_item_contexts(&contexts, env_file, command)
+}
+
+fn run_plugin_by_name(
+    cli: &Cli,
+    plugin_name: &str,
+    item_titles: &[String],
+    command: &[String],
+) -> Result<()> {
+    let resolved_items = resolve_run_items(cli, item_titles)?;
+    if resolved_items.len() != 1 {
+        return Err(anyhow!(
+            "OPZ_PLUGIN_CONFIG_INVALID: plugin execution requires exactly one 1Password item"
+        ));
+    }
+    let contexts = collect_item_contexts(cli, &resolved_items)?;
+    let context = contexts
+        .first()
+        .ok_or_else(|| anyhow!("OPZ_PLUGIN_CONFIG_INVALID: no resolved item"))?;
+    let item_config = item_plugin_config(&context.item)?;
+    run_plugin_with_item(cli, plugin_name, item_config, context, command)
+}
+
+fn run_plugin_with_item(
+    _cli: &Cli,
+    requested_name: &str,
+    item_config: Option<ItemPluginConfig>,
+    item_context: &ResolvedItemContext,
+    command: &[String],
+) -> Result<()> {
+    let plugin = resolve_plugin(requested_name)?;
+    if !plugin_matches_name_or_alias(&plugin.manifest, requested_name) {
+        return Err(anyhow!("OPZ_PLUGIN_NOT_FOUND: {requested_name}"));
+    }
+
+    if let Some(config) = &item_config {
+        validate_item_plugin_pin(&plugin, config)?;
+    }
+
+    validate_plugin_manifest(&plugin.manifest)?;
+    validate_plugin_target_command(&plugin.manifest, command)?;
+
+    let runtime_config = build_plugin_runtime_config(&plugin.manifest, item_config.as_ref())?;
+    let secret_lines = plugin_secret_env_lines(&plugin.manifest, item_context)?;
+    let mut child_env = resolve_env_vars(&secret_lines)?;
+
+    let workspace = tempfile::Builder::new()
+        .prefix("opz-plugin-")
+        .tempdir()
+        .context("OPZ_PLUGIN_RENDER_FAILED: create temp workspace")?;
+    let tmp = workspace.path().to_string_lossy().to_string();
+    let rendered_env = render_plugin_env(&plugin.manifest, &runtime_config, &tmp)?;
+    for (key, value) in &rendered_env {
+        child_env.insert(key.clone(), value.clone());
+    }
+    render_plugin_files(
+        &plugin.manifest,
+        &runtime_config,
+        &rendered_env,
+        workspace.path(),
+    )?;
+
+    run_command_with_env(command, &child_env)
+}
+
+fn validate_item_plugin_pin(plugin: &ResolvedPlugin, item_config: &ItemPluginConfig) -> Result<()> {
+    if item_config.plugin != plugin.manifest.name
+        && !plugin
+            .manifest
+            .aliases
+            .iter()
+            .any(|alias| alias == &item_config.plugin)
+    {
+        return Err(anyhow!(
+            "OPZ_PLUGIN_NOT_FOUND: item requested `{}` but resolved `{}`",
+            item_config.plugin,
+            plugin.manifest.name
+        ));
+    }
+    if item_config.plugin_source != plugin.source {
+        return Err(anyhow!(
+            "OPZ_PLUGIN_SCHEMA_INVALID: source mismatch for {}",
+            plugin.manifest.name
+        ));
+    }
+    if item_config.plugin_version != plugin.manifest.version {
+        return Err(anyhow!(
+            "OPZ_PLUGIN_SCHEMA_INVALID: version mismatch for {}",
+            plugin.manifest.name
+        ));
+    }
+    if item_config.plugin_sha256 != plugin.sha256 {
+        return Err(anyhow!(
+            "OPZ_PLUGIN_HASH_MISMATCH: expected {}, got {}",
+            item_config.plugin_sha256,
+            plugin.sha256
+        ));
+    }
+    Ok(())
+}
+
+fn load_available_plugins() -> Result<Vec<ResolvedPlugin>> {
+    let mut plugins = bundled_plugins()?;
+    if let Some(local_plugins) = load_local_registry_plugins()? {
+        for local in local_plugins {
+            if let Some(pos) = plugins
+                .iter()
+                .position(|plugin| plugin.manifest.name == local.manifest.name)
+            {
+                plugins[pos] = local;
+            } else {
+                plugins.push(local);
+            }
+        }
+    }
+    plugins.sort_by(|a, b| a.manifest.name.cmp(&b.manifest.name));
+    Ok(plugins)
+}
+
+fn resolve_plugin(name: &str) -> Result<ResolvedPlugin> {
+    load_available_plugins()?
+        .into_iter()
+        .find(|plugin| plugin_matches_name_or_alias(&plugin.manifest, name))
+        .ok_or_else(|| anyhow!("OPZ_PLUGIN_NOT_FOUND: {name}"))
+}
+
+fn plugin_matches_name_or_alias(manifest: &PluginManifest, name: &str) -> bool {
+    manifest.name == name || manifest.aliases.iter().any(|alias| alias == name)
+}
+
+fn bundled_plugins() -> Result<Vec<ResolvedPlugin>> {
+    let manifest = parse_plugin_manifest(BUNDLED_OPENCODE_GO_CODEX_MANIFEST)?;
+    let sha256 = sha256_hex(BUNDLED_OPENCODE_GO_CODEX_MANIFEST.as_bytes());
+    if sha256 != BUNDLED_OPENCODE_GO_CODEX_SHA256 {
+        return Err(anyhow!(
+            "OPZ_PLUGIN_HASH_MISMATCH: bundled opencode-go-codex digest changed"
+        ));
+    }
+    Ok(vec![ResolvedPlugin {
+        manifest,
+        source: "github:opz-rs/opz-plugin/plugins/opencode-go-codex".to_string(),
+        sha256,
+        origin: PluginOrigin::Bundled,
+    }])
+}
+
+fn load_local_registry_plugins() -> Result<Option<Vec<ResolvedPlugin>>> {
+    let Some(root) = env::var_os(OPZ_PLUGIN_REGISTRY_DIR_ENV) else {
+        return Ok(None);
+    };
+    let root = PathBuf::from(root);
+    let registry_path = root.join("registry.toml");
+    let registry_text = fs::read_to_string(&registry_path)
+        .with_context(|| format!("OPZ_PLUGIN_NOT_FOUND: read {}", registry_path.display()))?;
+    let registry: PluginRegistry = toml::from_str(&registry_text).with_context(|| {
+        format!(
+            "OPZ_PLUGIN_SCHEMA_INVALID: parse {}",
+            registry_path.display()
+        )
+    })?;
+    let mut plugins = Vec::new();
+    for entry in registry.plugins {
+        let manifest_path = root.join(&entry.path);
+        let manifest_text = fs::read_to_string(&manifest_path).with_context(|| {
+            format!(
+                "OPZ_PLUGIN_NOT_FOUND: read plugin manifest {}",
+                manifest_path.display()
+            )
+        })?;
+        let digest = sha256_hex(manifest_text.as_bytes());
+        if digest != entry.sha256 {
+            return Err(anyhow!(
+                "OPZ_PLUGIN_HASH_MISMATCH: {} expected {}, got {}",
+                entry.name,
+                entry.sha256,
+                digest
+            ));
+        }
+        let manifest = parse_plugin_manifest(&manifest_text)?;
+        if manifest.name != entry.name
+            || manifest.version != entry.version
+            || manifest.target_commands != entry.target_commands
+        {
+            return Err(anyhow!(
+                "OPZ_PLUGIN_SCHEMA_INVALID: registry entry does not match manifest for {}",
+                entry.name
+            ));
+        }
+        plugins.push(ResolvedPlugin {
+            manifest,
+            source: entry.source,
+            sha256: digest,
+            origin: PluginOrigin::LocalRegistry,
+        });
+    }
+    Ok(Some(plugins))
+}
+
+fn parse_plugin_manifest(text: &str) -> Result<PluginManifest> {
+    let manifest: PluginManifest =
+        toml::from_str(text).context("OPZ_PLUGIN_SCHEMA_INVALID: parse plugin manifest")?;
+    validate_plugin_manifest(&manifest)?;
+    Ok(manifest)
+}
+
+fn plugin_manifest_to_toml(manifest: &PluginManifest) -> Result<String> {
+    toml::to_string_pretty(manifest).context("OPZ_PLUGIN_RENDER_FAILED: serialize plugin manifest")
+}
+
+fn validate_plugin_manifest(manifest: &PluginManifest) -> Result<()> {
+    if manifest.schema_version != 1 {
+        return Err(anyhow!(
+            "OPZ_PLUGIN_SCHEMA_INVALID: unsupported schema_version {}",
+            manifest.schema_version
+        ));
+    }
+    validate_plugin_name(&manifest.name)?;
+    for alias in &manifest.aliases {
+        validate_plugin_name(alias)?;
+    }
+    if manifest.version.is_empty() || manifest.description.is_empty() {
+        return Err(anyhow!(
+            "OPZ_PLUGIN_SCHEMA_INVALID: version and description are required"
+        ));
+    }
+    if manifest.target_commands.is_empty() {
+        return Err(anyhow!(
+            "OPZ_PLUGIN_SCHEMA_INVALID: target_commands must not be empty"
+        ));
+    }
+    for command in &manifest.target_commands {
+        validate_target_command(command)?;
+    }
+    let required: HashSet<&str> = manifest.required_env.iter().map(String::as_str).collect();
+    for name in manifest
+        .required_env
+        .iter()
+        .chain(manifest.secret_env_allowlist.iter())
+    {
+        validate_env_name(name)?;
+    }
+    for secret in &manifest.secret_env_allowlist {
+        if !required.contains(secret.as_str()) {
+            return Err(anyhow!(
+                "OPZ_PLUGIN_SCHEMA_INVALID: secret_env_allowlist entry `{secret}` is not in required_env"
+            ));
+        }
+    }
+    for key in manifest.env.keys() {
+        validate_env_name(key)?;
+    }
+    for spec in manifest.files.values() {
+        validate_file_mode(&spec.mode)?;
+    }
+    Ok(())
+}
+
+fn validate_plugin_name(name: &str) -> Result<()> {
+    let re = Regex::new(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")?;
+    if !re.is_match(name) {
+        return Err(anyhow!(
+            "OPZ_PLUGIN_SCHEMA_INVALID: invalid plugin name `{name}`"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_target_command(command: &str) -> Result<()> {
+    let re = Regex::new(r"^[a-z0-9][a-z0-9._-]*$")?;
+    if !re.is_match(command) {
+        return Err(anyhow!(
+            "OPZ_PLUGIN_SCHEMA_INVALID: invalid target command `{command}`"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_env_name(name: &str) -> Result<()> {
+    let re = Regex::new(r"^[A-Z_][A-Z0-9_]*$")?;
+    if !re.is_match(name) {
+        return Err(anyhow!(
+            "OPZ_PLUGIN_SCHEMA_INVALID: invalid env name `{name}`"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_file_mode(mode: &str) -> Result<()> {
+    let re = Regex::new(r"^0[0-7]{3}$")?;
+    if !re.is_match(mode) {
+        return Err(anyhow!(
+            "OPZ_PLUGIN_SCHEMA_INVALID: invalid file mode `{mode}`"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_plugin_target_command(manifest: &PluginManifest, command: &[String]) -> Result<()> {
+    let first = command.first().ok_or_else(|| {
+        anyhow!("OPZ_PLUGIN_TARGET_MISMATCH: command required after plugin separator")
+    })?;
+    let basename = Path::new(first)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(first);
+    if !manifest
+        .target_commands
+        .iter()
+        .any(|target| target == basename)
+    {
+        return Err(anyhow!(
+            "OPZ_PLUGIN_TARGET_MISMATCH: plugin `{}` supports {}, got {}",
+            manifest.name,
+            manifest.target_commands.join(", "),
+            basename
+        ));
+    }
+    Ok(())
+}
+
+fn item_plugin_config(item: &ItemGet) -> Result<Option<ItemPluginConfig>> {
+    let Some(plugin) = item_field_value_by_label(item, OPZ_PLUGIN_LABEL) else {
+        return Ok(None);
+    };
+    let plugin_source = required_item_field(item, OPZ_PLUGIN_SOURCE_LABEL)?;
+    let plugin_version = required_item_field(item, OPZ_PLUGIN_VERSION_LABEL)?;
+    let plugin_sha256 = required_item_field(item, OPZ_PLUGIN_SHA256_LABEL)?;
+    let mut plugin_config = toml::Value::Table(item_plugin_scalar_overrides(item));
+    if let Some(config) = item_field_value_by_label(item, OPZ_PLUGIN_CONFIG_LABEL) {
+        let parsed = toml::from_str::<toml::Value>(&config)
+            .context("OPZ_PLUGIN_CONFIG_INVALID: parse OPZ_PLUGIN_CONFIG")?;
+        if let (toml::Value::Table(target), toml::Value::Table(source)) =
+            (&mut plugin_config, parsed)
+        {
+            merge_plugin_config(target, &source);
+        } else {
+            return Err(anyhow!(
+                "OPZ_PLUGIN_CONFIG_INVALID: OPZ_PLUGIN_CONFIG must be a TOML table"
+            ));
+        }
+    }
+    Ok(Some(ItemPluginConfig {
+        plugin,
+        plugin_source,
+        plugin_version,
+        plugin_sha256,
+        plugin_config,
+    }))
+}
+
+fn item_plugin_scalar_overrides(item: &ItemGet) -> toml::value::Table {
+    let mut table = toml::value::Table::new();
+    for (label, key) in [
+        ("OPZ_MODEL", "model"),
+        ("OPZ_BASE_URL", "opencode_go.base_url"),
+    ] {
+        if let Some(value) = item_field_value_by_label(item, label) {
+            insert_plugin_scalar_override(&mut table, key, toml::Value::String(value));
+        }
+    }
+    table
+}
+
+fn insert_plugin_scalar_override(
+    table: &mut toml::value::Table,
+    dotted_key: &str,
+    value: toml::Value,
+) {
+    let mut current = table;
+    let mut parts = dotted_key.split('.').peekable();
+    while let Some(part) = parts.next() {
+        if parts.peek().is_none() {
+            current.insert(part.to_string(), value);
+            return;
+        }
+        current = current
+            .entry(part.to_string())
+            .or_insert_with(|| toml::Value::Table(toml::value::Table::new()))
+            .as_table_mut()
+            .expect("plugin scalar override path contains only tables");
+    }
+}
+
+fn required_item_field(item: &ItemGet, label: &str) -> Result<String> {
+    item_field_value_by_label(item, label)
+        .ok_or_else(|| anyhow!("OPZ_PLUGIN_CONFIG_INVALID: missing required field {label}"))
+}
+
+fn item_field_value_by_label(item: &ItemGet, wanted: &str) -> Option<String> {
+    item.fields.iter().find_map(|field| {
+        let label = field.label.as_deref()?;
+        if label != wanted {
+            return None;
+        }
+        item_field_string_value(field)
+    })
+}
+
+fn build_plugin_runtime_config(
+    manifest: &PluginManifest,
+    item_config: Option<&ItemPluginConfig>,
+) -> Result<toml::value::Table> {
+    let mut config = manifest.defaults.clone();
+    if let Some(item_config) = item_config {
+        if let toml::Value::Table(table) = &item_config.plugin_config {
+            merge_plugin_config(&mut config, table);
+        } else {
+            return Err(anyhow!(
+                "OPZ_PLUGIN_CONFIG_INVALID: OPZ_PLUGIN_CONFIG must be a TOML table"
+            ));
+        }
+    }
+    Ok(config)
+}
+
+fn merge_plugin_config(target: &mut toml::value::Table, source: &toml::value::Table) {
+    for (key, value) in source {
+        match (target.get_mut(key), value) {
+            (Some(toml::Value::Table(target_child)), toml::Value::Table(source_child)) => {
+                merge_plugin_config(target_child, source_child);
+            }
+            _ => {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
+fn plugin_secret_env_lines(
+    manifest: &PluginManifest,
+    item_context: &ResolvedItemContext,
+) -> Result<Vec<String>> {
+    let available: HashSet<&str> = item_context
+        .item
+        .fields
+        .iter()
+        .filter_map(|field| field.label.as_deref())
+        .collect();
+    for name in &manifest.required_env {
+        if !available.contains(name.as_str()) {
+            return Err(anyhow!("OPZ_PLUGIN_REQUIRED_ENV_MISSING: {name}"));
+        }
+    }
+    let mut lines = Vec::new();
+    for name in &manifest.secret_env_allowlist {
+        if !available.contains(name.as_str()) {
+            return Err(anyhow!("OPZ_PLUGIN_REQUIRED_ENV_MISSING: {name}"));
+        }
+        lines.push(format!(
+            "{}=op://{}/{}/{}",
+            name, item_context.vault_id, item_context.item_id, name
+        ));
+    }
+    Ok(lines)
+}
+
+fn render_plugin_env(
+    manifest: &PluginManifest,
+    config: &toml::value::Table,
+    tmp: &str,
+) -> Result<HashMap<String, String>> {
+    let mut env_vars = HashMap::new();
+    for (key, template) in &manifest.env {
+        let value = render_plugin_template(template, config, &env_vars, tmp)?;
+        env_vars.insert(key.clone(), value);
+    }
+    Ok(env_vars)
+}
+
+fn render_plugin_files(
+    manifest: &PluginManifest,
+    config: &toml::value::Table,
+    env_vars: &HashMap<String, String>,
+    workspace: &Path,
+) -> Result<()> {
+    for (path_template, spec) in &manifest.files {
+        let rendered_path = render_plugin_template(
+            path_template,
+            config,
+            env_vars,
+            &workspace.to_string_lossy(),
+        )?;
+        let path = normalize_plugin_generated_path(workspace, &rendered_path)?;
+        let content = render_plugin_template(
+            &spec.content,
+            config,
+            env_vars,
+            &workspace.to_string_lossy(),
+        )?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("OPZ_PLUGIN_RENDER_FAILED: create {}", parent.display())
+            })?;
+        }
+        fs::write(&path, content)
+            .with_context(|| format!("OPZ_PLUGIN_RENDER_FAILED: write {}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = u32::from_str_radix(spec.mode.trim_start_matches('0'), 8)
+                .context("OPZ_PLUGIN_SCHEMA_INVALID: parse file mode")?;
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).with_context(|| {
+                format!(
+                    "OPZ_PLUGIN_RENDER_FAILED: set mode {} on {}",
+                    spec.mode,
+                    path.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn normalize_plugin_generated_path(workspace: &Path, rendered_path: &str) -> Result<PathBuf> {
+    use std::path::Component;
+
+    let path = PathBuf::from(rendered_path);
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(anyhow!(
+                    "OPZ_PLUGIN_RENDER_FAILED: generated file path escapes plugin workspace: {}",
+                    path.display()
+                ));
+            }
+        }
+    }
+
+    if !normalized.is_absolute() || !normalized.starts_with(workspace) {
+        return Err(anyhow!(
+            "OPZ_PLUGIN_RENDER_FAILED: generated file path escapes plugin workspace: {}",
+            path.display()
+        ));
+    }
+    Ok(normalized)
+}
+
+fn render_plugin_template(
+    template: &str,
+    config: &toml::value::Table,
+    env_vars: &HashMap<String, String>,
+    tmp: &str,
+) -> Result<String> {
+    let re = Regex::new(r"\{([^{}]+)\}")?;
+    let mut rendered = String::new();
+    let mut last = 0;
+    for captures in re.captures_iter(template) {
+        let full = captures
+            .get(0)
+            .ok_or_else(|| anyhow!("OPZ_PLUGIN_RENDER_FAILED: invalid template capture"))?;
+        rendered.push_str(&template[last..full.start()]);
+        let key = captures
+            .get(1)
+            .ok_or_else(|| anyhow!("OPZ_PLUGIN_RENDER_FAILED: invalid template key"))?
+            .as_str();
+        let replacement = if key == "tmp" {
+            tmp.to_string()
+        } else if let Some(rest) = key.strip_prefix("env.") {
+            env_vars
+                .get(rest)
+                .cloned()
+                .ok_or_else(|| anyhow!("OPZ_PLUGIN_RENDER_FAILED: missing env template {rest}"))?
+        } else if let Some(rest) = key.strip_prefix("config.") {
+            plugin_config_value(config, rest)?
+        } else {
+            return Err(anyhow!(
+                "OPZ_PLUGIN_RENDER_FAILED: unsupported template {key}"
+            ));
+        };
+        rendered.push_str(&replacement);
+        last = full.end();
+    }
+    rendered.push_str(&template[last..]);
+    Ok(rendered)
+}
+
+fn plugin_config_value(config: &toml::value::Table, key: &str) -> Result<String> {
+    let mut value = toml::Value::Table(config.clone());
+    for part in key.split('.') {
+        value = value
+            .as_table()
+            .and_then(|table| table.get(part))
+            .cloned()
+            .ok_or_else(|| anyhow!("OPZ_PLUGIN_CONFIG_INVALID: missing config.{key}"))?;
+    }
+    match value {
+        toml::Value::String(value) => Ok(value),
+        toml::Value::Integer(value) => Ok(value.to_string()),
+        toml::Value::Float(value) => Ok(value.to_string()),
+        toml::Value::Boolean(value) => Ok(value.to_string()),
+        _ => Err(anyhow!(
+            "OPZ_PLUGIN_CONFIG_INVALID: config.{key} is not a scalar"
+        )),
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1743,16 +2606,28 @@ fn doctor_has_required_failure(checks: &[DoctorCheck]) -> bool {
 }
 
 fn collect_item_env_sections(cli: &Cli, items: &[String]) -> Result<Vec<(String, Vec<String>)>> {
-    let mut sections = Vec::with_capacity(items.len());
+    Ok(collect_item_contexts(cli, items)?
+        .into_iter()
+        .map(|context| (context.title, context.env_lines))
+        .collect())
+}
+
+fn collect_item_contexts(cli: &Cli, items: &[String]) -> Result<Vec<ResolvedItemContext>> {
+    let mut contexts = Vec::with_capacity(items.len());
 
     for item_title in items {
-        let (item_id, vault_id, resolved_title, item) =
-            find_item(cli.vault.as_deref(), item_title)?;
+        let (item_id, vault_id, title, item) = find_item(cli.vault.as_deref(), item_title)?;
         let env_lines = item_to_env_lines(&item, &vault_id, &item_id)?;
-        sections.push((resolved_title, env_lines));
+        contexts.push(ResolvedItemContext {
+            item_id,
+            vault_id,
+            title,
+            item,
+            env_lines,
+        });
     }
 
-    Ok(sections)
+    Ok(contexts)
 }
 
 fn collect_item_env_sections_with_github_repos(
@@ -3743,17 +4618,15 @@ fn expand_vars(s: &str, env_vars: &HashMap<String, String>) -> String {
     result
 }
 
-fn run_with_items(
-    cli: &Cli,
-    items: &[String],
+fn run_with_item_contexts(
+    contexts: &[ResolvedItemContext],
     env_file: Option<&Path>,
     command: &[String],
 ) -> Result<()> {
-    let sections = instrumentation::with_span_result(
-        "load_inputs",
-        vec![KeyValue::new("item.count", items.len() as i64)],
-        || collect_item_env_sections(cli, items),
-    )?;
+    let sections: Vec<(String, Vec<String>)> = contexts
+        .iter()
+        .map(|context| (context.title.clone(), context.env_lines.clone()))
+        .collect();
     let merged_env_lines =
         instrumentation::with_span("main_operation", vec![], || merge_env_lines(&sections));
 
@@ -3790,6 +4663,10 @@ fn run_with_items(
             .collect()
     });
 
+    run_command_with_env(&expanded_args, &env_vars)
+}
+
+fn run_command_with_env(command: &[String], env_vars: &HashMap<String, String>) -> Result<()> {
     instrumentation::with_span_result("write_outputs.command_exec", vec![], || {
         #[cfg(unix)]
         let mut cmd = {
@@ -3797,19 +4674,18 @@ fn run_with_items(
             c.arg("-c");
             c.arg("exec \"$@\"");
             c.arg("sh");
-            c.args(&expanded_args);
+            c.args(command);
             c
         };
 
         #[cfg(windows)]
         let mut cmd = {
-            let mut c = Command::new(&expanded_args[0]);
-            c.args(&expanded_args[1..]);
+            let mut c = Command::new(&command[0]);
+            c.args(&command[1..]);
             c
         };
 
-        // Set environment variables for the child process
-        for (key, value) in &env_vars {
+        for (key, value) in env_vars {
             cmd.env(key, value);
         }
 
@@ -4042,6 +4918,11 @@ fn item_to_valid_labels(item: &ItemGet) -> Result<Vec<String>> {
 
 fn is_metadata_label(label: &str) -> bool {
     label.eq_ignore_ascii_case(GITHUB_REPOSITORIES_LABEL)
+        || label == OPZ_PLUGIN_LABEL
+        || label == OPZ_PLUGIN_SOURCE_LABEL
+        || label == OPZ_PLUGIN_VERSION_LABEL
+        || label == OPZ_PLUGIN_SHA256_LABEL
+        || label == OPZ_PLUGIN_CONFIG_LABEL
 }
 
 /// Parse env line to extract key name (e.g., "KEY=value" -> "KEY")

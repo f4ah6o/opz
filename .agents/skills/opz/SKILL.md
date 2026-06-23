@@ -1,17 +1,18 @@
 ---
 name: opz
-description: Use the opz CLI to search 1Password items, inspect valid env labels, manage 1Password Developer Environments through MCP, diagnose op and dependency status, generate env files, migrate scripts to repository item titles and metadata, store private files as notes, store GitHub repository secrets, store Cloudflare Worker secrets, and run commands with item-backed or 1Password Environment-backed secret injection.
+description: Use the opz CLI to search 1Password items, inspect valid env labels, manage 1Password Developer Environments through MCP, diagnose op and dependency status, generate env files, migrate scripts to repository item titles and metadata, store private files as notes, store GitHub repository secrets, store Cloudflare Worker secrets, apply declarative plugin launch profiles, and run commands with item-backed or 1Password Environment-backed secret injection.
 ---
 
 # opz
 
-Use this skill when you need to work with 1Password-backed secrets through the `opz` CLI. `opz` reads item metadata from `op`, builds `op://<vault_id>/<item_id>/<field>` references for valid env labels, and can resolve those references while running another command. When using 1Password Environments, `opz run --environment <ENV> -- <COMMAND>` delegates to native `op run` so `opz` does not read Environment secret values. `opz environment` uses the 1Password MCP server for Environment management, variable-name inspection, and local `.env` mounts without printing secret values.
+Use this skill when you need to work with 1Password-backed secrets through the `opz` CLI. `opz` reads item metadata from `op`, builds `op://<vault_id>/<item_id>/<field>` references for valid env labels, and can resolve those references while running another command. When item metadata selects `OPZ_PLUGIN`, `opz` applies a declarative launch profile such as `opencode-go-codex`, resolves only allowlisted secrets, generates temporary config files, and runs the target command. When using 1Password Environments, `opz run --environment <ENV> -- <COMMAND>` delegates to native `op run` so `opz` does not read Environment secret values. `opz environment` uses the 1Password MCP server for Environment management, variable-name inspection, and local `.env` mounts without printing secret values.
 
 ## Prerequisites
 
 - 1Password CLI (`op`) is installed and authenticated.
 - The 1Password MCP server is available as `onepassword-mcp`, or `OPZ_1PASSWORD_MCP_COMMAND` points to the executable, when using `opz environment`.
 - The relevant vault and item names are known, can be discovered with `opz find`, or can be auto-detected from item titles that match the current git remote repository name.
+- Plugin launch profiles require an item with `OPZ_PLUGIN`, `OPZ_PLUGIN_SOURCE`, `OPZ_PLUGIN_VERSION`, and `OPZ_PLUGIN_SHA256`; `OPZ_PLUGIN_REGISTRY_DIR` can point to a local registry checkout for development.
 
 ## Global Options
 
@@ -100,6 +101,19 @@ opz run --environment <ENV> -- <COMMAND>...
 opz --environment <ENV> -- <COMMAND>...
 ```
 
+When the auto-detected item contains `OPZ_PLUGIN`, `opz run -- <COMMAND>` and `opz -- <COMMAND>` apply the selected declarative plugin. For `opencode-go-codex`, `opz -- codex` generates a temporary `CODEX_HOME/config.toml`, injects only `OPENCODE_GO_API_KEY`, and removes the temporary workspace after the command exits.
+
+### `plugin`
+
+List, inspect, and explicitly run declarative launch profile plugins. `opz` ships a bundled `opencode-go-codex` manifest and does not fetch manifests from the network at runtime.
+
+```bash
+opz plugin list
+opz plugin show opencode-go-codex
+opz plugin run opencode-go-codex [--item <ITEM>] -- codex
+opz opencode-go-codex -- codex
+```
+
 ### `github-secret`
 
 Store valid item fields as GitHub repository secrets. If an item has `github_repositories` metadata, the target repository must match before secrets are resolved or written.
@@ -146,6 +160,8 @@ opz skills
 
 - When multiple items define the same env key, later items win.
 - `doctor` checks `op` as required and reports the 1Password MCP server command, `gh`, `wrangler`, `git`, `sh`, `secretlint`, and plaintext `.env`-style files as optional warnings.
+- Plugin execution is declarative only: no plugin scripts, network access, dynamic code execution, or access to secrets outside `secret_env_allowlist`.
+- Plugin-generated files are written under a temporary workspace and removed after the target command exits.
 - `github-secret` also uses later-item-wins and passes values to `gh secret set` through stdin.
 - `github-secret` rejects names starting with `GITHUB_` and blocks writes when item `github_repositories` metadata does not include the target repo.
 - `github-repo` migrates existing items by merging repository metadata into `github_repositories`.

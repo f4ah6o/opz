@@ -14,6 +14,7 @@
 * Show item field labels that are valid shell environment variable names.
 * Manage 1Password Developer Environments through the 1Password MCP server without printing secret values.
 * Run a command with secrets from one or more 1Password items, with repository-title auto-detection.
+* Apply declarative plugin launch profiles from item metadata, starting with `opencode-go-codex`.
 * Delegate command execution to native 1Password Environments with `--environment` when your `op` CLI supports it.
 * Generate env files containing `op://...` references, preserving unrelated existing lines.
 * Migrate scripts from explicit items or `.env` files to repository metadata.
@@ -167,6 +168,48 @@ opz run --environment dev -- your-command
 ```
 
 Environment mode is mutually exclusive with item arguments and `--env-file` in v1. `opz` delegates to `op run` and does not read Environment secret values. If your installed `op` CLI does not expose Environment runtime injection, `opz` reports a clear error and the item-backed workflow remains available.
+
+### Plugin Launch Profiles
+
+Declarative plugins let a repository item choose a launch profile without adding provider-specific logic to `opz` core.
+
+```bash
+opz plugin list
+opz plugin show opencode-go-codex
+opz plugin run opencode-go-codex --item owner/repo -- codex
+
+# Auto-detect the repository item, read OPZ_PLUGIN, generate a temp CODEX_HOME, and run codex.
+opz -- codex
+
+# Explicit plugin shortcut, with optional item auto-detection.
+opz opencode-go-codex -- codex
+```
+
+Top-level plugin shortcuts take precedence over item-title shorthand when the first positional argument matches a known plugin name or alias. If you have an item with the same title, use the explicit item form: `opz run opencode-go-codex -- <COMMAND>`.
+
+`opz` v1 ships a bundled official `opencode-go-codex` manifest snapshot and can read a local registry checkout when `OPZ_PLUGIN_REGISTRY_DIR` points at a directory containing `registry.toml` and `plugins/<name>/plugin.toml`. It does not fetch plugin manifests from the network at runtime.
+
+Repository items select and pin plugins with metadata fields:
+
+```text
+OPZ_PLUGIN=opencode-go-codex
+OPZ_PLUGIN_SOURCE=github:opz-rs/opz-plugin/plugins/opencode-go-codex
+OPZ_PLUGIN_VERSION=0.1.0
+OPZ_PLUGIN_SHA256=570d1aae0d54b0ace5bd33cba9a128f6157b854b99b8296260f7901f98bb7c48
+OPZ_MODEL=kimi-k2.7
+OPENCODE_GO_API_KEY=<secret>
+```
+
+For richer config, add `OPZ_PLUGIN_CONFIG` as TOML. It overrides manifest defaults and simple `OPZ_*` scalar fields:
+
+```toml
+model = "kimi-k2.7"
+
+[opencode_go]
+base_url = "https://opencode.ai/zen/go/v1"
+```
+
+Security model: v1 plugins are declarative only. They may define environment mappings, generated file templates, target command constraints, defaults, and static doctor metadata. They may not run scripts, perform network access, execute code, or read secrets outside `secret_env_allowlist`. Plugin-generated files are written under a temporary workspace and removed after the command exits.
 
 ### Generate Env File
 
