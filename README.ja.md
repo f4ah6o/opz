@@ -9,6 +9,7 @@
 * shell の環境変数名として使えるフィールドラベルを表示します。
 * 1Password MCP server 経由で、secret 値を表示せずに 1Password Developer Environments を管理します。
 * 1 つ以上の 1Password アイテムから secret を取得してコマンドを実行します。repository title による item 自動検出にも対応します。
+* item metadata から declarative plugin launch profile を適用できます。初期対応は `opencode-go-codex` です。
 * `op` CLI が対応している場合、`--environment` で 1Password Environments の native injection に委譲してコマンドを実行します。
 * `op://...` 参照を含む env ファイルを生成し、既存ファイルの無関係な行は残します。
 * 既存 script を、明示 item や `.env` から repository title と metadata ベースの管理へ migrate できます。
@@ -162,6 +163,48 @@ opz run --environment dev -- your-command
 ```
 
 Environment mode は v1 では item 引数や `--env-file` と同時に使えません。`opz` は `op run` に実行を委譲し、Environment の secret 値を読みません。インストール済みの `op` CLI が Environment runtime injection を公開していない場合、`opz` は明確なエラーを返し、従来の item-backed workflow はそのまま使えます。
+
+### Plugin launch profiles
+
+Declarative plugin を使うと、provider 固有の処理を `opz` core に入れず、repository item 側で launch profile を選べます。
+
+```bash
+opz plugin list
+opz plugin show opencode-go-codex
+opz plugin run opencode-go-codex --item owner/repo -- codex
+
+# repository item を自動検出し、OPZ_PLUGIN を読み、temp CODEX_HOME を生成して codex を実行
+opz -- codex
+
+# plugin shortcut。item は省略時に自動検出
+opz opencode-go-codex -- codex
+```
+
+Top-level plugin shortcut は、最初の positional argument が既知の plugin 名または alias と一致する場合、item-title shorthand より優先されます。同名 item を使う場合は明示形の `opz run opencode-go-codex -- <COMMAND>` を使ってください。
+
+`opz` v1 は official `opencode-go-codex` manifest snapshot を同梱します。`OPZ_PLUGIN_REGISTRY_DIR` に `registry.toml` と `plugins/<name>/plugin.toml` を含む local registry checkout を指定すると、その manifest を優先できます。runtime に GitHub から plugin manifest を fetch しません。
+
+Repository item では metadata field で plugin を選び、pin します:
+
+```text
+OPZ_PLUGIN=opencode-go-codex
+OPZ_PLUGIN_SOURCE=github:opz-rs/opz-plugin/plugins/opencode-go-codex
+OPZ_PLUGIN_VERSION=0.1.0
+OPZ_PLUGIN_SHA256=570d1aae0d54b0ace5bd33cba9a128f6157b854b99b8296260f7901f98bb7c48
+OPZ_MODEL=kimi-k2.7
+OPENCODE_GO_API_KEY=<secret>
+```
+
+複雑な設定は `OPZ_PLUGIN_CONFIG` に TOML として保存できます。これは manifest default と simple `OPZ_*` scalar field を上書きします。
+
+```toml
+model = "kimi-k2.7"
+
+[opencode_go]
+base_url = "https://opencode.ai/zen/go/v1"
+```
+
+Security model: v1 plugin は declarative のみです。環境変数 mapping、generated file template、target command 制約、default、static doctor metadata は扱えますが、script 実行、network access、code execution、`secret_env_allowlist` 外の secret 参照はできません。生成ファイルは temporary workspace 配下にだけ作成され、コマンド終了後に削除されます。
 
 ### Env ファイル生成
 
