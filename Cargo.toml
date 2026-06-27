@@ -4,7 +4,7 @@ version = "2026.5.23"
 edition = "2021"
 description = "1Password CLI wrapper for seamless secret injection into commands"
 license = "MIT"
-repository = "https://github.com/f4ah6o/opz"
+repository = "https://github.com/opz-rs/opz"
 
 [dependencies]
 anyhow = "1.0.100"
@@ -15,3 +15,8 @@ serde_json = "1.0.147"
 
 [dev-dependencies]
 tempfile = "3.24.0"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
