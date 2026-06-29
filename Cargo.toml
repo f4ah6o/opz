@@ -2,9 +2,14 @@
 name = "opz"
 version = "2026.5.23"
 edition = "2021"
+autobins = false
 description = "1Password CLI wrapper for seamless secret injection into commands"
 license = "MIT"
 repository = "https://github.com/opz-rs/opz"
+
+[[bin]]
+name = "opz"
+path = "src/entry.rs"
 
 [dependencies]
 anyhow = "1.0.100"
