@@ -26,3 +26,6 @@ target
 /target
 .env
 .DS_Store
+
+# Local 1Password env-reference files
+/claude

@@ -1742,7 +1742,10 @@ fn doctor_has_required_failure(checks: &[DoctorCheck]) -> bool {
         .any(|check| check.required && check.status == DoctorStatus::Error)
 }
 
-fn collect_item_env_sections(cli: &Cli, items: &[String]) -> Result<Vec<(String, Vec<String>)>> {
+/// Sections of `(item title, env lines)` collected per requested item.
+type ItemSections = Vec<(String, Vec<String>)>;
+
+fn collect_item_env_sections(cli: &Cli, items: &[String]) -> Result<ItemSections> {
     let mut sections = Vec::with_capacity(items.len());
 
     for item_title in items {
@@ -1758,7 +1761,7 @@ fn collect_item_env_sections(cli: &Cli, items: &[String]) -> Result<Vec<(String,
 fn collect_item_env_sections_with_github_repos(
     cli: &Cli,
     items: &[String],
-) -> Result<(Vec<(String, Vec<String>)>, Vec<ItemGithubRepositories>)> {
+) -> Result<(ItemSections, Vec<ItemGithubRepositories>)> {
     let mut sections = Vec::with_capacity(items.len());
     let mut repositories = Vec::with_capacity(items.len());
 
@@ -1777,7 +1780,7 @@ fn collect_item_env_sections_with_github_repos(
     Ok((sections, repositories))
 }
 
-fn collect_item_label_sections(cli: &Cli, items: &[String]) -> Result<Vec<(String, Vec<String>)>> {
+fn collect_item_label_sections(cli: &Cli, items: &[String]) -> Result<ItemSections> {
     let mut sections = Vec::with_capacity(items.len());
 
     for item_title in items {
@@ -3960,7 +3963,7 @@ fn item_field_string_value(field: &ItemField) -> Option<String> {
 
 fn parse_github_repositories_value(value: &str) -> Vec<String> {
     value
-        .split(|ch: char| ch == ',' || ch == '\n' || ch == '\r' || ch == '\t')
+        .split([',', '\n', '\r', '\t'])
         .filter_map(normalize_github_repo_spec)
         .collect()
 }
