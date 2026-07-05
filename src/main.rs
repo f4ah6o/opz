@@ -3004,7 +3004,7 @@ fn collect_create_stdout_sensitive_fields(template: &ItemCreateTemplate) -> Vec<
         }
     }
 
-    fields.sort_by(|(_, left), (_, right)| right.len().cmp(&left.len()));
+    fields.sort_by_key(|(_, value)| std::cmp::Reverse(value.len()));
     fields.dedup();
     fields
 }
@@ -3202,10 +3202,8 @@ fn strip_inline_comment(value: &str) -> &str {
         match ch {
             '"' => in_double_quote = true,
             '\'' => in_single_quote = true,
-            '#' => {
-                if idx == 0 || value[..idx].chars().last().is_some_and(char::is_whitespace) {
-                    return value[..idx].trim_end();
-                }
+            '#' if idx == 0 || value[..idx].chars().last().is_some_and(char::is_whitespace) => {
+                return value[..idx].trim_end();
             }
             _ => {}
         }
