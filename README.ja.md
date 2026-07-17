@@ -20,6 +20,14 @@
 
 ## インストール
 
+[`cargo binstall`](https://github.com/cargo-bins/cargo-binstall) でビルド済みバイナリを取得:
+
+```bash
+cargo binstall opz
+```
+
+または、ソースからビルド:
+
 ```bash
 cargo install opz
 ```

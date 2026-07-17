@@ -25,6 +25,14 @@
 
 ## Installation
 
+Prebuilt binaries via [`cargo binstall`](https://github.com/cargo-bins/cargo-binstall):
+
+```bash
+cargo binstall opz
+```
+
+Or build from source:
+
 ```bash
 cargo install opz
 ```
