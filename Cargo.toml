@@ -6,6 +6,14 @@ description = "1Password CLI wrapper for seamless secret injection into commands
 license = "MIT"
 repository = "https://github.com/opz-rs/opz"
 
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }{ archive-suffix }"
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "txz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
+
 [dependencies]
 anyhow = "1.0.100"
 clap = { version = "4.5.53", default-features = false, features = ["derive", "std", "help", "usage", "error-context"] }
