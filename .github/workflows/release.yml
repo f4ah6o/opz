@@ -218,6 +218,7 @@ jobs:
       - build-local-artifacts
       - build-global-artifacts
     permissions:
+      actions: write
       contents: write
     # Only run if we're "publishing", and only if plan, local and global didn't fail (skipped is fine)
     if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
@@ -279,6 +280,13 @@ jobs:
           echo "$ANNOUNCEMENT_BODY" > $RUNNER_TEMP/notes.txt
 
           gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
+      - name: Dispatch release smoke test
+        env:
+          RELEASE_TAG: "${{ needs.plan.outputs.tag }}"
+        run: |
+          gh workflow run release-smoke.yml \
+            --ref "${{ github.event.repository.default_branch }}" \
+            --field tag="$RELEASE_TAG"
 
   announce:
     needs:
