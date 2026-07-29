@@ -140,7 +140,7 @@ opz --environment <ENV> -- <COMMAND>...
 引数:
 * `<ITEM>...` - secret を取得する任意のアイテムタイトル。省略時は、現在の git remote repository 名（例: `owner/repo`）と完全一致する title の item を 1 件だけ自動検出します。
 
-`--env-file` を指定すると、env ファイルはコマンド終了後も残ります。既存ファイルはマージされ、無関係な行は残り、重複キーは上書きされ、新しいキーは末尾に追加されます。複数アイテムで同じキーがある場合は後勝ちです（`opz run foo bar ...` では `bar` の値が優先）。
+`--env-file` を指定すると、env ファイルはコマンド終了後も残り、解決済みの値ではなく `op://` 参照を含みます。既存の通常ファイルは permission と無関係な内容を保ったまま安全に置換し、symlink と通常ファイル以外の target は拒否します。Unix で新規作成するファイルは mode `0600` です。複数アイテムで同じキーがある場合は後勝ちです（`opz run foo bar ...` では `bar` の値が優先）。
 
 例:
 ```bash
@@ -159,8 +159,11 @@ opz run --env-file .env foo bar -- your-command
 # 短縮形でも複数アイテム対応
 opz --env-file .env.local foo bar -- your-command
 
-# shell ではなく opz に展開させるため、変数を quote する
-opz run my-service -- curl -H 'Authorization: Bearer $API_TOKEN' https://api.example.test
+# 信頼する child が環境変数を直接読む
+opz run my-service -- your-command
+
+# または、明示的に信頼する child shell 内で stdin に渡す
+opz run my-service -- sh -c 'printf "%s" "$API_TOKEN" | trusted-consumer --token-stdin'
 
 # Vault を指定
 opz run --vault Private foo bar -- your-command
@@ -170,6 +173,8 @@ opz run --environment dev -- your-command
 ```
 
 Environment mode は v1 では item 引数や `--env-file` と同時に使えません。`opz` は `op run` に実行を委譲し、Environment の secret 値を読みません。インストール済みの `op` CLI が Environment runtime injection を公開していない場合、`opz` は明確なエラーを返し、従来の item-backed workflow はそのまま使えます。
+
+`opz` は command 引数を変更せずに渡し、解決済みの値を argv 内の `$VAR` や `${VAR}` に代入しません。値は child の環境変数だけに渡され、child は明示的な trust boundary です。詳細は [Secret-handling security policy](docs/security.md) を参照してください。
 
 ### Env ファイル生成
 
@@ -346,7 +351,7 @@ opz cloudflare-secret --name worker-app --env production my-service shared-secre
 4. item が決まると、その item を取得し、有効な env ラベルを持つフィールドから `op://<vault_id>/<item_id>/<field>` 参照を作ります。
 5. `--env-file` 指定があれば、参照をファイルに書き込み、既存ファイルの無関係な行は残します。通常は file-free な `opz run` を使い、env ファイルは `op://` 参照を必要とする tool 向けです。
 6. `op run --env-file <temp> -- sh -c 'env -0'` で secret をまとめて解決し、timeout 以外の失敗では参照ごとに `op read` へフォールバックします。
-7. 解決済みの値を環境変数に入れてコマンドを実行します。コマンド引数内の `$VAR` と `${VAR}` は、選択した item から解決できた変数だけ展開します。
+7. 解決済みの値を環境変数に入れ、argv は変更せずにコマンドを実行します。shell 展開は、利用者が信頼する child として明示的に起動した shell 内でだけ行われます。
 
 `gen` は参照を書いたところで終了します。`show` は secret 値を解決せず、有効なラベルだけを表示します。
 

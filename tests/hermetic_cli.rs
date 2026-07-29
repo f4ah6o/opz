@@ -139,7 +139,7 @@ fn item_run_and_top_level_shorthand_use_env_without_secret_argv() {
         "-c",
         "env -0",
     ];
-    let mut child = step("opz-child", &["hello"], "");
+    let mut child = step("opz-child", &["hello", "$API_KEY", "${API_KEY}"], "");
     child.capture_env = vec!["API_KEY".to_string()];
     let harness = Harness::new(
         vec![
@@ -161,14 +161,29 @@ fn item_run_and_top_level_shorthand_use_env_without_secret_argv() {
         &["op", "opz-child"],
     );
 
-    let run = harness.output(&["run", "example", "--", "opz-child", "hello"]);
+    let run = harness.output(&[
+        "run",
+        "example",
+        "--",
+        "opz-child",
+        "hello",
+        "$API_KEY",
+        "${API_KEY}",
+    ]);
     assert_success(&run);
-    let shorthand = harness.output(&["example", "--", "opz-child", "hello"]);
+    let shorthand = harness.output(&[
+        "example",
+        "--",
+        "opz-child",
+        "hello",
+        "$API_KEY",
+        "${API_KEY}",
+    ]);
     assert_success(&shorthand);
 
     for index in [2, 5] {
         let invocation = harness.invocation(index);
-        assert_eq!(invocation.args, ["hello"]);
+        assert_eq!(invocation.args, ["hello", "$API_KEY", "${API_KEY}"]);
         assert_eq!(
             invocation.env.get("API_KEY").map(String::as_str),
             Some("canary-secret")
@@ -280,15 +295,71 @@ fn repository_auto_detection_uses_fake_git_and_op() {
 }
 
 #[test]
+fn item_cache_serialization_drops_secret_bearing_fields() {
+    const CANARY: &str = "OPZ_CANARY_CACHE_51f7";
+    let harness = Harness::new(
+        vec![
+            Step {
+                exit_code: 1,
+                stderr: "serv isn't an item".to_string(),
+                ..step("op", &["item", "get", "serv", "--format", "json"], "")
+            },
+            step(
+                "op",
+                &["item", "list", "--format", "json"],
+                &format!(
+                    r#"[{{"id":"item-id","title":"service","vault":{{"id":"vault-id","name":"Private"}},"value":"{CANARY}","fields":[{{"value":"{CANARY}"}}]}}]"#
+                ),
+            ),
+            step(
+                "op",
+                &["item", "get", "item-id", "--format", "json"],
+                &item_json("service"),
+            ),
+        ],
+        &["op"],
+    );
+
+    let output = harness.output(&["gen", "serv"]);
+    assert_success(&output);
+    let cache_dir = harness.root.join("cache").join("opz");
+    let mut cache_count = 0;
+    for entry in fs::read_dir(cache_dir).unwrap() {
+        cache_count += 1;
+        let content = fs::read_to_string(entry.unwrap().path()).unwrap();
+        assert!(
+            !content.contains(CANARY),
+            "cache contained canary: {content}"
+        );
+        assert!(
+            !content.contains("\"fields\""),
+            "cache contained fields: {content}"
+        );
+        assert!(
+            !content.contains("\"value\""),
+            "cache contained value: {content}"
+        );
+    }
+    assert!(cache_count > 0, "expected a metadata cache file");
+}
+
+#[test]
 fn github_and_cloudflare_exporters_use_stdin_and_dry_run_skips_resolution() {
+    const DRY_RUN_CANARY: &str = "OPZ_CANARY_DRY_RUN_7249";
     let mut gh = step(
         "gh",
         &["secret", "set", "API_KEY", "--repo", "owner/repo"],
-        "",
+        "tool echoed canary-secret\n",
     );
     gh.read_stdin = true;
-    let mut wrangler = step("wrangler", &["secret", "bulk"], "");
+    gh.stderr = "tool error included canary-secret\n".to_string();
+    let mut wrangler = step(
+        "wrangler",
+        &["secret", "bulk"],
+        "bulk echoed canary-secret\n",
+    );
     wrangler.read_stdin = true;
+    wrangler.stderr = "bulk error included canary-secret\n".to_string();
     let batch_args = [
         "run",
         "--no-masking",
@@ -309,18 +380,31 @@ fn github_and_cloudflare_exporters_use_stdin_and_dry_run_skips_resolution() {
             step("op", &["item", "get", "example", "--format", "json"], &item),
             step("op", &batch_args, "API_KEY=canary-secret\0"),
             wrangler,
-            step("op", &["item", "get", "example", "--format", "json"], &item),
+            step(
+                "op",
+                &["item", "get", "example", "--format", "json"],
+                &item.replace(
+                    r#""value":"concealed""#,
+                    &format!(r#""value":"{DRY_RUN_CANARY}""#),
+                ),
+            ),
         ],
         &["op", "gh", "wrangler"],
     );
 
     let github = harness.output(&["github-secret", "--repo", "owner/repo", "example"]);
     assert_success(&github);
+    assert!(!String::from_utf8_lossy(&github.stdout).contains("canary-secret"));
+    assert!(!String::from_utf8_lossy(&github.stderr).contains("canary-secret"));
+    assert!(String::from_utf8_lossy(&github.stdout).contains("[REDACTED]"));
     assert_eq!(harness.invocation(2).stdin, "canary-secret");
     assert!(!format!("{:?}", harness.invocation(2).args).contains("canary-secret"));
 
     let cloudflare = harness.output(&["cloudflare-secret", "example"]);
     assert_success(&cloudflare);
+    assert!(!String::from_utf8_lossy(&cloudflare.stdout).contains("canary-secret"));
+    assert!(!String::from_utf8_lossy(&cloudflare.stderr).contains("canary-secret"));
+    assert!(String::from_utf8_lossy(&cloudflare.stdout).contains("[REDACTED]"));
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&harness.invocation(5).stdin).unwrap(),
         serde_json::json!({"API_KEY": "canary-secret"})
@@ -335,6 +419,7 @@ fn github_and_cloudflare_exporters_use_stdin_and_dry_run_skips_resolution() {
     ]);
     assert_success(&dry_run);
     assert!(String::from_utf8_lossy(&dry_run.stdout).contains("Would set GitHub secret API_KEY"));
+    assert_canary_absent(&dry_run, DRY_RUN_CANARY, "dry run");
 }
 
 #[test]
@@ -463,6 +548,108 @@ fn mcp_environment_list_uses_json_rpc_without_secret_values() {
         request.pointer("/params/name").and_then(|v| v.as_str()) == Some("list_environments")
     }));
     assert!(!format!("{requests:?}").contains("secret-value"));
+}
+
+#[test]
+fn secret_bearing_tool_failures_do_not_echo_canaries() {
+    const CANARY: &str = "OPZ_CANARY_FAILURE_8d90f43c";
+
+    let op_harness = Harness::new(
+        vec![Step {
+            exit_code: 9,
+            stderr: format!("op leaked {CANARY}"),
+            ..step("op", &["item", "get", "example", "--format", "json"], "")
+        }],
+        &["op"],
+    );
+    assert_canary_absent(
+        &op_harness.output(&["gen", "example"]),
+        CANARY,
+        "op failure",
+    );
+
+    let item = item_json("example");
+    let batch_args = [
+        "run",
+        "--no-masking",
+        "--env-file",
+        "*",
+        "--",
+        "sh",
+        "-c",
+        "env -0",
+    ];
+    let mut gh = step(
+        "gh",
+        &["secret", "set", "API_KEY", "--repo", "owner/repo"],
+        &format!("gh stdout {CANARY}"),
+    );
+    gh.stderr = format!("gh stderr {CANARY}");
+    gh.exit_code = 17;
+    gh.read_stdin = true;
+    let github_harness = Harness::new(
+        vec![
+            step("op", &["item", "get", "example", "--format", "json"], &item),
+            step("op", &batch_args, &format!("API_KEY={CANARY}\0")),
+            gh,
+        ],
+        &["op", "gh"],
+    );
+    assert_canary_absent(
+        &github_harness.output(&["github-secret", "--repo", "owner/repo", "example"]),
+        CANARY,
+        "gh failure",
+    );
+
+    let mut wrangler = step(
+        "wrangler",
+        &["secret", "bulk"],
+        &format!("wrangler stdout {CANARY}"),
+    );
+    wrangler.stderr = format!("wrangler stderr {CANARY}");
+    wrangler.exit_code = 18;
+    wrangler.read_stdin = true;
+    let wrangler_harness = Harness::new(
+        vec![
+            step("op", &["item", "get", "example", "--format", "json"], &item),
+            step("op", &batch_args, &format!("API_KEY={CANARY}\0")),
+            wrangler,
+        ],
+        &["op", "wrangler"],
+    );
+    assert_canary_absent(
+        &wrangler_harness.output(&["cloudflare-secret", "example"]),
+        CANARY,
+        "wrangler failure",
+    );
+
+    let mcp_harness = Harness::new(
+        vec![Step {
+            tool: "onepassword-mcp".to_string(),
+            mcp_results: vec![
+                serde_json::json!({"structuredContent": {"accountId": "A1"}}),
+                serde_json::json!({"__error": {
+                    "code": -32000,
+                    "message": format!("MCP leaked {CANARY}"),
+                    "data": {"secret": CANARY}
+                }}),
+            ],
+            ..Step::default()
+        }],
+        &["onepassword-mcp"],
+    );
+    assert_canary_absent(
+        &mcp_harness.output(&["environment", "list"]),
+        CANARY,
+        "MCP failure",
+    );
+}
+
+fn assert_canary_absent(output: &Output, canary: &str, label: &str) {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stdout.contains(canary), "{label} stdout: {stdout}");
+    assert!(!stderr.contains(canary), "{label} stderr: {stderr}");
 }
 
 #[test]

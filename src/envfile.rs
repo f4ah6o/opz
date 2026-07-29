@@ -120,8 +120,30 @@ pub(crate) fn write_env_file(path: &Path, new_lines: &[String]) -> Result<()> {
             let mut written_keys: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
 
-            // Read existing file and merge
-            if path.exists() {
+            let existing_permissions = match fs::symlink_metadata(path) {
+                Ok(metadata) => {
+                    if metadata.file_type().is_symlink() {
+                        return Err(anyhow!(
+                            "refusing to replace symlink env file: {}",
+                            path.display()
+                        ));
+                    }
+                    if !metadata.is_file() {
+                        return Err(anyhow!(
+                            "refusing to replace non-regular env file: {}",
+                            path.display()
+                        ));
+                    }
+                    Some(metadata.permissions())
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => {
+                    return Err(error).with_context(|| format!("inspect {}", path.display()));
+                }
+            };
+
+            // Read existing file and merge.
+            if existing_permissions.is_some() {
                 let content =
                     fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
 
@@ -151,13 +173,124 @@ pub(crate) fn write_env_file(path: &Path, new_lines: &[String]) -> Result<()> {
                 }
             }
 
-            // Write result
-            let mut f =
-                fs::File::create(path).with_context(|| format!("create {}", path.display()))?;
+            // Write a same-directory replacement so a partial write never
+            // truncates the persistent target.
+            let mut replacement = ReplacementFile::create(path)?;
             for line in &result_lines {
-                writeln!(f, "{line}")?;
+                writeln!(replacement.file_mut(), "{line}")?;
             }
+            replacement.commit(path, existing_permissions)?;
             Ok(())
         },
     )
+}
+
+struct ReplacementFile {
+    path: PathBuf,
+    file: Option<fs::File>,
+}
+
+impl ReplacementFile {
+    fn create(target: &Path) -> Result<Self> {
+        let parent = target.parent().unwrap_or_else(|| Path::new("."));
+        let file_name = target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("env");
+        for attempt in 0..100 {
+            let path = parent.join(format!(
+                ".{file_name}.opz-{}-{}-{attempt}.tmp",
+                std::process::id(),
+                stable_hex_hash(&format!("{:?}", SystemTime::now()))
+            ));
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            match options.open(&path) {
+                Ok(file) => {
+                    return Ok(Self {
+                        path,
+                        file: Some(file),
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("create replacement for {}", target.display()));
+                }
+            }
+        }
+        Err(anyhow!(
+            "failed to create unique replacement for {}",
+            target.display()
+        ))
+    }
+
+    fn file_mut(&mut self) -> &mut fs::File {
+        self.file
+            .as_mut()
+            .expect("replacement file is available before commit")
+    }
+
+    fn commit(
+        mut self,
+        target: &Path,
+        existing_permissions: Option<fs::Permissions>,
+    ) -> Result<()> {
+        let file = self
+            .file
+            .take()
+            .expect("replacement file is available before commit");
+        file.sync_all()
+            .with_context(|| format!("flush replacement for {}", target.display()))?;
+        drop(file);
+
+        if let Some(permissions) = existing_permissions {
+            fs::set_permissions(&self.path, permissions)
+                .with_context(|| format!("preserve permissions for {}", target.display()))?;
+        }
+
+        replace_target(&self.path, target)?;
+        Ok(())
+    }
+}
+
+impl Drop for ReplacementFile {
+    fn drop(&mut self) {
+        if self.path.exists() {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_target(replacement: &Path, target: &Path) -> Result<()> {
+    fs::rename(replacement, target).with_context(|| format!("replace {}", target.display()))
+}
+
+#[cfg(windows)]
+fn replace_target(replacement: &Path, target: &Path) -> Result<()> {
+    if !target.exists() {
+        return fs::rename(replacement, target)
+            .with_context(|| format!("replace {}", target.display()));
+    }
+
+    let backup = replacement.with_extension("backup");
+    fs::rename(target, &backup)
+        .with_context(|| format!("prepare replacement for {}", target.display()))?;
+    match fs::rename(replacement, target) {
+        Ok(()) => {
+            fs::remove_file(&backup)
+                .with_context(|| format!("remove replacement backup for {}", target.display()))?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = fs::rename(&backup, target);
+            Err(error).with_context(|| format!("replace {}", target.display()))
+        }
+    }
 }

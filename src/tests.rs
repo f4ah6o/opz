@@ -396,6 +396,58 @@ fn test_write_env_file_mixed_overwrite_and_append() {
     assert!(content_lines[2].contains(r#"KEY3="new3""#));
 }
 
+#[cfg(unix)]
+#[test]
+fn test_write_env_file_uses_restrictive_permissions_and_preserves_existing_mode() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let dir = TempDir::new().unwrap();
+    let new_path = dir.path().join(".env.new");
+    write_env_file(&new_path, &["API_KEY=op://vault/item/API_KEY".to_string()]).unwrap();
+    assert_eq!(fs::metadata(&new_path).unwrap().mode() & 0o777, 0o600);
+
+    let existing_path = dir.path().join(".env.existing");
+    fs::write(&existing_path, "KEEP=value\n").unwrap();
+    fs::set_permissions(&existing_path, fs::Permissions::from_mode(0o640)).unwrap();
+    write_env_file(
+        &existing_path,
+        &["API_KEY=op://vault/item/API_KEY".to_string()],
+    )
+    .unwrap();
+    assert_eq!(fs::metadata(&existing_path).unwrap().mode() & 0o777, 0o640);
+    assert!(fs::read_dir(dir.path()).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains(".opz-")
+    }));
+}
+
+#[cfg(unix)]
+#[test]
+fn test_write_env_file_rejects_symlink_targets() {
+    use std::os::unix::fs::symlink;
+
+    let dir = TempDir::new().unwrap();
+    let real = dir.path().join("real.env");
+    fs::write(&real, "KEEP=value\n").unwrap();
+    let link = dir.path().join("linked.env");
+    symlink(&real, &link).unwrap();
+    let error = write_env_file(&link, &["A=op://vault/item/A".to_string()]).unwrap_err();
+    assert!(error.to_string().contains("symlink"));
+    assert_eq!(fs::read_to_string(&real).unwrap(), "KEEP=value\n");
+}
+
+#[test]
+fn test_write_env_file_rejects_non_regular_target() {
+    let dir = TempDir::new().unwrap();
+    let directory = dir.path().join("env-dir");
+    fs::create_dir(&directory).unwrap();
+    let error = write_env_file(&directory, &["A=op://vault/item/A".to_string()]).unwrap_err();
+    assert!(error.to_string().contains("non-regular"));
+}
+
 // ============================================
 // Tests for cache_file_path()
 // ============================================
@@ -467,6 +519,15 @@ fn test_temp_env_file_writes_and_cleans_up() {
     };
 
     assert!(!path.exists(), "temp env file should be removed on drop");
+}
+
+#[cfg(unix)]
+#[test]
+fn test_temp_env_file_is_mode_0600() {
+    use std::os::unix::fs::MetadataExt;
+
+    let temp_env = TempEnvFile::create().unwrap();
+    assert_eq!(fs::metadata(temp_env.path()).unwrap().mode() & 0o777, 0o600);
 }
 
 #[test]
@@ -584,6 +645,31 @@ fn test_item_list_entry_without_vault() {
     assert_eq!(item.id, "abc123");
     assert_eq!(item.title, "My Item");
     assert!(item.vault.is_none());
+}
+
+#[test]
+fn test_cache_models_are_metadata_only() {
+    const CANARY: &str = "OPZ_CANARY_CACHE_SECRET_28d1";
+    let item_cache = vec![ItemListEntry {
+        id: "item-id".to_string(),
+        title: "service".to_string(),
+        vault: Some(ItemVault {
+            id: "vault-id".to_string(),
+            name: "Private".to_string(),
+        }),
+    }];
+    let repository_cache = vec![ItemGithubRepositories {
+        item_title: "service".to_string(),
+        repositories: vec!["owner/repo".to_string()],
+    }];
+    let serialized = format!(
+        "{}{}",
+        serde_json::to_string(&item_cache).unwrap(),
+        serde_json::to_string(&repository_cache).unwrap()
+    );
+    assert!(!serialized.contains(CANARY));
+    assert!(!serialized.contains("fields"));
+    assert!(!serialized.contains("value"));
 }
 
 #[test]
@@ -816,7 +902,7 @@ fn test_collect_create_stdout_sensitive_fields_from_template() {
 }
 
 #[test]
-fn test_mask_create_stdout_masks_only_field_values() {
+fn test_mask_create_stdout_masks_values_everywhere() {
     let template = build_api_credential_template(
         "my-item",
         &[
@@ -833,7 +919,7 @@ fn test_mask_create_stdout_masks_only_field_values() {
 
     assert_eq!(
         masked,
-        "ID: abc123\nTitle: my-secret-item\nAPI_KEY: ***\nDB_HOST: ***\n"
+        "ID: abc123\nTitle: my-[REDACTED]-item\nAPI_KEY: [REDACTED]\nDB_HOST: [REDACTED]\n"
     );
 }
 
@@ -846,7 +932,10 @@ fn test_mask_create_stdout_masks_multiline_notes_field() {
         &collect_create_stdout_sensitive_fields(&template),
     );
 
-    assert_eq!(masked, "ID: abc123\nnotesPlain: ***\nTitle: f4ah6o/opz\n");
+    assert_eq!(
+        masked,
+        "ID: abc123\nnotesPlain: [REDACTED]\nTitle: f4ah6o/opz\n"
+    );
 }
 
 #[test]
@@ -1277,108 +1366,6 @@ fn test_build_secure_note_uses_stdin_template_without_body_args() {
     assert_eq!(template.fields[0].label, "notesPlain");
     assert_eq!(template.fields[0].purpose.as_deref(), Some("NOTES"));
     assert_eq!(template.fields[0].value, "```a\nb\n```");
-}
-
-// ============================================
-// Tests for expand_vars()
-// ============================================
-
-#[test]
-fn test_expand_vars_simple() {
-    let mut env = HashMap::new();
-    env.insert("API_TOKEN".to_string(), "secret123".to_string());
-    assert_eq!(expand_vars("Bearer $API_TOKEN", &env), "Bearer secret123");
-}
-
-#[test]
-fn test_expand_vars_braced() {
-    let mut env = HashMap::new();
-    env.insert("HOST".to_string(), "example.com".to_string());
-    assert_eq!(
-        expand_vars("https://${HOST}/api", &env),
-        "https://example.com/api"
-    );
-}
-
-#[test]
-fn test_expand_vars_multiple() {
-    let mut env = HashMap::new();
-    env.insert("USER".to_string(), "alice".to_string());
-    env.insert("HOST".to_string(), "server.com".to_string());
-    assert_eq!(expand_vars("$USER@$HOST", &env), "alice@server.com");
-}
-
-#[test]
-fn test_expand_vars_unknown_var() {
-    let env = HashMap::new();
-    // Unknown vars should be preserved as-is
-    assert_eq!(expand_vars("$HOME/dir", &env), "$HOME/dir");
-    assert_eq!(expand_vars("$PATH", &env), "$PATH");
-}
-
-#[test]
-fn test_expand_vars_mixed_known_unknown() {
-    let mut env = HashMap::new();
-    env.insert("API_TOKEN".to_string(), "secret".to_string());
-    assert_eq!(
-        expand_vars("Authorization: $API_TOKEN for $HOME", &env),
-        "Authorization: secret for $HOME"
-    );
-}
-
-#[test]
-fn test_expand_vars_with_special_chars() {
-    let mut env = HashMap::new();
-    env.insert("TOKEN".to_string(), "a$b\"c`d".to_string());
-    let result = expand_vars("$TOKEN", &env);
-    assert_eq!(result, r#"a$b"c`d"#);
-}
-
-#[test]
-fn test_expand_vars_empty_value() {
-    let mut env = HashMap::new();
-    env.insert("EMPTY".to_string(), "".to_string());
-    // $EMPTYsuffix looks for "EMPTYsuffix" variable, not "EMPTY"
-    // Since EMPTYsuffix doesn't exist, it remains as-is for shell expansion
-    assert_eq!(
-        expand_vars("prefix$EMPTYsuffix", &env),
-        "prefix$EMPTYsuffix"
-    );
-    // Use ${EMPTY} to explicitly mark variable boundaries
-    assert_eq!(expand_vars("prefix${EMPTY}suffix", &env), "prefixsuffix");
-    // Direct usage should expand to empty string
-    assert_eq!(expand_vars("$EMPTY", &env), "");
-}
-
-#[test]
-fn test_expand_vars_partial_name() {
-    let mut env = HashMap::new();
-    env.insert("API".to_string(), "test".to_string());
-    // $API_TOKEN looks for "API_TOKEN" variable, not "API"
-    // Since API_TOKEN doesn't exist, it remains as-is
-    assert_eq!(expand_vars("$API_TOKEN", &env), "$API_TOKEN");
-}
-
-#[test]
-fn test_expand_vars_no_vars() {
-    let env = HashMap::new();
-    assert_eq!(expand_vars("hello world", &env), "hello world");
-}
-
-#[test]
-fn test_expand_vars_consecutive_dollars() {
-    let mut env = HashMap::new();
-    env.insert("A".to_string(), "1".to_string());
-    env.insert("B".to_string(), "2".to_string());
-    assert_eq!(expand_vars("$A$B", &env), "12");
-}
-
-#[test]
-fn test_expand_vars_underscore_in_name() {
-    let mut env = HashMap::new();
-    env.insert("API_TOKEN".to_string(), "secret".to_string());
-    assert_eq!(expand_vars("$API_TOKEN", &env), "secret");
-    assert_eq!(expand_vars("${API_TOKEN}", &env), "secret");
 }
 
 #[test]
@@ -2215,9 +2202,9 @@ fn test_build_wrangler_secret_bulk_args_excludes_secret_values() {
 fn test_build_secret_json_payload_uses_names_and_values() {
     let names = vec!["API_TOKEN".to_string(), "DB_URL".to_string()];
     let mut env_vars = HashMap::new();
-    env_vars.insert("API_TOKEN".to_string(), "secret-token".to_string());
-    env_vars.insert("DB_URL".to_string(), "postgres://example".to_string());
-    env_vars.insert("UNUSED".to_string(), "unused".to_string());
+    env_vars.insert("API_TOKEN".to_string(), SecretValue::new("secret-token"));
+    env_vars.insert("DB_URL".to_string(), SecretValue::new("postgres://example"));
+    env_vars.insert("UNUSED".to_string(), SecretValue::new("unused"));
 
     let payload = build_secret_json_payload(&names, &env_vars).unwrap();
     let value: serde_json::Value = serde_json::from_str(&payload).unwrap();

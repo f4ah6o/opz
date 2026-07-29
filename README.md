@@ -145,7 +145,7 @@ Options:
 Arguments:
 * `<ITEM>...` - Optional item titles to fetch secrets from. When omitted, `opz` auto-detects one item whose title exactly matches a current git remote repository name such as `owner/repo`.
 
-When `--env-file` is set, the file remains after the command exits. Existing files are merged: unrelated lines stay in place, duplicate keys are overwritten, and new keys are appended. If multiple items define the same key, later items win (`opz run foo bar ...` prefers values from `bar`).
+When `--env-file` is set, the file remains after the command exits and contains `op://` references, not resolved values. Existing regular files are replaced safely while preserving permissions and unrelated content; symlinks and non-regular targets are rejected. New files use mode `0600` on Unix. If multiple items define the same key, later items win (`opz run foo bar ...` prefers values from `bar`).
 
 Examples:
 ```bash
@@ -164,8 +164,11 @@ opz run --env-file .env foo bar -- your-command
 # Top-level shorthand also supports multiple items
 opz --env-file .env.local foo bar -- your-command
 
-# Quote variables so your shell leaves them for opz to expand
-opz run my-service -- curl -H 'Authorization: Bearer $API_TOKEN' https://api.example.test
+# Let a trusted child read the environment directly
+opz run my-service -- your-command
+
+# Or deliver a value through stdin inside an explicitly trusted child shell
+opz run my-service -- sh -c 'printf "%s" "$API_TOKEN" | trusted-consumer --token-stdin'
 
 # Specify vault
 opz run --vault Private foo bar -- your-command
@@ -175,6 +178,8 @@ opz run --environment dev -- your-command
 ```
 
 Environment mode is mutually exclusive with item arguments and `--env-file` in v1. `opz` delegates to `op run` and does not read Environment secret values. If your installed `op` CLI does not expose Environment runtime injection, `opz` reports a clear error and the item-backed workflow remains available.
+
+`opz` passes command arguments unchanged and never substitutes resolved values for `$VAR` or `${VAR}` in argv. The child receives values only in its environment and is an explicit trust boundary. See [Secret-handling security policy](docs/security.md).
 
 ### Generate Env File
 
@@ -351,7 +356,7 @@ opz cloudflare-secret --name worker-app --env production my-service shared-secre
 4. After the item is selected, `opz` fetches it and builds `op://<vault_id>/<item_id>/<field>` references for fields with valid env labels.
 5. If `--env-file` is set, `opz` writes references to that file and preserves unrelated existing lines. The usual path is file-free `opz run`; env files are for tools that require `op://` references.
 6. Secret values are resolved with `op run --env-file <temp> -- sh -c 'env -0'`, with `op read` per reference as a fallback for non-timeout failures.
-7. `opz` runs the command with the resolved values in the environment. `$VAR` and `${VAR}` in command arguments are expanded only for variables resolved from the selected items.
+7. `opz` runs the command with resolved values in its environment and passes argv unchanged. Any shell expansion happens only inside a shell the user explicitly launches as the trusted child.
 
 `gen` stops after writing references. `show` fetches items and prints valid labels without resolving secret values.
 
