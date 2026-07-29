@@ -66,9 +66,11 @@ After the GitHub release is published:
 - Confirm Linux `x86_64-unknown-linux-gnu`, macOS
   `x86_64-apple-darwin`, and Windows `x86_64-pc-windows-msvc` archives are
   present.
-- Require the `Release smoke test` workflow to pass. It downloads the exact
+- Require the `Release smoke test` workflow to pass. The cargo-dist workflow
+  dispatches it explicitly after publication because releases created with
+  `GITHUB_TOKEN` do not recursively trigger workflows. It downloads the exact
   cargo-dist archives and runs `opz --version` and `opz --help` on all three
-  operating systems.
+  operating systems. Use its manual `tag` input to retry a published release.
 - On Linux, require the smoke workflow's bounded crates.io retry and
   `cargo binstall` check to pass with compile and quick-install fallbacks
   disabled.

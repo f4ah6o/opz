@@ -4,6 +4,12 @@ on:
   release:
     types:
       - published
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to verify
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -12,6 +18,7 @@ env:
   CARGO_TERM_COLOR: always
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   GH_TOKEN: ${{ github.token }}
+  RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
 
 jobs:
   archive:
@@ -35,7 +42,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p "$RUNNER_TEMP/opz-smoke"
-          gh release download "${{ github.event.release.tag_name }}" \
+          gh release download "$RELEASE_TAG" \
             --repo "${{ github.repository }}" \
             --pattern "${{ matrix.archive }}" \
             --dir "$RUNNER_TEMP/opz-smoke"
@@ -80,7 +87,7 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          version=${{ github.event.release.tag_name }}
+          version=$RELEASE_TAG
           version=${version#v}
           install_root="$RUNNER_TEMP/opz-binstall"
           for attempt in $(seq 1 12); do
