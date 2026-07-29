@@ -409,7 +409,7 @@ Real 1Password e2e test is available in `tests/e2e_real_op.rs`.
 It is gated for safety and runs only when `OPZ_E2E=1` is set:
 
 ```bash
-OPZ_E2E=1 cargo test --test e2e_real_op -- --nocapture
+OPZ_E2E=1 cargo test --locked --test e2e_real_op -- --nocapture
 ```
 
 Or use just:
@@ -417,3 +417,11 @@ Or use just:
 ```bash
 just e2e
 ```
+
+## Development
+
+Contributor contracts and maintenance procedures are kept in
+[AGENTS.md](AGENTS.md), with focused references for
+[architecture](docs/architecture.md), [security](docs/security.md),
+[compatibility](docs/compatibility.md), [toolchains](docs/toolchain.md), and
+[releases](docs/releasing.md).

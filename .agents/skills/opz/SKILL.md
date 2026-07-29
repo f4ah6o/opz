@@ -174,8 +174,6 @@ opz skills
 - Explicit item titles are resolved with direct `op item get <title>` first; item list caching is used for fuzzy title fallback and legacy migration paths.
 - Item lists and the legacy auto-detect repository index are cached for 60 seconds. Creating or editing items invalidates those caches best-effort.
 - Secret-resolution `op` calls time out after 30 seconds by default. Set `OPZ_OP_TIMEOUT_SECONDS=<seconds>` to allow slower 1Password CLI operations. Batch secret-resolution timeouts stop immediately instead of retrying once per secret.
-- OTLP tracing is disabled unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set.
-
 ## Suggested Workflow
 
 1. Discover candidate items with `opz find`.
