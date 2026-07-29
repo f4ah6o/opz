@@ -19,7 +19,7 @@ default = []
 test-support = []
 
 [dependencies]
-anyhow = "1.0.100"
+anyhow = "1.0.103"
 clap = { version = "4.5.53", default-features = false, features = ["derive", "std", "help", "usage", "error-context"] }
 regex = "1.12.2"
 serde = { version = "1.0.228", features = ["derive"] }
