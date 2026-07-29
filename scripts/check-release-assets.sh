@@ -17,9 +17,10 @@ require_line() {
 }
 
 require_line Cargo.toml 'pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }{ archive-suffix }"'
-require_line Cargo.toml 'bin-dir = "{ bin }{ binary-ext }"'
+require_line Cargo.toml 'bin-dir = "{ name }-{ target }/{ bin }{ binary-ext }"'
 require_line Cargo.toml 'pkg-fmt = "txz"'
 require_line Cargo.toml '[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]'
+require_line Cargo.toml 'bin-dir = "{ bin }{ binary-ext }"'
 
 version=$(sed -nE 's/^version = "([^"]+)"/\1/p' Cargo.toml | head -n1)
 if [[ ! "$version" =~ ^[0-9]{4}\.(1[0-2]|[1-9])\.[0-9]+$ ]]; then
