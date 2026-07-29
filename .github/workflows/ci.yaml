@@ -29,7 +29,7 @@ jobs:
       run: cargo fmt --all --check
 
     - name: Run clippy
-      run: cargo clippy --all-targets -- -D warnings
+      run: cargo clippy --all-targets --locked --features test-support -- -D warnings
 
   test:
     name: Test (${{ matrix.os }})
@@ -51,4 +51,4 @@ jobs:
     - uses: swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
 
     - name: Run tests
-      run: cargo test --verbose
+      run: cargo test --all-targets --locked --features test-support --verbose
