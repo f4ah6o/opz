@@ -1,0 +1,103 @@
+name: Release smoke test
+
+on:
+  release:
+    types:
+      - published
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  archive:
+    name: Archive (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: opz-x86_64-unknown-linux-gnu.tar.xz
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            archive: opz-x86_64-apple-darwin.tar.xz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: opz-x86_64-pc-windows-msvc.zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Download exact cargo-dist archive
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/opz-smoke"
+          gh release download "${{ github.event.release.tag_name }}" \
+            --repo "${{ github.repository }}" \
+            --pattern "${{ matrix.archive }}" \
+            --dir "$RUNNER_TEMP/opz-smoke"
+
+      - name: Verify Unix archive
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/opz-unpacked"
+          tar -xJf "$RUNNER_TEMP/opz-smoke/${{ matrix.archive }}" \
+            -C "$RUNNER_TEMP/opz-unpacked"
+          binary=$(find "$RUNNER_TEMP/opz-unpacked" -type f -name opz -print -quit)
+          test -n "$binary"
+          chmod +x "$binary"
+          "$binary" --version
+          "$binary" --help
+
+      - name: Verify Windows archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $destination = Join-Path $env:RUNNER_TEMP "opz-unpacked"
+          Expand-Archive `
+            -Path (Join-Path $env:RUNNER_TEMP "opz-smoke/${{ matrix.archive }}") `
+            -DestinationPath $destination
+          $binary = Get-ChildItem -Path $destination -Recurse -Filter opz.exe |
+            Select-Object -First 1
+          if (-not $binary) {
+            throw "opz.exe was not present in the release archive"
+          }
+          & $binary.FullName --version
+          & $binary.FullName --help
+
+      - name: Install cargo-binstall
+        if: runner.os == 'Linux'
+        uses: taiki-e/install-action@18b1216eba7f8039b0f8d131d5473787f0edce68 # v2
+        with:
+          tool: cargo-binstall@1.21.1
+          fallback: none
+
+      - name: Verify cargo-binstall metadata
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          version=${{ github.event.release.tag_name }}
+          version=${version#v}
+          install_root="$RUNNER_TEMP/opz-binstall"
+          for attempt in $(seq 1 12); do
+            if cargo binstall "opz@$version" \
+              --no-confirm \
+              --force \
+              --root "$install_root" \
+              --no-track \
+              --disable-strategies compile,quick-install
+            then
+              break
+            fi
+            if [[ "$attempt" == 12 ]]; then
+              echo "cargo-binstall did not find the published crate after 12 attempts" >&2
+              exit 1
+            fi
+            sleep 15
+          done
+          "$install_root/bin/opz" --version
+          "$install_root/bin/opz" --help

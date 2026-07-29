@@ -9,6 +9,9 @@ env:
   CARGO_TERM_COLOR: always
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
+permissions:
+  contents: read
+
 jobs:
   publish:
     runs-on: ubuntu-latest
@@ -16,15 +19,18 @@ jobs:
       id-token: write
       contents: read
     steps:
-    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+    - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
     - name: Set up Rust
-      uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
 
     - uses: swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
 
     - uses: rust-lang/crates-io-auth-action@bbd81622f20ce9e2dd9622e3218b975523e45bbe # v1.0.4
       id: auth
+
+    - name: Check release metadata
+      run: ./scripts/check-release-metadata.sh
 
     # === バージョンチェック ===
     - name: Check version with cargo search
@@ -44,10 +50,10 @@ jobs:
         # 行頭(^)から 名前、等号、バージョン が一致するか確認
         if echo "$SEARCH_RESULT" | grep -E -q "^$NAME\s*=\s*\"$VERSION\""; then
           echo "::notice::Version $VERSION is already published on crates.io. Skipping all subsequent steps."
-          echo "should_publish=false" >> $GITHUB_OUTPUT
+          echo "should_publish=false" >> "$GITHUB_OUTPUT"
         else
           echo "::notice::Version $VERSION not found on crates.io. Proceeding."
-          echo "should_publish=true" >> $GITHUB_OUTPUT
+          echo "should_publish=true" >> "$GITHUB_OUTPUT"
         fi
 
     # === 以下のステップすべてに if 条件を追加 ===
@@ -55,11 +61,11 @@ jobs:
     - name: Run tests
       # 公開すべき時(true) かつ Pushの時だけ実行
       if: steps.check.outputs.should_publish == 'true' && github.event_name == 'push'
-      run: cargo test --verbose
+      run: cargo test --all-targets --locked --features test-support --verbose
 
     - name: Publish
       # 公開すべき時(true) かつ Pushの時だけ実行
       if: steps.check.outputs.should_publish == 'true' && github.event_name == 'push'
-      run: cargo publish
+      run: cargo publish --locked
       env:
         CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
