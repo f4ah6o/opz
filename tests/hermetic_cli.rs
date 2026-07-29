@@ -100,6 +100,8 @@ fn item_json(title: &str) -> String {
 fn install_tool(bin: &Path, name: &str) {
     let destination = tool_path(bin, name);
     fs::copy(env!("CARGO_BIN_EXE_opz-test-tool"), &destination).unwrap();
+    #[cfg(windows)]
+    fs::copy(env!("CARGO_BIN_EXE_opz-test-tool"), bin.join(name)).unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -195,7 +197,10 @@ fn environment_delegation_preserves_argv_and_reports_failure() {
     let output = harness.output(&["run", "--environment", "dev", "--", "opz-child", "hello"]);
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("status: exit status: 23"), "{stderr}");
+    assert!(
+        stderr.contains("status: exit status: 23") || stderr.contains("status: exit code: 23"),
+        "{stderr}"
+    );
     assert_eq!(
         harness.invocation(1).args,
         ["run", "--environments", "dev", "--", "opz-child", "hello"]
