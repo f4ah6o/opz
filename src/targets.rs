@@ -143,6 +143,7 @@ pub(crate) fn set_cloudflare_secrets(
         resolve_env_vars(&merged_env_lines)
     })?;
     let payload = build_secret_json_payload(&secret_names, &env_vars)?;
+    let redactor = Redactor::new(env_vars.values().cloned());
 
     instrumentation::with_span_result(
         "write_outputs.cloudflare_secret_bulk",
@@ -151,7 +152,7 @@ pub(crate) fn set_cloudflare_secrets(
             KeyValue::new("cloudflare.secret_count", secret_names.len() as i64),
         ],
         || {
-            run_wrangler_secret_bulk(target, payload.as_bytes())?;
+            run_wrangler_secret_bulk(target, payload.as_bytes(), &redactor)?;
             for name in secret_names {
                 println!("Set Cloudflare Worker secret {name}");
             }
@@ -248,14 +249,17 @@ pub(crate) fn build_wrangler_secret_bulk_args(target: CloudflareSecretTarget<'_>
 
 pub(crate) fn build_secret_json_payload(
     secret_names: &[String],
-    env_vars: &HashMap<String, String>,
+    env_vars: &HashMap<String, SecretValue>,
 ) -> Result<String> {
     let mut secrets = serde_json::Map::with_capacity(secret_names.len());
     for name in secret_names {
         let value = env_vars
             .get(name)
             .ok_or_else(|| anyhow!("resolved value missing for secret {name}"))?;
-        secrets.insert(name.clone(), serde_json::Value::String(value.clone()));
+        secrets.insert(
+            name.clone(),
+            serde_json::Value::String(value.expose().to_string()),
+        );
     }
     serde_json::to_string(&secrets).context("failed to encode Wrangler secret payload")
 }
@@ -290,29 +294,25 @@ pub(crate) fn resolve_current_github_repo() -> Result<String> {
     Ok(repo)
 }
 
-pub(crate) fn run_gh_secret_set(repo: &str, name: &str, value: &str) -> Result<()> {
+pub(crate) fn run_gh_secret_set(repo: &str, name: &str, value: &SecretValue) -> Result<()> {
     let args = build_gh_secret_set_args(repo, name);
-    let mut child = Command::new("gh")
+    let child = Command::new("gh")
         .args(&args)
         .stdin(Stdio::piped())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .context("failed to run `gh secret set`")?;
 
-    {
-        let stdin = child
-            .stdin
-            .as_mut()
-            .ok_or_else(|| anyhow!("failed to open stdin for `gh secret set`"))?;
-        stdin
-            .write_all(value.as_bytes())
-            .context("failed to write GitHub secret value to stdin")?;
-    }
-
-    let status = child.wait().context("failed to wait for `gh secret set`")?;
-    if !status.success() {
-        return Err(anyhow!("gh secret set failed with status: {}", status));
+    let output = wait_with_secret_stdin(child, value.expose().as_bytes(), "`gh secret set`")?;
+    let redactor = Redactor::new([value.clone()]);
+    redactor.write_stdout(&output.stdout)?;
+    redactor.write_stderr(&output.stderr)?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "gh secret set failed with status: {}",
+            output.status
+        ));
     }
     Ok(())
 }
@@ -320,34 +320,42 @@ pub(crate) fn run_gh_secret_set(repo: &str, name: &str, value: &str) -> Result<(
 pub(crate) fn run_wrangler_secret_bulk(
     target: CloudflareSecretTarget<'_>,
     payload: &[u8],
+    redactor: &Redactor,
 ) -> Result<()> {
     let args = build_wrangler_secret_bulk_args(target);
-    let mut child = Command::new("wrangler")
+    let child = Command::new("wrangler")
         .args(&args)
         .stdin(Stdio::piped())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .context("failed to run `wrangler secret bulk`")?;
 
-    {
-        let stdin = child
-            .stdin
-            .as_mut()
-            .ok_or_else(|| anyhow!("failed to open stdin for `wrangler secret bulk`"))?;
-        stdin
-            .write_all(payload)
-            .context("failed to write Cloudflare secret payload to stdin")?;
-    }
-
-    let status = child
-        .wait()
-        .context("failed to wait for `wrangler secret bulk`")?;
-    if !status.success() {
+    let output = wait_with_secret_stdin(child, payload, "`wrangler secret bulk`")?;
+    redactor.write_stdout(&output.stdout)?;
+    redactor.write_stderr(&output.stderr)?;
+    if !output.status.success() {
         return Err(anyhow!(
             "wrangler secret bulk failed with status: {}",
-            status
+            output.status
         ));
     }
     Ok(())
+}
+
+fn wait_with_secret_stdin(mut child: Child, input: &[u8], label: &'static str) -> Result<Output> {
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("failed to open stdin for {label}"))?;
+    let input = input.to_vec();
+    let writer = thread::spawn(move || stdin.write_all(&input));
+    let output = child
+        .wait_with_output()
+        .with_context(|| format!("failed to wait for {label}"))?;
+    writer
+        .join()
+        .map_err(|_| anyhow!("stdin writer for {label} panicked"))?
+        .with_context(|| format!("failed to write secret payload to stdin for {label}"))?;
+    Ok(output)
 }

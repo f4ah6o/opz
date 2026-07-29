@@ -156,7 +156,7 @@ pub(crate) fn merge_env_lines(sections: &[(String, Vec<String>)]) -> Vec<String>
     merged_lines
 }
 
-pub(crate) fn resolve_env_vars(env_lines: &[String]) -> Result<HashMap<String, String>> {
+pub(crate) fn resolve_env_vars(env_lines: &[String]) -> Result<HashMap<String, SecretValue>> {
     let references: Vec<(String, String)> = env_lines
         .iter()
         .filter_map(|line| {
@@ -178,11 +178,11 @@ pub(crate) fn resolve_env_vars(env_lines: &[String]) -> Result<HashMap<String, S
     }
 
     // Fallback path for environments where batch resolution is unavailable.
-    let mut env_vars: HashMap<String, String> = HashMap::with_capacity(references.len());
+    let mut env_vars: HashMap<String, SecretValue> = HashMap::with_capacity(references.len());
     for line in env_lines {
         if let Some((key, reference)) = parse_env_line_kv(line) {
             let value = op_read(reference)?;
-            env_vars.insert(key.to_string(), value);
+            env_vars.insert(key.to_string(), SecretValue::new(value));
         }
     }
 
@@ -191,7 +191,7 @@ pub(crate) fn resolve_env_vars(env_lines: &[String]) -> Result<HashMap<String, S
 
 pub(crate) fn resolve_env_vars_batch(
     references: &[(String, String)],
-) -> Result<HashMap<String, String>> {
+) -> Result<HashMap<String, SecretValue>> {
     instrumentation::with_span_result(
         "load_inputs.op_run_batch_resolve",
         vec![KeyValue::new(
@@ -222,10 +222,7 @@ pub(crate) fn resolve_env_vars_batch(
             )?;
 
             if !out.status.success() {
-                return Err(anyhow!(
-                    "op run failed: {}",
-                    String::from_utf8_lossy(&out.stderr)
-                ));
+                return Err(anyhow!("op run failed with status: {}", out.status));
             }
 
             let wanted_keys: std::collections::HashSet<&str> =
@@ -240,7 +237,7 @@ pub(crate) fn resolve_env_vars_batch(
                     continue;
                 };
                 if wanted_keys.contains(key) {
-                    env_vars.insert(key.to_string(), value.to_string());
+                    env_vars.insert(key.to_string(), SecretValue::new(value));
                 }
             }
 
@@ -596,11 +593,14 @@ impl TempEnvFile {
                 std::process::id(),
                 stable_hex_hash(&format!("{:?}", SystemTime::now()))
             ));
-            match fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
             {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            match options.open(&path) {
                 Ok(file) => return Ok(Self { path, file }),
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(err) => return Err(err).with_context(|| format!("create {}", path.display())),

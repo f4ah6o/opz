@@ -113,7 +113,7 @@ impl OnePasswordMcpStdioClient {
             if let Some(error) = value.get("error") {
                 return Err(anyhow!(
                     "1Password MCP `{method}` failed: {}",
-                    concise_json(error)
+                    mcp_error_summary(error)
                 ));
             }
             return value.get("result").cloned().ok_or_else(|| {
@@ -645,10 +645,9 @@ pub(crate) fn collect_string_array_for_keys(
     }
 }
 
-pub(crate) fn concise_json(value: &serde_json::Value) -> String {
-    serde_json::to_string(value)
-        .unwrap_or_else(|_| "<unprintable JSON>".to_string())
-        .chars()
-        .take(500)
-        .collect()
+pub(crate) fn mcp_error_summary(error: &serde_json::Value) -> String {
+    match error.get("code").and_then(serde_json::Value::as_i64) {
+        Some(code) => format!("server returned error code {code}"),
+        None => "server returned an error".to_string(),
+    }
 }

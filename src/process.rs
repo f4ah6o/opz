@@ -1,59 +1,5 @@
 use crate::*;
 
-/// Expand environment references using the provided values.
-pub(crate) fn expand_vars(s: &str, env_vars: &HashMap<String, String>) -> String {
-    let mut result = String::with_capacity(s.len() * 2);
-    let mut chars = s.chars().peekable();
-
-    while let Some(c) = chars.next() {
-        if c == '$' {
-            // Try to parse ${VAR} or $VAR
-            let mut var_name = String::new();
-            let mut is_braced = false;
-
-            if chars.peek() == Some(&'{') {
-                is_braced = true;
-                chars.next(); // consume '{'
-            }
-
-            // Collect variable name (ASCII alphanumeric + underscore only)
-            // This matches shell variable naming rules
-            while let Some(&next) = chars.peek() {
-                match next {
-                    'a'..='z' | 'A'..='Z' | '0'..='9' | '_' => {
-                        var_name.push(chars.next().unwrap());
-                    }
-                    _ => break,
-                }
-            }
-
-            if is_braced {
-                if chars.peek() == Some(&'}') {
-                    chars.next(); // consume '}'
-                } else {
-                    // Invalid ${ syntax, treat as literal
-                    result.push_str("${");
-                    result.push_str(&var_name);
-                    continue;
-                }
-            }
-
-            // Look up the variable and replace, or keep original literal form
-            if let Some(value) = env_vars.get(&var_name) {
-                result.push_str(value);
-            } else {
-                // Variable not found in our env, keep $VAR as-is
-                result.push('$');
-                result.push_str(&var_name);
-            }
-        } else {
-            result.push(c);
-        }
-    }
-
-    result
-}
-
 pub(crate) fn run_with_items(
     context: &ItemContext,
     items: &[String],
@@ -93,20 +39,12 @@ pub(crate) fn run_with_items(
         resolve_env_vars(&merged_env_lines)
     })?;
 
-    // Second pass: expand $VAR references in command arguments
-    let expanded_args: Vec<String> = instrumentation::with_span("main_operation", vec![], || {
-        command
-            .iter()
-            .map(|arg| expand_vars(arg, &env_vars))
-            .collect()
-    });
-
     instrumentation::with_span_result("write_outputs.command_exec", vec![], || {
-        let mut cmd = build_child_command(&expanded_args)?;
+        let mut cmd = build_child_command(command)?;
 
         // Set environment variables for the child process
         for (key, value) in &env_vars {
-            cmd.env(key, value);
+            cmd.env(key, value.expose());
         }
 
         let status = cmd
@@ -158,11 +96,15 @@ pub(crate) fn op_json(args: &[&str]) -> Result<serde_json::Value> {
             let out = command_output_with_timeout(cmd, &display, op_command_timeout())?;
 
             if !out.status.success() {
-                return Err(anyhow!(
-                    "op error ({}): {}",
-                    out.status,
-                    String::from_utf8_lossy(&out.stderr)
-                ));
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                if args.starts_with(&["item", "get"])
+                    && (stderr.contains("isn't an item")
+                        || stderr.contains("is not an item")
+                        || stderr.contains("not found"))
+                {
+                    return Err(anyhow!("op item not found"));
+                }
+                return Err(anyhow!("op error ({})", out.status));
             }
 
             let v: serde_json::Value =

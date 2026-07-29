@@ -90,7 +90,7 @@ opz note <FILE>
 
 ### `run`
 
-Run a command with secrets from one or more items injected as environment variables. `$VAR` and `${VAR}` in command arguments are expanded only when that variable was resolved from the selected items.
+Run a command with secrets from one or more items injected as environment variables. Arguments are passed unchanged; `opz` never substitutes resolved values into `$VAR` or `${VAR}` in argv.
 When no item is passed, `run` auto-detects exactly one item whose title matches the current git remote repository name such as `owner/repo`.
 
 ```bash
@@ -98,6 +98,13 @@ opz run [OPTIONS] [<ITEM>...] -- <COMMAND>...
 opz [OPTIONS] [<ITEM>...] -- <COMMAND>...
 opz run --environment <ENV> -- <COMMAND>...
 opz --environment <ENV> -- <COMMAND>...
+```
+
+Prefer commands that read their environment directly. If stdin delivery is
+required, make the shell an explicit trusted child:
+
+```bash
+opz run my-service -- sh -c 'printf "%s" "$API_TOKEN" | trusted-consumer --token-stdin'
 ```
 
 ### `github-secret`
@@ -161,7 +168,8 @@ opz skills
 - `cloudflare-secret` also uses later-item-wins and passes a JSON payload to `wrangler secret bulk` through stdin.
 - `cloudflare-secret` supports `--name`, `--env`, and `--config` for Wrangler target selection.
 - `gen` stdout uses `op://<vault_id>/<item_id>/<field>` references, not resolved secret values.
-- When `--env-file` points to an existing file, `opz` appends new keys and overwrites duplicate keys while preserving unrelated lines.
+- Persistent env files contain `op://` references, preserve unrelated lines and existing permissions, reject symlinks/non-regular targets, and use mode `0600` for new files on Unix.
+- Resolved values are passed only through a trusted child environment, `gh` stdin, or `wrangler` stdin; they are never added to argv.
 - `show` only prints labels that are valid shell environment variable names.
 - Explicit item titles are resolved with direct `op item get <title>` first; item list caching is used for fuzzy title fallback and legacy migration paths.
 - Item lists and the legacy auto-detect repository index are cached for 60 seconds. Creating or editing items invalidates those caches best-effort.

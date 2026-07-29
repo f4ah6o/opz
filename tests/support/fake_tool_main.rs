@@ -144,10 +144,11 @@ fn run_mcp(
             result_index += 1;
             result
         };
-        serde_json::to_writer(
-            &mut io::stdout(),
-            &serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result}),
-        )?;
+        let response = match result.get("__error") {
+            Some(error) => serde_json::json!({"jsonrpc": "2.0", "id": id, "error": error}),
+            None => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result}),
+        };
+        serde_json::to_writer(&mut io::stdout(), &response)?;
         io::stdout().write_all(b"\n")?;
         io::stdout().flush()?;
     }

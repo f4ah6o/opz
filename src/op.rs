@@ -13,7 +13,7 @@ pub(crate) struct ItemVault {
     pub(crate) name: String,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize)]
 pub(crate) struct ItemGet {
     #[serde(default)]
     pub(crate) id: Option<String>,
@@ -24,7 +24,7 @@ pub(crate) struct ItemGet {
     #[serde(default)]
     pub(crate) vault: Option<ItemVault>,
 }
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize)]
 pub(crate) struct ItemField {
     #[serde(default)]
     pub(crate) label: Option<String>,
@@ -32,14 +32,14 @@ pub(crate) struct ItemField {
     pub(crate) value: Option<serde_json::Value>,
 }
 
-#[derive(Serialize, Debug)]
+#[derive(Serialize)]
 pub(crate) struct ItemCreateTemplate {
     pub(crate) title: String,
     pub(crate) category: String,
     pub(crate) fields: Vec<ItemCreateField>,
 }
 
-#[derive(Serialize, Debug)]
+#[derive(Serialize)]
 pub(crate) struct ItemCreateField {
     pub(crate) id: String,
     #[serde(rename = "type")]
@@ -361,6 +361,8 @@ pub(crate) fn run_op_item_create(args: &[String], template: &ItemCreateTemplate)
         vec![KeyValue::new("op.arg_count", args.len() as i64)],
         || {
             let sensitive_fields = collect_create_stdout_sensitive_fields(template);
+            let redactor =
+                Redactor::from_strings(sensitive_fields.iter().map(|(_, value)| value.clone()));
             let mut cmd = Command::new("op");
             cmd.args(args);
 
@@ -384,14 +386,10 @@ pub(crate) fn run_op_item_create(args: &[String], template: &ItemCreateTemplate)
                 .wait_with_output()
                 .context("failed to wait for `op item create`")?;
 
-            std::io::stderr()
-                .write_all(&output.stderr)
-                .context("failed to write `op item create` stderr")?;
+            redactor.write_stderr(&output.stderr)?;
 
             if !output.status.success() {
-                std::io::stdout()
-                    .write_all(&output.stdout)
-                    .context("failed to write `op item create` stdout")?;
+                redactor.write_stdout(&output.stdout)?;
                 return Err(anyhow!(
                     "op item create failed with status: {}",
                     output.status
@@ -653,10 +651,7 @@ pub(crate) fn op_read(reference: &str) -> Result<String> {
         let out = command_output_with_timeout(cmd, "`op read`", op_command_timeout())?;
 
         if !out.status.success() {
-            return Err(anyhow!(
-                "op read failed: {}",
-                String::from_utf8_lossy(&out.stderr)
-            ));
+            return Err(anyhow!("op read failed with status: {}", out.status));
         }
 
         Ok(String::from_utf8(out.stdout)?.trim().to_string())
