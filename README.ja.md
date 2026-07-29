@@ -404,7 +404,7 @@ sequenceDiagram
 安全のため、`OPZ_E2E=1` を指定した場合にのみ実行されます:
 
 ```bash
-OPZ_E2E=1 cargo test --test e2e_real_op -- --nocapture
+OPZ_E2E=1 cargo test --locked --test e2e_real_op -- --nocapture
 ```
 
 または `just` で実行できます:
