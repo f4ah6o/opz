@@ -1,8 +1,8 @@
 # opz
 <!-- bdg:begin -->
 [![crates.io](https://img.shields.io/crates/v/opz.svg)](https://crates.io/crates/opz)
-[![license](https://img.shields.io/github/license/f4ah6o/opz.svg)](https://github.com/f4ah6o/opz)
-[![CI](https://github.com/f4ah6o/opz/actions/workflows/ci.yaml/badge.svg)](https://github.com/f4ah6o/opz/actions/workflows/ci.yaml)
+[![license](https://img.shields.io/github/license/opz-rs/opz.svg)](https://github.com/opz-rs/opz)
+[![CI](https://github.com/opz-rs/opz/actions/workflows/ci.yaml/badge.svg)](https://github.com/opz-rs/opz/actions/workflows/ci.yaml)
 <!-- bdg:end -->
 
 `opz` is a small wrapper around the 1Password CLI. It finds items, turns valid field labels into environment variables, and runs commands with those secrets injected.
