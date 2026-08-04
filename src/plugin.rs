@@ -533,9 +533,10 @@ fn load_registry_plugins(
                 let path = contained_registry_path(root, &entry.path)?;
                 fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?
             }
-            None => bundled_manifest(&entry.path)
-                .ok_or_else(|| anyhow!("bundled plugin manifest is missing: {}", entry.path))?
-                .to_string(),
+            None => normalize_bundled_newlines(
+                bundled_manifest(&entry.path)
+                    .ok_or_else(|| anyhow!("bundled plugin manifest is missing: {}", entry.path))?,
+            ),
         };
         let digest = sha256_hex(manifest_text.as_bytes());
         if digest != entry.sha256 {
@@ -557,6 +558,10 @@ fn load_registry_plugins(
         });
     }
     Ok(plugins)
+}
+
+fn normalize_bundled_newlines(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 fn bundled_manifest(path: &str) -> Option<&'static str> {
@@ -1102,6 +1107,7 @@ fn render_files(
             .parent()
             .ok_or_else(|| anyhow!("generated plugin file has no parent"))?;
         create_private_directories(workspace, parent)?;
+        #[cfg(unix)]
         let mode = u32::from_str_radix(file.mode.trim_start_matches('0'), 8)
             .context("parse plugin file mode")?;
         let mut options = OpenOptions::new();
@@ -1361,10 +1367,15 @@ mod tests {
 
     #[test]
     fn generated_path_rejects_parent_traversal() {
-        let workspace = Path::new("/tmp/opz-plugin-test");
-        let error =
-            normalize_generated_path(workspace, "/tmp/opz-plugin-test/a/../escape").unwrap_err();
+        let workspace = env::temp_dir().join("opz-plugin-test");
+        let path = workspace.join("a").join("..").join("escape");
+        let error = normalize_generated_path(&workspace, &path.to_string_lossy()).unwrap_err();
         assert!(error.to_string().contains("parent traversal"));
+    }
+
+    #[test]
+    fn bundled_digest_input_normalizes_checkout_line_endings() {
+        assert_eq!(normalize_bundled_newlines("a\r\nb\r\n"), "a\nb\n");
     }
 
     proptest! {
@@ -1413,13 +1424,13 @@ mod tests {
                 1..8
             )
         ) {
-            let workspace = Path::new("/tmp/opz-plugin-pbt");
-            let mut path = workspace.to_path_buf();
+            let workspace = env::temp_dir().join("opz-plugin-pbt");
+            let mut path = workspace.clone();
             for segment in &segments {
                 path.push(segment);
             }
-            let normalized = normalize_generated_path(workspace, &path.to_string_lossy()).unwrap();
-            prop_assert!(normalized.starts_with(workspace));
+            let normalized = normalize_generated_path(&workspace, &path.to_string_lossy()).unwrap();
+            prop_assert!(normalized.starts_with(&workspace));
             prop_assert_ne!(normalized, workspace);
         }
     }
