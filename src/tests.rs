@@ -1,4 +1,5 @@
 use super::*;
+use clap::CommandFactory;
 use std::collections::VecDeque;
 use std::fs;
 use tempfile::TempDir;
@@ -18,6 +19,19 @@ impl FakeMcpClient {
 }
 
 impl OnePasswordMcp for FakeMcpClient {
+    fn list_tools(&mut self) -> Result<Vec<String>> {
+        Ok(vec![
+            "append_variables".to_string(),
+            "authenticate".to_string(),
+            "create_environment".to_string(),
+            "create_local_env_file".to_string(),
+            "list_environments".to_string(),
+            "list_local_env_files".to_string(),
+            "list_variables".to_string(),
+            "rename_environment".to_string(),
+        ])
+    }
+
     fn call_tool(&mut self, name: &str, arguments: serde_json::Value) -> Result<serde_json::Value> {
         self.calls.push((name.to_string(), arguments));
         self.responses
@@ -1496,7 +1510,7 @@ fn test_environment_list_uses_account_without_authentication() {
         }
     })]);
     let output =
-        run_environment_command(&mut client, Some("A1"), &EnvironmentCommand::List).unwrap();
+        run_environment_command(&mut client, Some("A1"), &McpEnvironmentAction::List).unwrap();
     assert_eq!(output, "env1\tdev\nenv2\tstaging\n");
     assert_eq!(client.calls.len(), 1);
     assert_eq!(client.calls[0].0, "list_environments");
@@ -1516,7 +1530,7 @@ fn test_environment_variables_authenticates_and_lists_names_only() {
     let output = run_environment_command(
         &mut client,
         None,
-        &EnvironmentCommand::Variables {
+        &McpEnvironmentAction::Variables {
             environment: "dev".to_string(),
         },
     )
@@ -1542,7 +1556,7 @@ fn test_environment_mount_resolves_by_id_and_prints_mount_path() {
     let output = run_environment_command(
         &mut client,
         Some("A1"),
-        &EnvironmentCommand::Mount {
+        &McpEnvironmentAction::Mount {
             environment: "env1".to_string(),
             path: PathBuf::from(".env.local"),
         },
@@ -1552,6 +1566,56 @@ fn test_environment_mount_resolves_by_id_and_prints_mount_path() {
     assert_eq!(client.calls[1].0, "create_local_env_file");
     assert_eq!(client.calls[1].1["environmentName"], "dev");
     assert_eq!(client.calls[1].1["mountPath"], ".env.local");
+}
+
+#[test]
+fn test_environment_add_appends_concealed_empty_placeholders() {
+    let mut client = FakeMcpClient::new(vec![
+        serde_json::json!({"structuredContent": {"environments": [{"id": "env1", "name": "dev"}]}}),
+        serde_json::json!({"structuredContent": {"updated": true}}),
+    ]);
+    let output = run_environment_command(
+        &mut client,
+        Some("A1"),
+        &McpEnvironmentAction::Add {
+            environment: "dev".to_string(),
+            variables: vec!["API_TOKEN".to_string(), "DB_URL".to_string()],
+        },
+    )
+    .unwrap();
+    assert_eq!(output, "API_TOKEN\nDB_URL\n");
+    assert_eq!(client.calls[1].0, "append_variables");
+    assert_eq!(client.calls[1].1["variables"][0]["name"], "API_TOKEN");
+    assert_eq!(client.calls[1].1["variables"][0]["value"], "");
+    assert_eq!(client.calls[1].1["variables"][0]["concealed"], true);
+}
+
+#[test]
+fn test_environment_add_rejects_invalid_variable_names_before_mcp_mutation() {
+    let mut client = FakeMcpClient::new(vec![serde_json::json!({
+        "structuredContent": {"environments": [{"id": "env1", "name": "dev"}]}
+    })]);
+    let err = run_environment_command(
+        &mut client,
+        Some("A1"),
+        &McpEnvironmentAction::Add {
+            environment: "dev".to_string(),
+            variables: vec!["NOT-VALID".to_string()],
+        },
+    )
+    .unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("Invalid Environment variable name"));
+    assert_eq!(client.calls.len(), 1);
+}
+
+#[test]
+fn test_environment_tools_does_not_authenticate() {
+    let mut client = FakeMcpClient::new(vec![]);
+    let output = run_environment_command(&mut client, None, &McpEnvironmentAction::Tools).unwrap();
+    assert!(output.contains("append_variables\n"));
+    assert!(client.calls.is_empty());
 }
 
 #[test]
@@ -1567,7 +1631,7 @@ fn test_environment_resolve_rejects_ambiguous_names() {
     let err = run_environment_command(
         &mut client,
         Some("A1"),
-        &EnvironmentCommand::Mounts {
+        &McpEnvironmentAction::Mounts {
             environment: "dev".to_string(),
         },
     )
@@ -1644,6 +1708,67 @@ fn test_summarize_op_whoami_uses_non_secret_metadata() {
 }
 
 #[test]
+fn test_help_and_skill_cover_visible_commands() {
+    let mut command = Cli::command();
+    let help = command.render_long_help().to_string();
+    for name in [
+        "find",
+        "doctor",
+        "environment",
+        "skills",
+        "show",
+        "gen",
+        "migrate",
+        "note",
+        "github-repo",
+        "run",
+        "github-secret",
+        "cloudflare-secret",
+    ] {
+        assert!(help.contains(name), "top-level help is missing `{name}`");
+        assert!(
+            OPZ_SKILL.contains(&format!("### `{name}`")),
+            "bundled skill is missing `{name}`"
+        );
+    }
+
+    let command = Cli::command();
+    let mut environment = command
+        .find_subcommand("environment")
+        .expect("environment subcommand")
+        .clone();
+    let environment_help = environment.render_long_help().to_string();
+    assert!(!environment_help.contains("--environment <ENV>"));
+
+    let command = Cli::command();
+    let mut run = command
+        .find_subcommand("run")
+        .expect("run subcommand")
+        .clone();
+    let run_help = run.render_long_help().to_string();
+    assert!(run_help.contains("--environment <ENV>"));
+    for (name, skill_marker) in [
+        ("list", "] list"),
+        ("create", "] create <NAME>"),
+        ("rename", "] rename <ENVIRONMENT> <NEW_NAME>"),
+        ("variables", "] variables <ENVIRONMENT>"),
+        ("add", "] add <ENVIRONMENT> <NAME>..."),
+        ("mount", "] mount <ENVIRONMENT> <PATH>"),
+        ("mounts", "] mounts <ENVIRONMENT>"),
+        ("tools", "opz environment tools"),
+    ] {
+        assert!(
+            environment_help.contains(name),
+            "environment help is missing `{name}`"
+        );
+        assert!(
+            OPZ_SKILL.contains(skill_marker),
+            "bundled skill is missing environment command `{name}`"
+        );
+    }
+}
+
+#[test]
 fn test_bundled_skill_has_expected_metadata() {
     let skill_lines: Vec<&str> = OPZ_SKILL.lines().collect();
     assert_eq!(skill_lines.first().copied(), Some("---"));
@@ -1684,6 +1809,7 @@ fn test_cli_parse_run_multiple_items() {
             items,
             command,
             env_file,
+            ..
         }) => {
             assert_eq!(items, vec!["foo".to_string(), "bar".to_string()]);
             assert_eq!(command, vec!["echo".to_string(), "ok".to_string()]);
@@ -1740,9 +1866,15 @@ fn test_cli_parse_top_level_without_items_for_auto_detect() {
 #[test]
 fn test_cli_parse_run_with_environment() {
     let cli = Cli::try_parse_from(["opz", "run", "--environment", "dev", "--", "env"]).unwrap();
-    assert_eq!(cli.environment, vec!["dev".to_string()]);
+    assert!(cli.run_environments.is_empty());
     match cli.cmd {
-        Some(Cmd::Run { items, command, .. }) => {
+        Some(Cmd::Run {
+            environments,
+            items,
+            command,
+            ..
+        }) => {
+            assert_eq!(environments, vec!["dev".to_string()]);
             assert!(items.is_empty());
             assert_eq!(command, vec!["env".to_string()]);
         }
@@ -1753,7 +1885,13 @@ fn test_cli_parse_run_with_environment() {
 #[test]
 fn test_cli_parse_run_with_environments_alias() {
     let cli = Cli::try_parse_from(["opz", "run", "--environments", "dev", "--", "env"]).unwrap();
-    assert_eq!(cli.environment, vec!["dev".to_string()]);
+    assert!(cli.run_environments.is_empty());
+    match cli.cmd {
+        Some(Cmd::Run { environments, .. }) => {
+            assert_eq!(environments, vec!["dev".to_string()]);
+        }
+        _ => panic!("expected run command"),
+    }
 }
 
 #[test]
@@ -1769,17 +1907,20 @@ fn test_cli_parse_run_with_multiple_environments() {
         "env",
     ])
     .unwrap();
-    assert_eq!(
-        cli.environment,
-        vec!["dev".to_string(), "staging".to_string()]
-    );
+    assert!(cli.run_environments.is_empty());
+    match cli.cmd {
+        Some(Cmd::Run { environments, .. }) => {
+            assert_eq!(environments, vec!["dev".to_string(), "staging".to_string()]);
+        }
+        _ => panic!("expected run command"),
+    }
 }
 
 #[test]
 fn test_cli_parse_top_level_with_environment() {
     let cli = Cli::try_parse_from(["opz", "--environment", "dev", "--", "env"]).unwrap();
     assert!(cli.cmd.is_none());
-    assert_eq!(cli.environment, vec!["dev".to_string()]);
+    assert_eq!(cli.run_environments, vec!["dev".to_string()]);
     assert!(cli.items.is_empty());
     assert_eq!(cli.command, vec!["env".to_string()]);
 }
@@ -1897,6 +2038,21 @@ fn test_detect_command_hint_skips_environment_options() {
 }
 
 #[test]
+fn test_vault_option_rejected_for_environment_commands() {
+    let args = vec![
+        OsString::from("opz"),
+        OsString::from("environment"),
+        OsString::from("--vault"),
+        OsString::from("Private"),
+        OsString::from("tools"),
+    ];
+    let err = run_cli(&args).unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("`--vault` cannot be combined with `opz environment`"));
+}
+
+#[test]
 fn test_environment_option_rejected_for_non_run_commands() {
     let args = vec![
         OsString::from("opz"),
@@ -1906,7 +2062,9 @@ fn test_environment_option_rejected_for_non_run_commands() {
         OsString::from("query"),
     ];
     let err = run_cli(&args).unwrap_err();
-    assert!(err.to_string().contains("only supported with `opz run`"));
+    assert!(err
+        .to_string()
+        .contains("unexpected argument '--environment'"));
 }
 
 #[test]

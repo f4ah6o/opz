@@ -1,4 +1,9 @@
-use crate::*;
+use super::{OnePasswordMcp, OnePasswordMcpStdioClient};
+use crate::instrumentation;
+use anyhow::{anyhow, Result};
+use regex::Regex;
+use serde_json::Value;
+use std::{collections::HashSet, path::PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EnvironmentRecord {
@@ -6,191 +11,39 @@ pub(crate) struct EnvironmentRecord {
     pub(crate) name: String,
 }
 
-pub(crate) trait OnePasswordMcp {
-    fn call_tool(&mut self, name: &str, arguments: serde_json::Value) -> Result<serde_json::Value>;
-}
-
-pub(crate) struct OnePasswordMcpStdioClient {
-    child: Child,
-    stdin: ChildStdin,
-    stdout_lines: Receiver<std::result::Result<String, String>>,
-    next_id: u64,
-}
-
-impl OnePasswordMcpStdioClient {
-    fn connect() -> Result<Self> {
-        let command = onepassword_mcp_command();
-        let path = find_command_path(&command).ok_or_else(|| {
-            anyhow!(
-                "1Password MCP server command `{command}` was not found. Set OPZ_1PASSWORD_MCP_COMMAND to the executable path, or install `onepassword-mcp` on PATH."
-            )
-        })?;
-
-        let mut child = Command::new(&path)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .with_context(|| {
-                format!("failed to start 1Password MCP server `{}`", path.display())
-            })?;
-        let stdin = child
-            .stdin
-            .take()
-            .context("1Password MCP server stdin was not available")?;
-        let stdout = child
-            .stdout
-            .take()
-            .context("1Password MCP server stdout was not available")?;
-        let stdout_lines = spawn_mcp_stdout_reader(stdout);
-
-        let mut client = Self {
-            child,
-            stdin,
-            stdout_lines,
-            next_id: 1,
-        };
-        client.initialize()?;
-        Ok(client)
-    }
-
-    fn initialize(&mut self) -> Result<()> {
-        let _ = self.request(
-            "initialize",
-            serde_json::json!({
-                "protocolVersion": "2025-06-18",
-                "capabilities": {},
-                "clientInfo": {
-                    "name": "opz",
-                    "version": env!("CARGO_PKG_VERSION")
-                }
-            }),
-        )?;
-        self.notify("notifications/initialized", serde_json::json!({}))?;
-        Ok(())
-    }
-
-    fn request(&mut self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
-        let id = self.next_id;
-        self.next_id += 1;
-        let payload = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": method,
-            "params": params,
-        });
-        self.write_message(&payload)?;
-
-        let timeout = mcp_command_timeout();
-        let started = Instant::now();
-        loop {
-            let remaining = timeout.checked_sub(started.elapsed()).ok_or_else(|| {
-                anyhow!("timed out waiting for 1Password MCP response to `{method}`")
-            })?;
-            let line = match self.stdout_lines.recv_timeout(remaining) {
-                Ok(Ok(line)) => line,
-                Ok(Err(err)) => {
-                    return Err(anyhow!(
-                        "failed to read 1Password MCP response to `{method}`: {err}"
-                    ));
-                }
-                Err(RecvTimeoutError::Timeout) => {
-                    return Err(anyhow!(
-                        "timed out waiting for 1Password MCP response to `{method}`"
-                    ));
-                }
-                Err(RecvTimeoutError::Disconnected) => {
-                    return Err(anyhow!(
-                        "1Password MCP server exited before responding to `{method}`"
-                    ));
-                }
-            };
-            let value: serde_json::Value = serde_json::from_str(line.trim())
-                .with_context(|| format!("1Password MCP response to `{method}` was not JSON"))?;
-            if value.get("id").and_then(serde_json::Value::as_u64) != Some(id) {
-                continue;
-            }
-            if let Some(error) = value.get("error") {
-                return Err(anyhow!(
-                    "1Password MCP `{method}` failed: {}",
-                    mcp_error_summary(error)
-                ));
-            }
-            return value.get("result").cloned().ok_or_else(|| {
-                anyhow!("1Password MCP `{method}` response did not include result")
-            });
-        }
-    }
-
-    fn notify(&mut self, method: &str, params: serde_json::Value) -> Result<()> {
-        let payload = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": method,
-            "params": params,
-        });
-        self.write_message(&payload)
-    }
-
-    fn write_message(&mut self, payload: &serde_json::Value) -> Result<()> {
-        serde_json::to_writer(&mut self.stdin, payload).context("failed to encode MCP request")?;
-        self.stdin
-            .write_all(b"\n")
-            .context("failed to write MCP request newline")?;
-        self.stdin.flush().context("failed to flush MCP request")
-    }
-}
-
-pub(crate) fn spawn_mcp_stdout_reader(
-    stdout: std::process::ChildStdout,
-) -> Receiver<std::result::Result<String, String>> {
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let mut reader = BufReader::new(stdout);
-        loop {
-            let mut line = String::new();
-            match reader.read_line(&mut line) {
-                Ok(0) => break,
-                Ok(_) => {
-                    if tx.send(Ok(line)).is_err() {
-                        break;
-                    }
-                }
-                Err(err) => {
-                    let _ = tx.send(Err(err.to_string()));
-                    break;
-                }
-            }
-        }
-    });
-    rx
-}
-
-impl Drop for OnePasswordMcpStdioClient {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-impl OnePasswordMcp for OnePasswordMcpStdioClient {
-    fn call_tool(&mut self, name: &str, arguments: serde_json::Value) -> Result<serde_json::Value> {
-        self.request(
-            "tools/call",
-            serde_json::json!({
-                "name": name,
-                "arguments": arguments,
-            }),
-        )
-        .with_context(|| format!("failed to call 1Password MCP tool `{name}`"))
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum McpEnvironmentAction {
+    List,
+    Create {
+        name: String,
+    },
+    Rename {
+        environment: String,
+        new_name: String,
+    },
+    Variables {
+        environment: String,
+    },
+    Add {
+        environment: String,
+        variables: Vec<String>,
+    },
+    Mount {
+        environment: String,
+        path: PathBuf,
+    },
+    Mounts {
+        environment: String,
+    },
+    Tools,
 }
 
 pub(crate) fn run_environment_cli(
     account: Option<&str>,
-    command: &EnvironmentCommand,
+    action: &McpEnvironmentAction,
 ) -> Result<()> {
     let mut client = OnePasswordMcpStdioClient::connect()?;
-    let output = run_environment_command(&mut client, account, command)?;
+    let output = run_environment_command(&mut client, account, action)?;
     instrumentation::with_span("write_outputs", vec![], || {
         print!("{output}");
     });
@@ -200,19 +53,23 @@ pub(crate) fn run_environment_cli(
 pub(crate) fn run_environment_command(
     client: &mut dyn OnePasswordMcp,
     account: Option<&str>,
-    command: &EnvironmentCommand,
+    action: &McpEnvironmentAction,
 ) -> Result<String> {
+    if matches!(action, McpEnvironmentAction::Tools) {
+        return Ok(render_lines(&client.list_tools()?));
+    }
+
     let account_id = resolve_mcp_account_id(client, account)?;
-    match command {
-        EnvironmentCommand::List => {
+    match action {
+        McpEnvironmentAction::List => {
             let environments = list_mcp_environments(client, &account_id)?;
             Ok(render_environment_records(&environments))
         }
-        EnvironmentCommand::Create { name } => {
+        McpEnvironmentAction::Create { name } => {
             let environment = create_mcp_environment(client, &account_id, name)?;
             Ok(format!("{}\t{}\n", environment.id, environment.name))
         }
-        EnvironmentCommand::Rename {
+        McpEnvironmentAction::Rename {
             environment,
             new_name,
         } => {
@@ -220,12 +77,21 @@ pub(crate) fn run_environment_command(
             let renamed = rename_mcp_environment(client, &account_id, &existing.id, new_name)?;
             Ok(format!("{}\t{}\n", renamed.id, renamed.name))
         }
-        EnvironmentCommand::Variables { environment } => {
+        McpEnvironmentAction::Variables { environment } => {
             let environment = resolve_mcp_environment(client, &account_id, environment)?;
             let variables = list_mcp_variable_names(client, &account_id, &environment.id)?;
             Ok(render_lines(&variables))
         }
-        EnvironmentCommand::Mount { environment, path } => {
+        McpEnvironmentAction::Add {
+            environment,
+            variables,
+        } => {
+            let environment = resolve_mcp_environment(client, &account_id, environment)?;
+            let variables =
+                append_mcp_placeholder_variables(client, &account_id, &environment.id, variables)?;
+            Ok(render_lines(&variables))
+        }
+        McpEnvironmentAction::Mount { environment, path } => {
             let environment = resolve_mcp_environment(client, &account_id, environment)?;
             let mounts = create_mcp_local_env_file(
                 client,
@@ -236,11 +102,12 @@ pub(crate) fn run_environment_command(
             )?;
             Ok(render_lines(&mounts))
         }
-        EnvironmentCommand::Mounts { environment } => {
+        McpEnvironmentAction::Mounts { environment } => {
             let environment = resolve_mcp_environment(client, &account_id, environment)?;
             let mounts = list_mcp_local_env_files(client, &account_id, &environment.id)?;
             Ok(render_lines(&mounts))
         }
+        McpEnvironmentAction::Tools => unreachable!("handled before authentication"),
     }
 }
 
@@ -355,12 +222,58 @@ pub(crate) fn list_mcp_variable_names(
     Ok(extract_variable_names(&mcp_result_values(&result)))
 }
 
+pub(crate) fn append_mcp_placeholder_variables(
+    client: &mut dyn OnePasswordMcp,
+    account_id: &str,
+    environment_id: &str,
+    variables: &[String],
+) -> Result<Vec<String>> {
+    let name_pattern = Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*$")?;
+    let mut seen = HashSet::new();
+    let mut names = Vec::new();
+    for name in variables {
+        if !name_pattern.is_match(name) {
+            return Err(anyhow!(
+                "Invalid Environment variable name `{name}`. Use shell-compatible names such as API_TOKEN."
+            ));
+        }
+        if seen.insert(name.clone()) {
+            names.push(name.clone());
+        }
+    }
+    if names.is_empty() {
+        return Err(anyhow!(
+            "At least one Environment variable name is required"
+        ));
+    }
+
+    let payload = names
+        .iter()
+        .map(|name| {
+            serde_json::json!({
+                "name": name,
+                "value": "",
+                "concealed": true,
+            })
+        })
+        .collect::<Vec<_>>();
+    let _ = client.call_tool(
+        "append_variables",
+        serde_json::json!({
+            "accountId": account_id,
+            "environmentId": environment_id,
+            "variables": payload,
+        }),
+    )?;
+    Ok(names)
+}
+
 pub(crate) fn create_mcp_local_env_file(
     client: &mut dyn OnePasswordMcp,
     account_id: &str,
     environment_id: &str,
     environment_name: &str,
-    path: &Path,
+    path: &std::path::Path,
 ) -> Result<Vec<String>> {
     let result = client.call_tool(
         "create_local_env_file",
@@ -426,41 +339,7 @@ pub(crate) fn render_lines(lines: &[String]) -> String {
     out
 }
 
-pub(crate) fn onepassword_mcp_command() -> String {
-    env::var("OPZ_1PASSWORD_MCP_COMMAND")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "onepassword-mcp".to_string())
-}
-
-pub(crate) fn mcp_command_timeout() -> Duration {
-    env::var("OPZ_MCP_TIMEOUT_SECONDS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|seconds| *seconds > 0)
-        .map(Duration::from_secs)
-        .unwrap_or_else(|| Duration::from_secs(30))
-}
-
-pub(crate) fn check_onepassword_mcp_server() -> DoctorCheck {
-    let command = onepassword_mcp_command();
-    match find_command_path(&command) {
-        Some(path) => DoctorCheck::ok(
-            "1Password MCP",
-            format!(
-                "{} (set OPZ_1PASSWORD_MCP_COMMAND to override)",
-                path.display()
-            ),
-            false,
-        ),
-        None => DoctorCheck::warn(
-            "1Password MCP",
-            format!("`{command}` not found in PATH; needed by `opz environment` commands"),
-        ),
-    }
-}
-
-pub(crate) fn mcp_result_values(result: &serde_json::Value) -> Vec<serde_json::Value> {
+pub(crate) fn mcp_result_values(result: &Value) -> Vec<Value> {
     let mut values = Vec::new();
     if let Some(value) = result.get("structuredContent") {
         values.push(value.clone());
@@ -469,11 +348,11 @@ pub(crate) fn mcp_result_values(result: &serde_json::Value) -> Vec<serde_json::V
         values.push(value.clone());
         if let Some(items) = value.as_array() {
             for item in items {
-                if let Some(text) = item.get("text").and_then(serde_json::Value::as_str) {
-                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
+                if let Some(text) = item.get("text").and_then(Value::as_str) {
+                    if let Ok(parsed) = serde_json::from_str::<Value>(text) {
                         values.push(parsed);
                     } else {
-                        values.push(serde_json::Value::String(text.to_string()));
+                        values.push(Value::String(text.to_string()));
                     }
                 }
             }
@@ -483,7 +362,7 @@ pub(crate) fn mcp_result_values(result: &serde_json::Value) -> Vec<serde_json::V
     values
 }
 
-pub(crate) fn extract_environment_records(values: &[serde_json::Value]) -> Vec<EnvironmentRecord> {
+pub(crate) fn extract_environment_records(values: &[Value]) -> Vec<EnvironmentRecord> {
     let mut records = Vec::new();
     for value in values {
         collect_environment_records(value, &mut records);
@@ -491,27 +370,24 @@ pub(crate) fn extract_environment_records(values: &[serde_json::Value]) -> Vec<E
     dedupe_environment_records(records)
 }
 
-pub(crate) fn collect_environment_records(
-    value: &serde_json::Value,
-    records: &mut Vec<EnvironmentRecord>,
-) {
+pub(crate) fn collect_environment_records(value: &Value, records: &mut Vec<EnvironmentRecord>) {
     match value {
-        serde_json::Value::Array(items) => {
+        Value::Array(items) => {
             for item in items {
                 collect_environment_records(item, records);
             }
         }
-        serde_json::Value::Object(map) => {
+        Value::Object(map) => {
             let id = map
                 .get("environmentId")
                 .or_else(|| map.get("environment_id"))
                 .or_else(|| map.get("id"))
-                .and_then(serde_json::Value::as_str);
+                .and_then(Value::as_str);
             let name = map
                 .get("environmentName")
                 .or_else(|| map.get("environment_name"))
                 .or_else(|| map.get("name"))
-                .and_then(serde_json::Value::as_str);
+                .and_then(Value::as_str);
             if let (Some(id), Some(name)) = (id, name) {
                 records.push(EnvironmentRecord {
                     id: id.to_string(),
@@ -539,7 +415,7 @@ pub(crate) fn dedupe_environment_records(
     deduped
 }
 
-pub(crate) fn extract_variable_names(values: &[serde_json::Value]) -> Vec<String> {
+pub(crate) fn extract_variable_names(values: &[Value]) -> Vec<String> {
     let mut names = Vec::new();
     for value in values {
         collect_strings_for_keys(
@@ -565,7 +441,7 @@ pub(crate) fn extract_variable_names(values: &[serde_json::Value]) -> Vec<String
     names
 }
 
-pub(crate) fn extract_mount_paths(values: &[serde_json::Value]) -> Vec<String> {
+pub(crate) fn extract_mount_paths(values: &[Value]) -> Vec<String> {
     let mut mounts = Vec::new();
     for value in values {
         collect_strings_for_keys(
@@ -580,10 +456,7 @@ pub(crate) fn extract_mount_paths(values: &[serde_json::Value]) -> Vec<String> {
     mounts
 }
 
-pub(crate) fn extract_first_string_for_keys(
-    values: &[serde_json::Value],
-    keys: &[&str],
-) -> Option<String> {
+pub(crate) fn extract_first_string_for_keys(values: &[Value], keys: &[&str]) -> Option<String> {
     let mut strings = Vec::new();
     for value in values {
         collect_strings_for_keys(value, keys, &mut strings);
@@ -591,20 +464,16 @@ pub(crate) fn extract_first_string_for_keys(
     strings.into_iter().next()
 }
 
-pub(crate) fn collect_strings_for_keys(
-    value: &serde_json::Value,
-    keys: &[&str],
-    out: &mut Vec<String>,
-) {
+pub(crate) fn collect_strings_for_keys(value: &Value, keys: &[&str], out: &mut Vec<String>) {
     match value {
-        serde_json::Value::Array(items) => {
+        Value::Array(items) => {
             for item in items {
                 collect_strings_for_keys(item, keys, out);
             }
         }
-        serde_json::Value::Object(map) => {
+        Value::Object(map) => {
             for key in keys {
-                if let Some(value) = map.get(*key).and_then(serde_json::Value::as_str) {
+                if let Some(value) = map.get(*key).and_then(Value::as_str) {
                     out.push(value.to_string());
                 }
             }
@@ -616,20 +485,16 @@ pub(crate) fn collect_strings_for_keys(
     }
 }
 
-pub(crate) fn collect_string_array_for_keys(
-    value: &serde_json::Value,
-    keys: &[&str],
-    out: &mut Vec<String>,
-) {
+pub(crate) fn collect_string_array_for_keys(value: &Value, keys: &[&str], out: &mut Vec<String>) {
     match value {
-        serde_json::Value::Array(items) => {
+        Value::Array(items) => {
             for item in items {
                 collect_string_array_for_keys(item, keys, out);
             }
         }
-        serde_json::Value::Object(map) => {
+        Value::Object(map) => {
             for key in keys {
-                if let Some(items) = map.get(*key).and_then(serde_json::Value::as_array) {
+                if let Some(items) = map.get(*key).and_then(Value::as_array) {
                     for item in items {
                         if let Some(text) = item.as_str() {
                             out.push(text.to_string());
@@ -642,12 +507,5 @@ pub(crate) fn collect_string_array_for_keys(
             }
         }
         _ => {}
-    }
-}
-
-pub(crate) fn mcp_error_summary(error: &serde_json::Value) -> String {
-    match error.get("code").and_then(serde_json::Value::as_i64) {
-        Some(code) => format!("server returned error code {code}"),
-        None => "server returned an error".to_string(),
     }
 }

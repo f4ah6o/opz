@@ -22,7 +22,8 @@ command types. Cross-module visibility stays `pub(crate)` or narrower.
 | --- | --- |
 | `cli` | clap declarations, parsing, command dispatch, and conversion to domain inputs |
 | `op` | 1Password item models, templates, item mutations, and git remote parsing used by item operations |
-| `mcp` | line-oriented JSON-RPC stdio transport and Developer Environment operations |
+| `mcp/client` | line-oriented JSON-RPC stdio transport, executable discovery, and safe connection diagnostics |
+| `mcp/environment` | Developer Environment domain actions and response metadata parsing |
 | `environment` | native `op run` Environment delegation and capability detection |
 | `resolver` | direct/fuzzy item lookup, repository auto-detection, and metadata-only caches |
 | `envfile` | env parsing, merge/render rules, temporary references, and persistent-file replacement |

@@ -4,7 +4,7 @@ use crate::*;
 #[command(author, version, about)]
 #[command(args_conflicts_with_subcommands = true)]
 pub(crate) struct Cli {
-    /// Vault name (optional). If omitted, search all items and pick best match.
+    /// Vault name for item-backed commands. Incompatible with `environment`.
     #[arg(long, global = true)]
     pub(crate) vault: Option<String>,
 
@@ -13,8 +13,8 @@ pub(crate) struct Cli {
     pub(crate) env_file: Option<PathBuf>,
 
     /// 1Password Environment name or ID for native op run injection
-    #[arg(long, alias = "environments", value_name = "ENV", global = true)]
-    pub(crate) environment: Vec<String>,
+    #[arg(long = "environment", alias = "environments", value_name = "ENV")]
+    pub(crate) run_environments: Vec<String>,
 
     #[command(subcommand)]
     pub(crate) cmd: Option<Cmd>,
@@ -129,6 +129,10 @@ pub(crate) enum Cmd {
         #[arg(long, value_name = "ENV")]
         env_file: Option<PathBuf>,
 
+        /// 1Password Environment name or ID for native op run injection
+        #[arg(long = "environment", alias = "environments", value_name = "ENV")]
+        environments: Vec<String>,
+
         /// Item titles
         #[arg(value_name = "ITEM", num_args = 1..)]
         items: Vec<String>,
@@ -203,6 +207,16 @@ pub(crate) enum EnvironmentCommand {
         environment: String,
     },
 
+    /// Add concealed placeholder variables without putting secret values in argv
+    Add {
+        /// Environment ID or exact name
+        environment: String,
+
+        /// Shell-compatible variable names to add with empty concealed values
+        #[arg(value_name = "NAME", num_args = 1..)]
+        variables: Vec<String>,
+    },
+
     /// Create a locally mounted .env file for a 1Password Environment
     Mount {
         /// Environment ID or exact name
@@ -217,6 +231,43 @@ pub(crate) enum EnvironmentCommand {
         /// Environment ID or exact name
         environment: String,
     },
+
+    /// List tool names advertised by the connected 1Password MCP server
+    Tools,
+}
+
+impl From<&EnvironmentCommand> for McpEnvironmentAction {
+    fn from(command: &EnvironmentCommand) -> Self {
+        match command {
+            EnvironmentCommand::List => Self::List,
+            EnvironmentCommand::Create { name } => Self::Create { name: name.clone() },
+            EnvironmentCommand::Rename {
+                environment,
+                new_name,
+            } => Self::Rename {
+                environment: environment.clone(),
+                new_name: new_name.clone(),
+            },
+            EnvironmentCommand::Variables { environment } => Self::Variables {
+                environment: environment.clone(),
+            },
+            EnvironmentCommand::Add {
+                environment,
+                variables,
+            } => Self::Add {
+                environment: environment.clone(),
+                variables: variables.clone(),
+            },
+            EnvironmentCommand::Mount { environment, path } => Self::Mount {
+                environment: environment.clone(),
+                path: path.clone(),
+            },
+            EnvironmentCommand::Mounts { environment } => Self::Mounts {
+                environment: environment.clone(),
+            },
+            EnvironmentCommand::Tools => Self::Tools,
+        }
+    }
 }
 
 pub(crate) fn run_cli(args: &[OsString]) -> Result<()> {
@@ -233,9 +284,9 @@ pub(crate) fn run_cli(args: &[OsString]) -> Result<()> {
         let _ = std::env::current_dir();
     });
     let context = ItemContext::from(&cli);
-    if !cli.environment.is_empty() && !matches!(cli.cmd, Some(Cmd::Run { .. }) | None) {
+    if cli.vault.is_some() && matches!(cli.cmd, Some(Cmd::Environment { .. })) {
         return Err(anyhow!(
-            "`--environment` is only supported with `opz run` or top-level command execution."
+            "`--vault` cannot be combined with `opz environment`; Developer Environments are account-scoped, not vault item lookups."
         ));
     }
 
@@ -265,7 +316,8 @@ pub(crate) fn run_cli(args: &[OsString]) -> Result<()> {
         }
         Some(Cmd::Doctor) => run_doctor(),
         Some(Cmd::Environment { account, command }) => {
-            run_environment_cli(account.as_deref(), command)
+            let action = McpEnvironmentAction::from(command);
+            run_environment_cli(account.as_deref(), &action)
         }
         Some(Cmd::Skills) => print_bundled_skill(),
         Some(Cmd::Show { with_item, items }) => show_item_labels(&context, items, *with_item),
@@ -288,6 +340,7 @@ pub(crate) fn run_cli(args: &[OsString]) -> Result<()> {
             items,
         }) => update_github_repositories_metadata(&context, repo, *dry_run, items),
         Some(Cmd::Run {
+            environments,
             items,
             env_file,
             command,
@@ -297,10 +350,10 @@ pub(crate) fn run_cli(args: &[OsString]) -> Result<()> {
                     "Command required after '--'. Usage: opz run [OPTIONS] [--env-file <ENV>] [--environment <ENV>] [<ITEM>...] -- <COMMAND>..."
                 ));
             }
-            if !cli.environment.is_empty() {
+            if !environments.is_empty() {
                 return run_with_environments(
                     cli.vault.as_deref(),
-                    &cli.environment,
+                    environments,
                     items,
                     env_file.as_deref(),
                     command,
@@ -343,10 +396,10 @@ pub(crate) fn run_cli(args: &[OsString]) -> Result<()> {
                     "Command required after '--'. Usage: opz [OPTIONS] [--env-file <ENV>] [--environment <ENV>] [<ITEM>...] -- <COMMAND>..."
                 ));
             }
-            if !cli.environment.is_empty() {
+            if !cli.run_environments.is_empty() {
                 return run_with_environments(
                     cli.vault.as_deref(),
-                    &cli.environment,
+                    &cli.run_environments,
                     &cli.items,
                     cli.env_file.as_deref(),
                     &cli.command,
@@ -431,7 +484,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dispatch_rejects_environment_for_non_run_command() {
+    fn parser_rejects_run_environment_option_for_find() {
         let args = [
             OsString::from("opz"),
             OsString::from("find"),
@@ -440,9 +493,8 @@ mod tests {
             OsString::from("query"),
         ];
         let error = run_cli(&args).unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "`--environment` is only supported with `opz run` or top-level command execution."
-        );
+        assert!(error
+            .to_string()
+            .contains("unexpected argument '--environment'"));
     }
 }

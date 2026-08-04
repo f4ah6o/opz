@@ -42,7 +42,11 @@ files, caches, and other users on the same machine are not secret channels.
   intentionally preserved and remain the user's responsibility.
 - 1Password Developer Environment operations MUST use MCP only for account and
   Environment management, variable names, and mount metadata. `opz` MUST NOT
-  request or print Environment variable values.
+  request or print Environment variable values. Placeholder creation may send
+  only validated variable names, an empty value, and `concealed=true`; real
+  values must be entered in 1Password.
+- Raw MCP stderr MUST NOT be relayed. Connection diagnostics may map recognized
+  permission or feature-disabled errors to fixed, non-secret hints.
 
 ## Safe usage
 

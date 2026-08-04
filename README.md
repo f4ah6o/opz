@@ -1,8 +1,8 @@
 # opz
 <!-- bdg:begin -->
 [![crates.io](https://img.shields.io/crates/v/opz.svg)](https://crates.io/crates/opz)
-[![license](https://img.shields.io/github/license/opz-rs/opz.svg)](https://github.com/opz-rs/opz)
-[![CI](https://github.com/opz-rs/opz/actions/workflows/ci.yaml/badge.svg)](https://github.com/opz-rs/opz/actions/workflows/ci.yaml)
+[![license](https://img.shields.io/github/license/f4ah6o/opz.svg)](https://github.com/f4ah6o/opz)
+[![CI](https://github.com/f4ah6o/opz/actions/workflows/ci.yaml/badge.svg)](https://github.com/f4ah6o/opz/actions/workflows/ci.yaml)
 <!-- bdg:end -->
 
 `opz` is a small wrapper around the 1Password CLI. It finds items, turns valid field labels into environment variables, and runs commands with those secrets injected.
@@ -13,6 +13,7 @@
 * Check `op` authentication, optional CLI dependencies, and plaintext `.env`-style credential files with `doctor`.
 * Show item field labels that are valid shell environment variable names.
 * Manage 1Password Developer Environments through the 1Password MCP server without printing secret values.
+* Add concealed placeholder variable names and inspect the MCP tools advertised by the installed server.
 * Run a command with secrets from one or more 1Password items, with repository-title auto-detection.
 * Delegate command execution to native 1Password Environments with `--environment` when your `op` CLI supports it.
 * Generate env files containing `op://...` references, preserving unrelated existing lines.
@@ -103,14 +104,18 @@ opz environment list
 opz environment create dev
 opz environment rename dev staging
 opz environment variables dev
+opz environment add dev API_TOKEN DB_URL
 opz environment mount dev .env.local
 opz environment mounts dev
+opz environment tools
 
 # Short alias
 opz env list
 ```
 
-`opz environment variables` prints variable names only. `opz environment mount` asks the MCP server to create a synced local `.env` mount; `opz` does not write secret values itself. Set `OPZ_1PASSWORD_MCP_COMMAND` if the MCP server executable is not named `onepassword-mcp`.
+`opz environment variables` prints variable names only. `opz environment add` creates empty, concealed placeholders, so secret values never appear in argv or `opz` output. Fill the values in the 1Password app. `opz environment mount` asks the MCP server to create a synced local `.env` mount; `opz` does not write secret values itself. `opz environment tools` prints the tool names returned by MCP `tools/list` without authenticating to an account.
+
+The official bundled executable is `1password-mcp`. `opz` also accepts the older `onepassword-mcp` name as a compatibility fallback. Set `OPZ_1PASSWORD_MCP_COMMAND` to use an explicit executable path and `OPZ_MCP_TIMEOUT_SECONDS` to change the 30-second MCP response timeout.
 
 ### Removed `create` Command
 
@@ -396,11 +401,11 @@ Install and authenticate [1Password CLI](https://developer.1password.com/docs/cl
 
 `github-secret` needs GitHub CLI (`gh`). `cloudflare-secret` needs Wrangler (`wrangler`). `migrate` and `note` need Git (`git`) when they read repository remotes.
 
-`opz environment` needs the 1Password MCP server as `onepassword-mcp`, or set `OPZ_1PASSWORD_MCP_COMMAND` to its executable path.
+`opz environment` uses the official `1password-mcp` executable bundled with supported 1Password desktop builds. Enable the local MCP server in **Settings > Labs > MCP Server** and **Settings > Developer > Integrate with MCP clients**. Set `OPZ_1PASSWORD_MCP_COMMAND` only when an explicit executable path is required.
 
 ## 1Password Environments and MCP
 
-`opz` complements 1Password Environments instead of replacing them. Use `opz environment` through the 1Password MCP server to create Environments, inspect variable names, and mount local `.env` files without exposing secret values to the agent. Use `opz run --environment <ENV> -- <COMMAND>` as repo-local command glue when native `op run` Environment injection is available. Keep item-backed `opz run`, `migrate`, `github-secret`, and `cloudflare-secret` for existing vault item workflows, repository-title auto-detection, and deploy secret sync.
+`opz` complements 1Password Environments instead of replacing them. Use `opz environment` through the 1Password MCP server to create Environments, inspect or add placeholder variable names, inspect server tools, and mount local `.env` files without exposing secret values to the agent. Use `opz run --environment <ENV> -- <COMMAND>` as repo-local command glue when native `op run` Environment injection is available. Keep item-backed `opz run`, `migrate`, `github-secret`, and `cloudflare-secret` for existing vault item workflows, repository-title auto-detection, and deploy secret sync.
 
 ## E2E Test
 

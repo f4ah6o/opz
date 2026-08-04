@@ -24,6 +24,7 @@ The following environment variables are currently documented user-facing
 interfaces:
 
 - `OPZ_1PASSWORD_MCP_COMMAND`;
+- `OPZ_MCP_TIMEOUT_SECONDS`;
 - `OPZ_OP_TIMEOUT_SECONDS`;
 - `OPZ_AUTODETECT_LEGACY_SCAN`.
 

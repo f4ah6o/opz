@@ -34,10 +34,9 @@ use std::{
     env,
     ffi::OsString,
     fs,
-    io::{BufRead, BufReader, Write},
+    io::Write,
     path::{Path, PathBuf},
-    process::{Child, ChildStdin, Command, Output, Stdio},
-    sync::mpsc::{self, Receiver, RecvTimeoutError},
+    process::{Child, Command, Output, Stdio},
     thread,
     time::{Duration, Instant, SystemTime},
 };

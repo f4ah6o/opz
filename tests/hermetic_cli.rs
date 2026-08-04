@@ -59,7 +59,7 @@ impl Harness {
             .env("XDG_CACHE_HOME", self.root.join("cache"))
             .env(
                 "OPZ_1PASSWORD_MCP_COMMAND",
-                tool_path(&self.bin, "onepassword-mcp"),
+                tool_path(&self.bin, "1password-mcp"),
             );
         command
     }
@@ -523,7 +523,7 @@ fn doctor_required_auth_failure_exits_one_with_diagnostic_on_stdout() {
 #[test]
 fn mcp_environment_list_uses_json_rpc_without_secret_values() {
     let mcp = Step {
-        tool: "onepassword-mcp".to_string(),
+        tool: "1password-mcp".to_string(),
         mcp_results: vec![
             serde_json::json!({"structuredContent": {"accountId": "A1"}}),
             serde_json::json!({"structuredContent": {"environments": [
@@ -533,7 +533,7 @@ fn mcp_environment_list_uses_json_rpc_without_secret_values() {
         ],
         ..Step::default()
     };
-    let harness = Harness::new(vec![mcp], &["onepassword-mcp"]);
+    let harness = Harness::new(vec![mcp], &["1password-mcp"]);
     let output = harness.output(&["environment", "list"]);
     assert_success(&output);
     assert_eq!(
@@ -548,6 +548,86 @@ fn mcp_environment_list_uses_json_rpc_without_secret_values() {
         request.pointer("/params/name").and_then(|v| v.as_str()) == Some("list_environments")
     }));
     assert!(!format!("{requests:?}").contains("secret-value"));
+}
+
+#[test]
+fn mcp_environment_tools_lists_advertised_tool_names_without_authentication() {
+    let mcp = Step {
+        tool: "1password-mcp".to_string(),
+        mcp_results: vec![serde_json::json!({"tools": [
+            {"name": "list_variables"},
+            {"name": "append_variables"}
+        ]})],
+        ..Step::default()
+    };
+    let harness = Harness::new(vec![mcp], &["1password-mcp"]);
+    let output = harness.output(&["environment", "tools"]);
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "append_variables\nlist_variables\n"
+    );
+    let requests = harness.mcp_requests(0);
+    assert!(requests.iter().any(|request| {
+        request.get("method").and_then(|value| value.as_str()) == Some("tools/list")
+    }));
+    assert!(!requests.iter().any(|request| {
+        request
+            .pointer("/params/name")
+            .and_then(|value| value.as_str())
+            == Some("authenticate")
+    }));
+}
+
+#[test]
+fn mcp_environment_add_sends_only_empty_concealed_placeholders() {
+    const CANARY: &str = "OPZ_MCP_SECRET_CANARY_92e8a4";
+    let mcp = Step {
+        tool: "1password-mcp".to_string(),
+        mcp_results: vec![
+            serde_json::json!({"structuredContent": {"environments": [
+                {"id": "E1", "name": "dev"}
+            ]}}),
+            serde_json::json!({"structuredContent": {"updated": true}}),
+        ],
+        ..Step::default()
+    };
+    let harness = Harness::new(vec![mcp], &["1password-mcp"]);
+    let mut command = harness.command();
+    command.env("OPZ_MCP_TEST_CANARY", CANARY);
+    let output = command
+        .args([
+            "environment",
+            "--account",
+            "A1",
+            "add",
+            "dev",
+            "API_TOKEN",
+            "DB_URL",
+        ])
+        .output()
+        .unwrap();
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "API_TOKEN\nDB_URL\n"
+    );
+    let requests = harness.mcp_requests(0);
+    let append = requests
+        .iter()
+        .find(|request| {
+            request
+                .pointer("/params/name")
+                .and_then(|value| value.as_str())
+                == Some("append_variables")
+        })
+        .expect("append_variables request");
+    assert_eq!(append["params"]["arguments"]["variables"][0]["value"], "");
+    assert_eq!(
+        append["params"]["arguments"]["variables"][0]["concealed"],
+        true
+    );
+    assert!(!format!("{requests:?}").contains(CANARY));
 }
 
 #[test]
@@ -625,7 +705,7 @@ fn secret_bearing_tool_failures_do_not_echo_canaries() {
 
     let mcp_harness = Harness::new(
         vec![Step {
-            tool: "onepassword-mcp".to_string(),
+            tool: "1password-mcp".to_string(),
             mcp_results: vec![
                 serde_json::json!({"structuredContent": {"accountId": "A1"}}),
                 serde_json::json!({"__error": {
@@ -636,7 +716,7 @@ fn secret_bearing_tool_failures_do_not_echo_canaries() {
             ],
             ..Step::default()
         }],
-        &["onepassword-mcp"],
+        &["1password-mcp"],
     );
     assert_canary_absent(
         &mcp_harness.output(&["environment", "list"]),

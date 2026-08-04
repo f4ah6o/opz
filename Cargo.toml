@@ -1,10 +1,10 @@
 [package]
 name = "opz"
-version = "2026.7.1"
+version = "2026.8.0"
 edition = "2021"
 description = "1Password CLI wrapper for seamless secret injection into commands"
 license = "MIT"
-repository = "https://github.com/opz-rs/opz"
+repository = "https://github.com/f4ah6o/opz"
 
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }{ archive-suffix }"
