@@ -10,6 +10,7 @@
 * 1Password MCP server 経由で、secret 値を表示せずに 1Password Developer Environments を管理します。
 * concealed placeholder 変数の追加と、server が公開する MCP tool 一覧の確認ができます。
 * 1 つ以上の 1Password アイテムから secret を取得してコマンドを実行します。repository title による item 自動検出にも対応します。
+* 公式 `opz-plugin` registry のintegrity pin済み declarative launch pluginを適用します。
 * `op` CLI が対応している場合、`--environment` で 1Password Environments の native injection に委譲してコマンドを実行します。
 * `op://...` 参照を含む env ファイルを生成し、既存ファイルの無関係な行は残します。
 * 既存 script を、明示 item や `.env` から repository title と metadata ベースの管理へ migrate できます。
@@ -111,6 +112,32 @@ opz env list
 `opz environment variables` は変数名だけを表示します。`opz environment add` は空文字の concealed placeholder を作成するため、secret 値を argv や `opz` の出力へ載せません。値は 1Password app で設定します。`opz environment mount` は MCP server に synced local `.env` mount の作成を依頼し、`opz` 自身は secret 値を書きません。`opz environment tools` は account 認証を行わず、MCP `tools/list` が返した tool 名を表示します。
 
 公式の bundled executable は `1password-mcp` です。互換性のため、旧名 `onepassword-mcp` も fallback として認識します。明示的な executable path を使う場合は `OPZ_1PASSWORD_MCP_COMMAND`、既定30秒の応答 timeout を変更する場合は `OPZ_MCP_TIMEOUT_SECONDS` を設定します。
+
+### Declarative Plugin
+
+`opz` は公式 `opz-plugin` registry のreview済みsnapshotを同梱します。plugin manifestは実行コードではなく宣言データです。許可されたtargetの選択、明示allowlistされたitem fieldの投影、検証済みargumentの追加、contained temporary config fileの生成だけを扱います。script、installer、hook、任意subprocess、wildcard secret accessは記述できません。
+
+```bash
+opz plugin list
+opz plugin show codex-openai@1.0.0
+opz plugin run codex-openai@1.0.0 --item owner/repo -- codex
+```
+
+pluginを使うitemはimmutableなregistry releaseをpinします:
+
+```text
+OPZ_PLUGIN_SCHEMA_VERSION=1
+OPZ_PLUGIN=codex-openai
+OPZ_PLUGIN_SOURCE=github:opz-rs/opz-plugin/plugins/codex-openai
+OPZ_PLUGIN_VERSION=1.0.0
+OPZ_PLUGIN_SHA256=89f1fd0e0ac35669a620a2ddce10230635ff432453930ee691858629bb2062ce
+OPZ_PLUGIN_CONFIG=
+OPENAI_API_KEY=<concealed field>
+```
+
+通常の `opz run` でも、選択itemが1件で `OPZ_PLUGIN` を持つ場合は自動適用します。plugin metadataはchild environmentへ渡しません。secretを解決する前に、registry digest、manifest schema、source/version pin、target allowlist、config type、secret allowlist、generated path containment、release lifecycleをruntimeで再検証します。revoked releaseは常に拒否し、deprecated releaseは `opz plugin run` の明示的な `--allow-deprecated` が必要です。
+
+`OPZ_PLUGIN_REGISTRY_DIR` には `registry.toml` と `plugins/.../plugin.toml` を含む明示的なlocal checkoutを指定できます。local entryも正確なSHA-256検証が必須で、network fetchや実行可能plugin codeは有効になりません。
 
 ### 削除済みの `create` コマンド
 

@@ -1,5 +1,6 @@
 use super::*;
 use clap::CommandFactory;
+use proptest::prelude::*;
 use std::collections::VecDeque;
 use std::fs;
 use tempfile::TempDir;
@@ -1715,6 +1716,7 @@ fn test_help_and_skill_cover_visible_commands() {
         "find",
         "doctor",
         "environment",
+        "plugin",
         "skills",
         "show",
         "gen",
@@ -1739,6 +1741,23 @@ fn test_help_and_skill_cover_visible_commands() {
         .clone();
     let environment_help = environment.render_long_help().to_string();
     assert!(!environment_help.contains("--environment <ENV>"));
+
+    let command = Cli::command();
+    let mut plugin = command
+        .find_subcommand("plugin")
+        .expect("plugin subcommand")
+        .clone();
+    let plugin_help = plugin.render_long_help().to_string();
+    for name in ["list", "show", "run"] {
+        assert!(
+            plugin_help.contains(name),
+            "plugin help is missing `{name}`"
+        );
+    }
+    assert!(OPZ_SKILL.contains("### `plugin`"));
+    assert!(OPZ_SKILL.contains("opz plugin list"));
+    assert!(OPZ_SKILL.contains("opz plugin show <NAME[@VERSION]>"));
+    assert!(OPZ_SKILL.contains("opz plugin run <NAME[@VERSION]>"));
 
     let command = Cli::command();
     let mut run = command
@@ -1786,6 +1805,7 @@ fn test_bundled_skill_has_expected_metadata() {
     assert!(OPZ_SKILL.contains("opz run [OPTIONS] [<ITEM>...] -- <COMMAND>..."));
     assert!(OPZ_SKILL.contains("opz github-secret [OPTIONS] <ITEM>..."));
     assert!(OPZ_SKILL.contains("opz cloudflare-secret [OPTIONS] <ITEM>..."));
+    assert!(OPZ_SKILL.contains("opz plugin list"));
     assert!(OPZ_SKILL.contains("opz skills"));
 }
 
@@ -2400,5 +2420,49 @@ fn test_cli_parse_legacy_env_positional_treated_as_item() {
             assert!(env_file.is_none());
         }
         _ => panic!("expected run command"),
+    }
+}
+
+proptest! {
+    #[test]
+    fn pbt_github_remote_formats_normalize_identically(
+        owner in "[A-Za-z0-9][A-Za-z0-9._-]{0,20}",
+        repository in "[A-Za-z0-9][A-Za-z0-9._-]{0,20}"
+    ) {
+        let expected = format!("{}/{}", owner.to_ascii_lowercase(), repository.to_ascii_lowercase());
+        let https = format!("https://github.com/{owner}/{repository}.git");
+        let ssh = format!("git@github.com:{owner}/{repository}.git");
+        let plain = format!("{owner}/{repository}");
+        prop_assert_eq!(normalize_github_repo_spec(&https), Some(expected.clone()));
+        prop_assert_eq!(normalize_github_repo_spec(&ssh), Some(expected.clone()));
+        prop_assert_eq!(normalize_github_repo_spec(&plain), Some(expected));
+    }
+
+    #[test]
+    fn pbt_merge_env_lines_is_unique_and_last_write_wins(
+        entries in prop::collection::vec(
+            ("[A-Z_][A-Z0-9_]{0,12}", "[a-zA-Z0-9._:/-]{0,24}"),
+            0..80
+        )
+    ) {
+        let sections = entries
+            .iter()
+            .enumerate()
+            .map(|(index, (key, value))| {
+                (format!("item-{index}"), vec![format!("{key}={value}")])
+            })
+            .collect::<Vec<_>>();
+        let merged = merge_env_lines(&sections);
+        let mut expected = HashMap::new();
+        for (key, value) in &entries {
+            expected.insert(key.clone(), value.clone());
+        }
+        let actual = merged
+            .iter()
+            .filter_map(|line| parse_env_line_kv(line))
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect::<HashMap<_, _>>();
+        prop_assert_eq!(merged.len(), actual.len());
+        prop_assert_eq!(actual, expected);
     }
 }

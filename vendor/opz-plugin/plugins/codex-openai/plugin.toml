@@ -1,0 +1,30 @@
+schema_version = 1
+name = "codex-openai"
+version = "1.0.0"
+description = "Run Codex with an ephemeral OpenAI API-key provider"
+target_commands = ["codex"]
+required_env = ["OPENAI_API_KEY"]
+secret_env_allowlist = ["OPENAI_API_KEY"]
+
+[env]
+CODEX_HOME = "{tmp}/codex-home"
+
+[files."{env.CODEX_HOME}/config.toml"]
+mode = "0600"
+content = """
+model_provider = "openai_api"
+
+[model_providers.openai_api]
+name = "OpenAI API"
+base_url = "https://api.openai.com/v1"
+env_key = "OPENAI_API_KEY"
+requires_openai_auth = false
+wire_api = "responses"
+
+[shell_environment_policy]
+exclude = ["OPENAI_API_KEY"]
+"""
+
+[doctor]
+required_commands = ["codex"]
+required_env = ["OPENAI_API_KEY"]

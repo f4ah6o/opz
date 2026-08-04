@@ -621,7 +621,7 @@ pub(crate) fn item_to_valid_labels(item: &ItemGet) -> Result<Vec<String>> {
 }
 
 pub(crate) fn is_metadata_label(label: &str) -> bool {
-    label.eq_ignore_ascii_case(GITHUB_REPOSITORIES_LABEL)
+    label.eq_ignore_ascii_case(GITHUB_REPOSITORIES_LABEL) || is_plugin_metadata_label(label)
 }
 
 /// Parse env line to extract key name (e.g., "KEY=value" -> "KEY")

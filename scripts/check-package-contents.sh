@@ -15,7 +15,14 @@ for required in \
     build.rs \
     .agents/skills/opz/SKILL.md \
     src/lib.rs \
-    src/main.rs
+    src/main.rs \
+    src/plugin.rs \
+    vendor/opz-plugin/LICENSE \
+    vendor/opz-plugin/README.md \
+    vendor/opz-plugin/registry.toml \
+    vendor/opz-plugin/plugins/claude-env/plugin.toml \
+    vendor/opz-plugin/plugins/codex-openai/plugin.toml \
+    vendor/opz-plugin/plugins/opencode-go-codex/plugin.toml
 do
     if ! grep -Fqx "$required" "$listing"; then
         echo "package is missing required file: $required" >&2

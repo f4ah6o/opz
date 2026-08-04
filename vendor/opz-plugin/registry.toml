@@ -1,0 +1,38 @@
+schema_version = 1
+
+[[plugins]]
+name = "claude-env"
+version = "1.0.0"
+source = "github:opz-rs/opz-plugin/plugins/claude-env"
+path = "plugins/claude-env/plugin.toml"
+sha256 = "e028456c0a9d69259482074c6884363ad1d92cdc3428d2f6fffc82db0b0b8f09"
+plugin_schema_version = 1
+lifecycle = "active"
+description = "Run Claude Code with an explicitly projected Anthropic API key"
+target_commands = ["claude"]
+min_opz_version = "0.1.0"
+
+[[plugins]]
+name = "codex-openai"
+version = "1.0.0"
+source = "github:opz-rs/opz-plugin/plugins/codex-openai"
+path = "plugins/codex-openai/plugin.toml"
+sha256 = "89f1fd0e0ac35669a620a2ddce10230635ff432453930ee691858629bb2062ce"
+plugin_schema_version = 1
+lifecycle = "active"
+description = "Run Codex with an ephemeral OpenAI API-key provider"
+target_commands = ["codex"]
+min_opz_version = "0.1.0"
+
+[[plugins]]
+name = "opencode-go-codex"
+version = "0.1.0"
+source = "github:opz-rs/opz-plugin/plugins/opencode-go-codex"
+path = "plugins/opencode-go-codex/plugin.toml"
+sha256 = "6ceaf9684aa4697d39f83a9aa2a53600b5a72de32b4fde78a2b2368f6983182f"
+plugin_schema_version = 1
+lifecycle = "revoked"
+description = "Compatibility record for Codex with OpenCode Go"
+target_commands = ["codex"]
+min_opz_version = "0.1.0"
+revocation_reason = "Codex supports Responses only; OpenCode Go currently documents chat-completions/messages endpoints for its models."

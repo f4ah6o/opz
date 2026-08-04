@@ -1,11 +1,11 @@
 ---
 name: opz
-description: Use the opz CLI to search 1Password items, inspect valid env labels, manage 1Password Developer Environments through MCP, add concealed placeholder variables, inspect MCP tools, diagnose op and dependency status, generate env files, migrate scripts to repository item titles and metadata, store private files as notes, store GitHub repository secrets, store Cloudflare Worker secrets, and run commands with item-backed or 1Password Environment-backed secret injection.
+description: Use the opz CLI to search 1Password items, inspect valid env labels, manage 1Password Developer Environments through MCP, run integrity-pinned declarative plugins, diagnose dependencies, generate env files, migrate repository metadata, export deploy secrets, and run commands with item-backed or Environment-backed secret injection.
 ---
 
 # opz
 
-Use this skill when you need to work with 1Password-backed secrets through the `opz` CLI. `opz` reads item metadata from `op`, builds `op://<vault_id>/<item_id>/<field>` references for valid env labels, and can resolve those references while running another command. When using 1Password Environments, `opz run --environment <ENV> -- <COMMAND>` delegates to native `op run` so `opz` does not read Environment secret values. `opz environment` uses the 1Password MCP server for Environment management, variable-name inspection, and local `.env` mounts without printing secret values.
+Use this skill when you need to work with 1Password-backed secrets through the `opz` CLI. `opz` reads item metadata from `op`, builds `op://<vault_id>/<item_id>/<field>` references for valid env labels, and can resolve those references while running another command. When using 1Password Environments, `opz run --environment <ENV> -- <COMMAND>` delegates to native `op run` so `opz` does not read Environment secret values. `opz environment` uses the 1Password MCP server for Environment management, variable-name inspection, and local `.env` mounts without printing secret values. `opz plugin` consumes digest-verified declarative releases from the bundled `opz-plugin` registry; item metadata pins source, version, and SHA-256 before any secret is resolved.
 
 ## Prerequisites
 
@@ -61,6 +61,18 @@ opz environment [--account <ACCOUNT_ID>] mounts <ENVIRONMENT>
 opz environment tools
 opz env list
 ```
+
+### `plugin`
+
+List, inspect, and run declarative launch plugins. A run requires exactly one item with `OPZ_PLUGIN_SCHEMA_VERSION`, `OPZ_PLUGIN`, `OPZ_PLUGIN_SOURCE`, `OPZ_PLUGIN_VERSION`, and `OPZ_PLUGIN_SHA256`. `OPZ_PLUGIN_CONFIG` is an optional flat scalar TOML table. Plugin metadata is not forwarded as environment variables. Revoked releases are blocked; deprecated releases need `--allow-deprecated`.
+
+```bash
+opz plugin list
+opz plugin show <NAME[@VERSION]>
+opz plugin run <NAME[@VERSION]> [--item <ITEM>] [--allow-deprecated] -- <COMMAND>...
+```
+
+Normal `opz run` auto-applies a pinned plugin when exactly one selected item declares `OPZ_PLUGIN`. The runtime validates digest, lifecycle, target, config, exact secret allowlist, temporary-file mode, and workspace containment before launch. `OPZ_PLUGIN_REGISTRY_DIR` may select an explicit local registry checkout, but manifests remain data-only and digest-verified.
 
 ### `gen`
 
@@ -168,7 +180,8 @@ opz skills
 - `opz environment add` sends only variable names, empty values, and `concealed=true` to `append_variables`; set real values in the 1Password app.
 - `opz environment tools` lists the tool names advertised by the connected server and does not authenticate to a 1Password account.
 - `opz environment mount` creates a synced local `.env` mount through the MCP server. `opz` does not write secret values itself.
-- `github_repositories` is metadata, not an env label or deployable secret.
+- `github_repositories` and all `OPZ_PLUGIN*` fields are metadata, not env labels or deployable secrets.
+- Plugin runs project only `secret_env_allowlist` fields and use a private temporary workspace; revoked plugins never run.
 - `cloudflare-secret` also uses later-item-wins and passes a JSON payload to `wrangler secret bulk` through stdin.
 - `cloudflare-secret` supports `--name`, `--env`, and `--config` for Wrangler target selection.
 - `gen` stdout uses `op://<vault_id>/<item_id>/<field>` references, not resolved secret values.
@@ -186,8 +199,9 @@ opz skills
 4. Use `opz run ... -- <COMMAND>` for the normal file-free workflow.
 5. Use `opz run --environment <ENV> -- <COMMAND>` when the project is managed through 1Password Environments and the local `op` CLI supports native Environment injection.
 6. Use `opz environment list`, `opz environment variables <ENV>`, `opz environment add <ENV> <NAME>...`, `opz environment tools`, and `opz environment mount <ENV> .env.local` when managing 1Password Developer Environments through MCP.
-7. Use `opz gen --env-file ...` only when another tool needs `op://` references in a file.
-8. Use `opz migrate --dry-run` to preview script migration, then `opz migrate`, `opz migrate --new`, or `opz migrate --restore`.
-9. Use `opz github-repo --dry-run ...` to manually add repository metadata for older items.
-10. Use `opz github-secret --dry-run ...` before writing GitHub repository secrets.
-11. Use `opz cloudflare-secret --dry-run ...` before writing Cloudflare Worker secrets.
+7. Use `opz plugin list` and `opz plugin show <NAME[@VERSION]>` before pinning a release; use `opz plugin run ...` for an explicit plugin launch.
+8. Use `opz gen --env-file ...` only when another tool needs `op://` references in a file.
+9. Use `opz migrate --dry-run` to preview script migration, then `opz migrate`, `opz migrate --new`, or `opz migrate --restore`.
+10. Use `opz github-repo --dry-run ...` to manually add repository metadata for older items.
+11. Use `opz github-secret --dry-run ...` before writing GitHub repository secrets.
+12. Use `opz cloudflare-secret --dry-run ...` before writing Cloudflare Worker secrets.

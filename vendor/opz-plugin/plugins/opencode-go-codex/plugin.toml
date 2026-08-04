@@ -1,0 +1,49 @@
+schema_version = 1
+name = "opencode-go-codex"
+version = "0.1.0"
+description = "Compatibility record for Codex with OpenCode Go"
+target_commands = ["codex"]
+required_env = ["OPENCODE_GO_API_KEY"]
+secret_env_allowlist = ["OPENCODE_GO_API_KEY"]
+
+[config.model]
+type = "string"
+required = false
+default = "kimi-k2.7-code"
+description = "OpenCode Go model identifier"
+pattern = "^[a-z0-9][a-z0-9._-]{0,127}$"
+
+[config.base_url]
+type = "string"
+required = false
+default = "https://opencode.ai/zen/go/v1"
+description = "OpenCode Go API base URL"
+enum = ["https://opencode.ai/zen/go/v1"]
+
+[defaults]
+model = "kimi-k2.7-code"
+base_url = "https://opencode.ai/zen/go/v1"
+
+[env]
+CODEX_HOME = "{tmp}/codex-home"
+
+[files."{env.CODEX_HOME}/config.toml"]
+mode = "0600"
+content = """
+model = "{config.model}"
+model_provider = "opencode_go"
+
+[model_providers.opencode_go]
+name = "OpenCode Go"
+base_url = "{config.base_url}"
+env_key = "OPENCODE_GO_API_KEY"
+requires_openai_auth = false
+wire_api = "responses"
+
+[shell_environment_policy]
+exclude = ["OPENCODE_GO_API_KEY"]
+"""
+
+[doctor]
+required_commands = ["codex"]
+required_env = ["OPENCODE_GO_API_KEY"]

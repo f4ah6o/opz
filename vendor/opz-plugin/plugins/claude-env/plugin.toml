@@ -1,0 +1,11 @@
+schema_version = 1
+name = "claude-env"
+version = "1.0.0"
+description = "Run Claude Code with an explicitly projected Anthropic API key"
+target_commands = ["claude"]
+required_env = ["ANTHROPIC_API_KEY"]
+secret_env_allowlist = ["ANTHROPIC_API_KEY"]
+
+[doctor]
+required_commands = ["claude"]
+required_env = ["ANTHROPIC_API_KEY"]

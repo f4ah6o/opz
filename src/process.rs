@@ -1,18 +1,12 @@
 use crate::*;
 
-pub(crate) fn run_with_items(
-    context: &ItemContext,
-    items: &[String],
+pub(crate) fn run_with_item_sections(
+    sections: &ItemSections,
     env_file: Option<&Path>,
     command: &[String],
 ) -> Result<()> {
-    let sections = instrumentation::with_span_result(
-        "load_inputs",
-        vec![KeyValue::new("item.count", items.len() as i64)],
-        || collect_item_env_sections(context, items),
-    )?;
     let merged_env_lines =
-        instrumentation::with_span("main_operation", vec![], || merge_env_lines(&sections));
+        instrumentation::with_span("main_operation", vec![], || merge_env_lines(sections));
 
     instrumentation::with_span_result(
         "write_outputs",

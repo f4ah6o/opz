@@ -1,6 +1,6 @@
 [package]
 name = "opz"
-version = "2026.8.0"
+version = "2026.8.1"
 edition = "2021"
 description = "1Password CLI wrapper for seamless secret injection into commands"
 license = "MIT"
@@ -25,9 +25,12 @@ clap = { version = "4.5.53", default-features = false, features = ["derive", "st
 regex = "1.12.2"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.147"
+sha2 = "0.10.9"
+tempfile = "3.24.0"
+toml = "0.8.23"
 
 [dev-dependencies]
-tempfile = "3.24.0"
+proptest = "1.11.0"
 
 [[bin]]
 name = "opz-test-tool"

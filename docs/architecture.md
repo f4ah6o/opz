@@ -31,12 +31,15 @@ command types. Cross-module visibility stays `pub(crate)` or narrower.
 | `targets` | GitHub/Cloudflare validation, argv construction, stdin delivery, and redacted output relay |
 | `doctor` | required/optional tool checks, authentication checks, credential-file discovery, and rendering |
 | `process` | child command construction, secret environment injection, captured commands, and timeouts |
+| `plugin` | bundled/local registry loading, SHA-256 and lifecycle validation, item pinning, typed config, contained rendering, and plugin target launch |
 | `security` | `SecretValue`, longest-match `Redactor`, and masked create output |
 | `skill` | compile-time bundled `.agents/skills/opz/SKILL.md` |
 | `instrumentation` | telemetry seam; currently records no external telemetry |
 
 Shared unit coverage is in `src/tests.rs`; narrowly scoped module tests live
-with `cli`, `process`, and `security`. `tests/hermetic_cli.rs` exercises the
+with `cli`, `process`, `plugin`, and `security`. Property-based tests use
+`proptest` to exercise repository normalization, last-write-wins env merging,
+plugin identifiers, template rendering, and generated-path containment. `tests/hermetic_cli.rs` exercises the
 compiled binary using `CARGO_BIN_EXE_*` and a feature-gated fake-tool binary.
 The real-account test remains opt-in in `tests/e2e_real_op.rs`.
 
@@ -47,6 +50,11 @@ The real-account test remains opt-in in `tests/e2e_real_op.rs`.
 construction belongs in the owning adapter or in `process`; secret-bearing
 capture and relay must use `security`. See [security.md](security.md) for the
 trust model.
+
+The official plugin registry snapshot under `vendor/opz-plugin` is compiled into
+the binary. `OPZ_PLUGIN_REGISTRY_DIR` is an explicit local data override; every
+manifest remains declarative and is re-hashed and revalidated before use. No
+plugin manifest is fetched from the network at runtime.
 
 The item-list and legacy repository caches are implementation details. They may
 store IDs, titles, vault metadata, normalized repository metadata, and

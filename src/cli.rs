@@ -58,6 +58,12 @@ pub(crate) enum Cmd {
     /// Print bundled Agent Skills SKILL.md for opz
     Skills,
 
+    /// List, inspect, and run declarative launch profile plugins
+    Plugin {
+        #[command(subcommand)]
+        command: PluginCommand,
+    },
+
     /// Show valid env labels from 1Password items
     Show {
         /// Show item title header for each section
@@ -320,6 +326,7 @@ pub(crate) fn run_cli(args: &[OsString]) -> Result<()> {
             run_environment_cli(account.as_deref(), &action)
         }
         Some(Cmd::Skills) => print_bundled_skill(),
+        Some(Cmd::Plugin { command }) => run_plugin_cli(&context, command),
         Some(Cmd::Show { with_item, items }) => show_item_labels(&context, items, *with_item),
         Some(Cmd::Gen { items, env_file }) => {
             print_credential_file_advice_for_secret_command("gen");
@@ -361,7 +368,12 @@ pub(crate) fn run_cli(args: &[OsString]) -> Result<()> {
             }
             print_credential_file_advice_for_secret_command("run");
             let resolved_items = resolve_run_items(&context, items)?;
-            run_with_items(&context, &resolved_items, env_file.as_deref(), command)
+            run_with_items_plugin_aware(
+                &context,
+                &resolved_items,
+                env_file.as_deref(),
+                command,
+            )
         }
         Some(Cmd::GithubSecret {
             repo,
@@ -407,7 +419,7 @@ pub(crate) fn run_cli(args: &[OsString]) -> Result<()> {
             }
             print_credential_file_advice_for_secret_command("run");
             let resolved_items = resolve_run_items(&context, &cli.items)?;
-            run_with_items(
+            run_with_items_plugin_aware(
                 &context,
                 &resolved_items,
                 cli.env_file.as_deref(),
@@ -462,6 +474,7 @@ pub(crate) fn detect_command_hint(args: &[OsString]) -> &'static str {
             "find" => "find",
             "doctor" => "doctor",
             "environment" | "env" => "environment",
+            "plugin" => "plugin",
             "skills" => "skills",
             "show" => "show",
             "gen" => "gen",

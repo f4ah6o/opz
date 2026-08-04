@@ -18,7 +18,10 @@ The following are stable once documented in CLI help, `README.md`, or
 - persistent env-file merge behavior and the metadata-only property of caches.
 
 The bundled `.agents/skills/opz/SKILL.md` describes the same supported CLI and
-must stay synchronized with both READMEs and clap help.
+must stay synchronized with both READMEs and clap help. The `plugin` command,
+`NAME[@VERSION]` selector, lifecycle behavior, and item pin field names are part
+of that stable surface. Individual registry releases remain immutable data and
+are versioned independently in `opz-plugin`.
 
 The following environment variables are currently documented user-facing
 interfaces:
@@ -26,7 +29,8 @@ interfaces:
 - `OPZ_1PASSWORD_MCP_COMMAND`;
 - `OPZ_MCP_TIMEOUT_SECONDS`;
 - `OPZ_OP_TIMEOUT_SECONDS`;
-- `OPZ_AUTODETECT_LEGACY_SCAN`.
+- `OPZ_AUTODETECT_LEGACY_SCAN`;
+- `OPZ_PLUGIN_REGISTRY_DIR`.
 
 Test-only controls such as `OPZ_E2E` and fake-tool protocol variables are not
 user-facing interfaces. Undocumented implementation controls are internal.

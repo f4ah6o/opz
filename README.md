@@ -15,6 +15,7 @@
 * Manage 1Password Developer Environments through the 1Password MCP server without printing secret values.
 * Add concealed placeholder variable names and inspect the MCP tools advertised by the installed server.
 * Run a command with secrets from one or more 1Password items, with repository-title auto-detection.
+* Apply integrity-pinned declarative launch plugins from the official `opz-plugin` registry.
 * Delegate command execution to native 1Password Environments with `--environment` when your `op` CLI supports it.
 * Generate env files containing `op://...` references, preserving unrelated existing lines.
 * Migrate scripts from explicit items or `.env` files to repository metadata.
@@ -116,6 +117,32 @@ opz env list
 `opz environment variables` prints variable names only. `opz environment add` creates empty, concealed placeholders, so secret values never appear in argv or `opz` output. Fill the values in the 1Password app. `opz environment mount` asks the MCP server to create a synced local `.env` mount; `opz` does not write secret values itself. `opz environment tools` prints the tool names returned by MCP `tools/list` without authenticating to an account.
 
 The official bundled executable is `1password-mcp`. `opz` also accepts the older `onepassword-mcp` name as a compatibility fallback. Set `OPZ_1PASSWORD_MCP_COMMAND` to use an explicit executable path and `OPZ_MCP_TIMEOUT_SECONDS` to change the 30-second MCP response timeout.
+
+### Declarative Plugins
+
+`opz` vendors a reviewed snapshot of the official `opz-plugin` registry. Plugin manifests are declarative data: they can select an allowed target, project explicitly allowlisted item fields, add validated arguments, and create contained temporary configuration files. They cannot contain scripts, installers, hooks, arbitrary subprocesses, or wildcard secret access.
+
+```bash
+opz plugin list
+opz plugin show codex-openai@1.0.0
+opz plugin run codex-openai@1.0.0 --item owner/repo -- codex
+```
+
+A plugin-backed item pins one immutable registry release:
+
+```text
+OPZ_PLUGIN_SCHEMA_VERSION=1
+OPZ_PLUGIN=codex-openai
+OPZ_PLUGIN_SOURCE=github:opz-rs/opz-plugin/plugins/codex-openai
+OPZ_PLUGIN_VERSION=1.0.0
+OPZ_PLUGIN_SHA256=89f1fd0e0ac35669a620a2ddce10230635ff432453930ee691858629bb2062ce
+OPZ_PLUGIN_CONFIG=
+OPENAI_API_KEY=<concealed field>
+```
+
+Normal `opz run` automatically applies the pin when exactly one selected item contains `OPZ_PLUGIN`. Plugin metadata is never projected to the child environment. The runtime rechecks the registry digest, manifest schema, source/version pin, target allowlist, config types, secret allowlist, generated path containment, and release lifecycle before resolving a secret. Revoked releases never run; deprecated releases require the explicit `--allow-deprecated` flag on `opz plugin run`.
+
+`OPZ_PLUGIN_REGISTRY_DIR` may point to an explicit local checkout containing `registry.toml` and `plugins/.../plugin.toml`. Local entries still require exact SHA-256 verification and do not enable network fetching or executable plugin code.
 
 ### Removed `create` Command
 

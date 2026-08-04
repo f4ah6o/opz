@@ -19,6 +19,8 @@ mod targets;
 pub(crate) use targets::*;
 mod process;
 pub(crate) use process::*;
+mod plugin;
+pub(crate) use plugin::*;
 mod security;
 pub(crate) use security::*;
 mod skill;

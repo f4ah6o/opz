@@ -47,6 +47,10 @@ files, caches, and other users on the same machine are not secret channels.
   values must be entered in 1Password.
 - Raw MCP stderr MUST NOT be relayed. Connection diagnostics may map recognized
   permission or feature-disabled errors to fixed, non-secret hints.
+- Plugin manifests MUST remain declarative data. Registry and item source, version, schema, lifecycle, and SHA-256 pins MUST be checked before secret resolution. Revoked releases MUST NOT run; deprecated releases require explicit consent.
+- Plugin execution MUST request only exact `secret_env_allowlist` fields. `OPZ_PLUGIN*` item metadata MUST NOT enter the child environment, arguments, generated files, caches, or diagnostics.
+- Plugin templates MUST use only `{tmp}`, declared `{config.*}`, and declared generated `{env.*}` placeholders. Generated paths MUST remain below a private mode-`0700` workspace; files MUST use allowlisted restrictive modes and create-new semantics.
+- Plugin target argv MUST contain only user arguments and validated manifest arguments. Secret values MUST NOT be rendered into arguments or files. The plugin child receives a policy-limited ambient baseline instead of the full parent environment.
 
 ## Safe usage
 

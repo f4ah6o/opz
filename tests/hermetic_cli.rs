@@ -91,6 +91,20 @@ fn step(tool: &str, args: &[&str], stdout: &str) -> Step {
     }
 }
 
+fn plugin_item_json(title: &str) -> String {
+    format!(
+        r#"{{"id":"item-id","title":"{title}","vault":{{"id":"vault-id","name":"Private"}},"fields":[
+            {{"label":"OPZ_PLUGIN_SCHEMA_VERSION","value":"1"}},
+            {{"label":"OPZ_PLUGIN","value":"codex-openai"}},
+            {{"label":"OPZ_PLUGIN_SOURCE","value":"github:opz-rs/opz-plugin/plugins/codex-openai"}},
+            {{"label":"OPZ_PLUGIN_VERSION","value":"1.0.0"}},
+            {{"label":"OPZ_PLUGIN_SHA256","value":"89f1fd0e0ac35669a620a2ddce10230635ff432453930ee691858629bb2062ce"}},
+            {{"label":"OPZ_PLUGIN_CONFIG","value":""}},
+            {{"label":"OPENAI_API_KEY","value":"concealed"}}
+        ]}}"#
+    )
+}
+
 fn item_json(title: &str) -> String {
     format!(
         r#"{{"id":"item-id","title":"{title}","vault":{{"id":"vault-id","name":"Private"}},"fields":[{{"label":"API_KEY","value":"concealed"}}]}}"#
@@ -190,6 +204,64 @@ fn item_run_and_top_level_shorthand_use_env_without_secret_argv() {
         );
         assert!(!format!("{:?}", invocation.args).contains("canary-secret"));
     }
+}
+
+#[test]
+fn plugin_run_projects_only_allowlisted_secret_and_generated_environment() {
+    let batch_args = [
+        "run",
+        "--no-masking",
+        "--env-file",
+        "*",
+        "--",
+        "sh",
+        "-c",
+        "env -0",
+    ];
+    let mut target = step("codex", &["exec", "task"], "");
+    target.capture_env = vec![
+        "OPENAI_API_KEY".to_string(),
+        "CODEX_HOME".to_string(),
+        "OPZ_PLUGIN".to_string(),
+        "OPZ_PLUGIN_SHA256".to_string(),
+    ];
+    let harness = Harness::new(
+        vec![
+            step(
+                "op",
+                &["item", "get", "example", "--format", "json"],
+                &plugin_item_json("example"),
+            ),
+            step("op", &batch_args, "OPENAI_API_KEY=plugin-canary\0"),
+            target,
+        ],
+        &["op", "codex"],
+    );
+
+    let output = harness.output(&[
+        "plugin",
+        "run",
+        "codex-openai@1.0.0",
+        "--item",
+        "example",
+        "--",
+        "codex",
+        "exec",
+        "task",
+    ]);
+    assert_success(&output);
+
+    let invocation = harness.invocation(2);
+    assert_eq!(invocation.args, ["exec", "task"]);
+    assert_eq!(
+        invocation.env.get("OPENAI_API_KEY").map(String::as_str),
+        Some("plugin-canary")
+    );
+    let codex_home = invocation.env.get("CODEX_HOME").expect("CODEX_HOME");
+    assert!(codex_home.contains("opz-plugin-"));
+    assert!(!invocation.env.contains_key("OPZ_PLUGIN"));
+    assert!(!invocation.env.contains_key("OPZ_PLUGIN_SHA256"));
+    assert!(!format!("{:?}", invocation.args).contains("plugin-canary"));
 }
 
 #[test]
