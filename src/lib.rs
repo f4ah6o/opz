@@ -5,6 +5,8 @@ mod mcp;
 pub(crate) use mcp::*;
 mod doctor;
 pub(crate) use doctor::*;
+mod cloudflare;
+pub(crate) use cloudflare::*;
 mod resolver;
 pub(crate) use resolver::*;
 mod migration;

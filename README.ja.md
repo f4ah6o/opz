@@ -16,6 +16,7 @@
 * 既存 script を、明示 item や `.env` から repository title と metadata ベースの管理へ migrate できます。
 * private 設定ファイルを Secure Note として保存します。
 * 有効なアイテムフィールドを GitHub repository secrets に保存し、item 側の repository metadata があれば誤配を防ぎます。
+* Cloudflare API token、Worker secrets、redact済みAPI responseを1Passwordへ取り込みます。
 * 有効なアイテムフィールドを Wrangler 経由で Cloudflare Worker secrets に保存します。
 * bundled `opz` Agent Skill を出力します。
 * fuzzy lookup と legacy migration path 用に、アイテムリストと repository metadata を 60 秒キャッシュします。
@@ -345,6 +346,42 @@ opz github-secret --repo owner/repo my-service shared-secrets
 `github-secret` は `gen` や `run` と同じ有効フィールドラベルを使います。複数 item で同名がある場合は後勝ちです。Secret 値はメモリ上で解決し、`gh secret set` の stdin に渡します。値を表示したりコマンド引数に載せたりしません。GitHub が予約しているため、`GITHUB_` で始まる名前は拒否します。
 
 選択した 1Password item に `github_repositories` フィールドがある場合、保存先 repository はその `owner/repo` 一覧のいずれかと一致する必要があります。一覧は改行またはカンマ区切りで複数指定できます。この metadata がない item は従来通り利用できますが、repository guard を適用できないため警告を表示します。
+
+### Cloudflare credential と API response を取り込む
+
+secret値をargv、設定ファイル、ログへ載せず、Cloudflare関連データをexact-titleの1Password itemへ保存します:
+
+```bash
+opz cloudflare-credential --preset <PRESET> --item <ITEM> [OPTIONS] --stdin
+opz cloudflare-credential --preset <PRESET> --item <ITEM> [OPTIONS] --file <JSON>
+opz cloudflare-credential --preset <PRESET> --item <ITEM> [OPTIONS] -- <COMMAND>...
+```
+
+Preset:
+* `api-token` - 1つのAPI tokenをconcealed fieldへ保存します。既定sectionは`Cloudflare`、fieldは`CLOUDFLARE_API_TOKEN`です。
+* `worker-secret` - 1つのsecret、またはJSON objectのtop-level keyを複数のconcealed fieldとして保存します。既定sectionは`Worker Secrets`です。
+* `api-response` - JSON responseをconcealed fieldへ保存します。既定では`Authorization`、`Cookie`、token/secret/key系fieldを再帰的に`[REDACTED]`へ置換します。
+
+Options:
+* `--mode <create|update|upsert>` - item作成方針。既定は`upsert`です。
+* `--vault <NAME>` - exact item lookupと書き込み先vaultを限定します。
+* `--section <SECTION>` / `--field <FIELD>` - presetの保存先labelを上書きします。
+* `--raw` - API responseのredactを無効化します。他presetでは拒否され、未加工responseを保持する必要がある場合だけ使います。
+* `--dry-run` - 入力をparse・検証し、create/update判定と保存先referenceだけを表示します。
+
+例:
+```bash
+# stdinからAPI tokenを保存
+printf '%s' "$CLOUDFLARE_API_TOKEN" |   opz cloudflare-credential --preset api-token --item cloudflare-prod --stdin
+
+# JSON fileから複数Worker secretsを保存
+opz cloudflare-credential --preset worker-secret --item worker-prod   --section production --file worker-secrets.json
+
+# command outputのCloudflare API responseをredactして保存
+opz cloudflare-credential --preset api-response --item cloudflare-audit   --field zones -- cloudflare-client zones list --json
+```
+
+Create/updateは完全な1Password JSON item templateを`op item create`または`op item edit`のstdinへ渡します。保存fieldはconcealed typeです。成功時は`op://<vault_id>/<item_id>/<section_id>/<field_id>`だけを表示し、取り込んだ値は表示しません。入力commandが失敗した場合もcredential漏えい防止のためstderr本文を表示しません。入力上限は16 MiBです。
 
 ### Cloudflare Worker Secrets に保存
 

@@ -2209,6 +2209,67 @@ fn test_cli_parse_github_repo() {
 }
 
 #[test]
+fn test_cli_parse_cloudflare_credential() {
+    let cli = Cli::try_parse_from([
+        "opz",
+        "cloudflare-credential",
+        "--vault",
+        "Private",
+        "--preset",
+        "api-response",
+        "--mode",
+        "update",
+        "--item",
+        "cloudflare-api",
+        "--section",
+        "Audit",
+        "--field",
+        "zones",
+        "--raw",
+        "--dry-run",
+        "--",
+        "cloudflare-client",
+        "zones",
+        "list",
+    ])
+    .unwrap();
+    assert_eq!(cli.vault.as_deref(), Some("Private"));
+    match cli.cmd {
+        Some(Cmd::CloudflareCredential {
+            preset,
+            mode,
+            item,
+            section,
+            field,
+            stdin,
+            file,
+            raw,
+            dry_run,
+            command,
+        }) => {
+            assert_eq!(preset, CloudflareCredentialPreset::ApiResponse);
+            assert_eq!(mode, CloudflareCredentialMode::Update);
+            assert_eq!(item, "cloudflare-api");
+            assert_eq!(section.as_deref(), Some("Audit"));
+            assert_eq!(field.as_deref(), Some("zones"));
+            assert!(!stdin);
+            assert!(file.is_none());
+            assert!(raw);
+            assert!(dry_run);
+            assert_eq!(
+                command,
+                vec![
+                    "cloudflare-client".to_string(),
+                    "zones".to_string(),
+                    "list".to_string()
+                ]
+            );
+        }
+        _ => panic!("expected cloudflare-credential command"),
+    }
+}
+
+#[test]
 fn test_cli_parse_cloudflare_secret() {
     let cli = Cli::try_parse_from([
         "opz",

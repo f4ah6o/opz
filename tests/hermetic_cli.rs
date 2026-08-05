@@ -68,6 +68,27 @@ impl Harness {
         self.command().args(args).output().unwrap()
     }
 
+    fn output_with_stdin(&self, args: &[&str], input: &str) -> Output {
+        use std::io::Write;
+        use std::process::Stdio;
+
+        let mut child = self
+            .command()
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    }
+
     fn invocation(&self, index: usize) -> Invocation {
         serde_json::from_slice(&fs::read(self.logs.join(format!("{index:03}.json"))).unwrap())
             .unwrap()
@@ -825,4 +846,169 @@ fn op_timeout_is_deterministic() {
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&output.stderr).contains("timed out after 1 seconds"));
+}
+
+#[test]
+fn cloudflare_credential_create_uses_template_stdin_and_emits_only_reference() {
+    let mut missing = step(
+        "op",
+        &[
+            "item",
+            "get",
+            "cloudflare-prod",
+            "--format",
+            "json",
+            "--vault",
+            "Private",
+        ],
+        "",
+    );
+    missing.exit_code = 1;
+    missing.stderr = "not found".to_string();
+    let mut create = step(
+        "op",
+        &["item", "create", "--vault", "Private", "--format=json", "-"],
+        r#"{"id":"item-id","title":"cloudflare-prod","vault":{"id":"vault-id","name":"Private"},"sections":[{"id":"cloudflare","label":"Cloudflare"}],"fields":[{"id":"cloudflare_api_token","section":{"id":"cloudflare"},"type":"CONCEALED","label":"CLOUDFLARE_API_TOKEN"}]}"#,
+    );
+    create.read_stdin = true;
+    let harness = Harness::new(
+        vec![step("cf-source", &[], "token-canary\n"), missing, create],
+        &["cf-source", "op"],
+    );
+
+    let output = harness.output(&[
+        "cloudflare-credential",
+        "--vault",
+        "Private",
+        "--preset",
+        "api-token",
+        "--mode",
+        "create",
+        "--item",
+        "cloudflare-prod",
+        "--",
+        "cf-source",
+    ]);
+    assert_success(&output);
+
+    let invocation = harness.invocation(2);
+    assert!(!invocation
+        .args
+        .iter()
+        .any(|arg| arg.contains("token-canary")));
+    let template: serde_json::Value = serde_json::from_str(&invocation.stdin).unwrap();
+    assert_eq!(template["fields"][0]["value"], "token-canary");
+    assert_eq!(template["fields"][0]["type"], "CONCEALED");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stdout.contains("token-canary"));
+    assert!(!stderr.contains("token-canary"));
+    assert!(stdout.contains("op://vault-id/item-id/cloudflare/cloudflare_api_token"));
+}
+
+#[test]
+fn cloudflare_api_response_update_redacts_file_before_op_item_edit() {
+    let item = r#"{"id":"item-id","title":"cloudflare-api","vault":{"id":"vault-id","name":"Private"},"sections":[{"id":"api_responses","label":"API Responses"}],"fields":[{"id":"response","section":{"id":"api_responses"},"type":"CONCEALED","label":"response","value":"old"}]}"#;
+    let mut edit = step(
+        "op",
+        &[
+            "item",
+            "edit",
+            "item-id",
+            "--format=json",
+            "--vault",
+            "Private",
+        ],
+        item,
+    );
+    edit.read_stdin = true;
+    let harness = Harness::new(
+        vec![
+            step(
+                "op",
+                &[
+                    "item",
+                    "get",
+                    "cloudflare-api",
+                    "--format",
+                    "json",
+                    "--vault",
+                    "Private",
+                ],
+                item,
+            ),
+            step(
+                "op",
+                &[
+                    "item", "get", "item-id", "--format", "json", "--vault", "Private",
+                ],
+                item,
+            ),
+            edit,
+        ],
+        &["op"],
+    );
+    let response_path = harness.root.join("response.json");
+    fs::write(
+        &response_path,
+        r#"{"result":{"id":"zone-id","Authorization":"Bearer auth-canary","access_token":"token-canary","nested":{"apiKey":"key-canary","name":"safe"}}}"#,
+    )
+    .unwrap();
+
+    let output = harness.output(&[
+        "cloudflare-credential",
+        "--vault",
+        "Private",
+        "--preset",
+        "api-response",
+        "--mode",
+        "update",
+        "--item",
+        "cloudflare-api",
+        "--file",
+        response_path.to_str().unwrap(),
+    ]);
+    assert_success(&output);
+
+    let invocation = harness.invocation(2);
+    assert!(!invocation.args.iter().any(|arg| arg.contains("canary")));
+    assert!(!invocation.stdin.contains("auth-canary"));
+    assert!(!invocation.stdin.contains("token-canary"));
+    assert!(!invocation.stdin.contains("key-canary"));
+    assert!(invocation.stdin.contains("[REDACTED]"));
+    assert!(invocation.stdin.contains("zone-id"));
+    assert!(invocation.stdin.contains("safe"));
+}
+
+#[test]
+fn cloudflare_worker_secret_dry_run_reads_stdin_without_writing_item() {
+    let mut missing = step(
+        "op",
+        &["item", "get", "worker-prod", "--format", "json"],
+        "",
+    );
+    missing.exit_code = 1;
+    missing.stderr = "not found".to_string();
+    let harness = Harness::new(vec![missing], &["op"]);
+
+    let output = harness.output_with_stdin(
+        &[
+            "cloudflare-credential",
+            "--preset",
+            "worker-secret",
+            "--item",
+            "worker-prod",
+            "--stdin",
+            "--dry-run",
+        ],
+        r#"{"DB_PASSWORD":"db-canary","API_KEY":"key-canary"}"#,
+    );
+    assert_success(&output);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("db-canary"));
+    assert!(!stdout.contains("key-canary"));
+    assert!(stdout.contains("2 concealed field(s)"));
+    assert_eq!(fs::read_dir(&harness.logs).unwrap().count(), 2);
 }

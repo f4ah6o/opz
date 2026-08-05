@@ -21,6 +21,7 @@
 * Migrate scripts from explicit items or `.env` files to repository metadata.
 * Save private config files as Secure Notes.
 * Store valid item fields as GitHub repository secrets, guarded by item repository metadata when present.
+* Import Cloudflare API tokens, Worker secrets, and redacted API responses into 1Password.
 * Store valid item fields as Cloudflare Worker secrets through Wrangler.
 * Print the bundled `opz` Agent Skill.
 * Cache item lists and repository metadata for fuzzy lookup and legacy migration paths.
@@ -350,6 +351,42 @@ opz github-secret --repo owner/repo my-service shared-secrets
 `github-secret` uses the same valid field labels as `gen` and `run`. Duplicate names across multiple items use the later item. Secret values are resolved in memory and passed to `gh secret set` through stdin; values are not printed or passed as command arguments. Names starting with `GITHUB_` are rejected because GitHub reserves that prefix.
 
 If a selected 1Password item has a `github_repositories` field, the target repository must match one of its `owner/repo` entries before `opz` resolves or writes secret values. Multiple repositories are allowed by separating entries with newlines or commas. Items without this metadata are still allowed, but `opz` prints a warning because the repository guard cannot be applied.
+
+### Import Cloudflare Credentials and API Responses
+
+Import Cloudflare data into an exact-title 1Password item without putting secret values in argv, config files, or logs:
+
+```bash
+opz cloudflare-credential --preset <PRESET> --item <ITEM> [OPTIONS] --stdin
+opz cloudflare-credential --preset <PRESET> --item <ITEM> [OPTIONS] --file <JSON>
+opz cloudflare-credential --preset <PRESET> --item <ITEM> [OPTIONS] -- <COMMAND>...
+```
+
+Presets:
+* `api-token` - Store one concealed API token. Defaults to section `Cloudflare` and field `CLOUDFLARE_API_TOKEN`.
+* `worker-secret` - Store one secret, or map a JSON object's top-level keys to concealed fields. Defaults to section `Worker Secrets`.
+* `api-response` - Store a JSON response as a concealed field. `Authorization`, `Cookie`, and token/secret/key-like fields are recursively replaced with `[REDACTED]` by default.
+
+Options:
+* `--mode <create|update|upsert>` - Select item creation behavior; default is `upsert`.
+* `--vault <NAME>` - Limit exact item lookup and writes to a vault.
+* `--section <SECTION>` / `--field <FIELD>` - Override preset destination labels.
+* `--raw` - Disable API-response redaction. It is rejected for other presets and should be used only when the unredacted response must be retained.
+* `--dry-run` - Parse and validate input, resolve whether the item would be created or updated, and print only destination references.
+
+Examples:
+```bash
+# API token from stdin
+printf '%s' "$CLOUDFLARE_API_TOKEN" |   opz cloudflare-credential --preset api-token --item cloudflare-prod --stdin
+
+# Multiple Worker secrets from a JSON file
+opz cloudflare-credential --preset worker-secret --item worker-prod   --section production --file worker-secrets.json
+
+# Capture and redact a Cloudflare API command response before storage
+opz cloudflare-credential --preset api-response --item cloudflare-audit   --field zones -- cloudflare-client zones list --json
+```
+
+Create and edit operations send a complete 1Password JSON item template through `op item create` or `op item edit` stdin. Stored fields use the concealed type. Successful writes print `op://<vault_id>/<item_id>/<section_id>/<field_id>` references and never echo imported values. Failed input commands suppress stderr because it may contain credentials. Input is limited to 16 MiB.
 
 ### Store Cloudflare Worker Secrets
 

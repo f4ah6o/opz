@@ -163,6 +163,49 @@ pub(crate) enum Cmd {
         items: Vec<String>,
     },
 
+    /// Import Cloudflare credentials or API responses into a 1Password item
+    CloudflareCredential {
+        /// Cloudflare storage preset controlling validation, defaults, and redaction
+        #[arg(long, value_enum)]
+        preset: CloudflareCredentialPreset,
+
+        /// Create, update, or upsert the exact item title
+        #[arg(long, value_enum, default_value = "upsert")]
+        mode: CloudflareCredentialMode,
+
+        /// Exact 1Password item title
+        #[arg(long, value_name = "ITEM")]
+        item: String,
+
+        /// Destination section label (preset-specific default when omitted)
+        #[arg(long, value_name = "SECTION")]
+        section: Option<String>,
+
+        /// Destination field label (preset-specific default when omitted)
+        #[arg(long, value_name = "FIELD")]
+        field: Option<String>,
+
+        /// Read input from stdin
+        #[arg(long)]
+        stdin: bool,
+
+        /// Read input from a JSON file
+        #[arg(long, value_name = "JSON")]
+        file: Option<PathBuf>,
+
+        /// Store an API response without redaction; only valid for api-response
+        #[arg(long)]
+        raw: bool,
+
+        /// Validate and show target secret references without writing to 1Password
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Command whose stdout is imported (after --)
+        #[arg(last = true)]
+        command: Vec<String>,
+    },
+
     /// Store valid fields from 1Password items as Cloudflare Worker secrets
     CloudflareSecret {
         /// Worker name passed to wrangler --name
@@ -383,6 +426,30 @@ pub(crate) fn run_cli(args: &[OsString]) -> Result<()> {
             print_credential_file_advice_for_secret_command("github-secret");
             set_github_secrets(&context, repo.as_deref(), *dry_run, items)
         }
+        Some(Cmd::CloudflareCredential {
+            preset,
+            mode,
+            item,
+            section,
+            field,
+            stdin,
+            file,
+            raw,
+            dry_run,
+            command,
+        }) => store_cloudflare_credential(CloudflareCredentialOptions {
+            vault: cli.vault.as_deref(),
+            item,
+            section: section.as_deref(),
+            field: field.as_deref(),
+            preset: *preset,
+            mode: *mode,
+            file: file.as_deref(),
+            stdin: *stdin,
+            raw: *raw,
+            dry_run: *dry_run,
+            command,
+        }),
         Some(Cmd::CloudflareSecret {
             name,
             env,

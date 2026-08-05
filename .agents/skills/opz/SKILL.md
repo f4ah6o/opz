@@ -1,6 +1,6 @@
 ---
 name: opz
-description: Use the opz CLI to search 1Password items, inspect valid env labels, manage 1Password Developer Environments through MCP, run integrity-pinned declarative plugins, diagnose dependencies, generate env files, migrate repository metadata, export deploy secrets, and run commands with item-backed or Environment-backed secret injection.
+description: Use the opz CLI to search 1Password items, inspect valid env labels, manage 1Password Developer Environments through MCP, import Cloudflare credentials and redacted API responses, run integrity-pinned declarative plugins, diagnose dependencies, generate env files, migrate repository metadata, export deploy secrets, and run commands with item-backed or Environment-backed secret injection.
 ---
 
 # opz
@@ -141,6 +141,19 @@ opz github-repo --repo owner/repo --repo other/service <ITEM>...
 opz github-repo --dry-run <ITEM>...
 ```
 
+### `cloudflare-credential`
+
+Import a Cloudflare API token, Worker secrets, or a JSON API response into an exact-title 1Password item. Choose exactly one source: `--stdin`, `--file <JSON>`, or a command after `--`. Values are sent to `op item create` or `op item edit` through a JSON template on stdin, and successful writes print only `op://` references.
+
+```bash
+opz cloudflare-credential --preset api-token --item cloudflare-prod --stdin
+opz cloudflare-credential --preset worker-secret --item worker-prod --file secrets.json
+opz cloudflare-credential --preset api-response --item cloudflare-audit -- cloudflare-client zones list --json
+opz cloudflare-credential --preset api-response --item cloudflare-audit --dry-run --file response.json
+```
+
+Use `--mode create`, `--mode update`, or the default `--mode upsert`. `--section` and `--field` override preset destinations. API responses recursively redact Authorization, Cookie, and token/secret/key-like fields. `--raw` is valid only for `api-response` and must be explicit.
+
 ### `cloudflare-secret`
 
 Store valid item fields as Cloudflare Worker secrets through Wrangler.
@@ -182,6 +195,8 @@ opz skills
 - `opz environment mount` creates a synced local `.env` mount through the MCP server. `opz` does not write secret values itself.
 - `github_repositories` and all `OPZ_PLUGIN*` fields are metadata, not env labels or deployable secrets.
 - Plugin runs project only `secret_env_allowlist` fields and use a private temporary workspace; revoked plugins never run.
+- `cloudflare-credential` imports at most 16 MiB, stores concealed fields, suppresses failed source-command stderr, and sends complete item templates to `op` through stdin.
+- `cloudflare-credential` redacts API responses by default; raw response storage requires explicit `--raw`.
 - `cloudflare-secret` also uses later-item-wins and passes a JSON payload to `wrangler secret bulk` through stdin.
 - `cloudflare-secret` supports `--name`, `--env`, and `--config` for Wrangler target selection.
 - `gen` stdout uses `op://<vault_id>/<item_id>/<field>` references, not resolved secret values.
@@ -204,4 +219,5 @@ opz skills
 9. Use `opz migrate --dry-run` to preview script migration, then `opz migrate`, `opz migrate --new`, or `opz migrate --restore`.
 10. Use `opz github-repo --dry-run ...` to manually add repository metadata for older items.
 11. Use `opz github-secret --dry-run ...` before writing GitHub repository secrets.
-12. Use `opz cloudflare-secret --dry-run ...` before writing Cloudflare Worker secrets.
+12. Use `opz cloudflare-credential --dry-run ...` before importing Cloudflare credentials or API responses.
+13. Use `opz cloudflare-secret --dry-run ...` before writing Cloudflare Worker secrets.
