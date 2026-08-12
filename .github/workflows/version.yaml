@@ -1,0 +1,38 @@
+name: Allocate release version
+
+on:
+  push:
+    tags:
+      - latest
+
+jobs:
+  version:
+    permissions:
+      contents: write
+      id-token: write
+    uses: f4ah6o/calver-action/.github/workflows/rust-crate.yaml@ed77f35391c8a334e420974bb7983b0a13fc5deb # 2026.8.0
+    with:
+      format: YYYY.MM.PATCH
+      timezone: Asia/Tokyo
+      tag_prefix: v
+      source_branch: main
+      registry_publish: false
+
+  dispatch-release:
+    needs: version
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Dispatch preserved release workflows
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          gh workflow run release.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref "$RELEASE_TAG"
+          gh workflow run publish.yaml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref "$RELEASE_TAG"
