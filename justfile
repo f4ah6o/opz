@@ -18,9 +18,8 @@ release-check: check security-check
     cargo publish --locked --dry-run
 
 release: release-check
-    version=$(sed -nE 's/^version = "([^"]+)"/\1/p' Cargo.toml | head -n1); \
-    git tag "v${version}"; \
-    git push origin "v${version}"
+    git tag -f latest HEAD
+    git push --force origin refs/tags/latest
 
 e2e:
     OPZ_E2E=1 cargo test --locked --test e2e_real_op -- --nocapture
