@@ -133,12 +133,13 @@ pub(crate) fn migrate_scripts(
                 println!("Would rename item {item_title} to {canonical_item_title}");
             }
         } else {
-            let (item_id, _, resolved_title, item) =
+            let (item_id, vault_id, resolved_title, item) =
                 find_item(context.vault.as_deref(), item_title)?;
             let merged_repos =
                 merge_github_repository_lists(&item_github_repositories(&item), &repositories);
-            run_op_item_edit_github_repositories(
+            run_item_edit_github_repositories(
                 context.vault.as_deref(),
+                &vault_id,
                 &item_id,
                 &merged_repos,
             )?;
@@ -149,7 +150,12 @@ pub(crate) fn migrate_scripts(
                 merged_repos.join(", ")
             );
             if rename_item {
-                run_op_item_edit_title(context.vault.as_deref(), &item_id, &canonical_item_title)?;
+                run_item_edit_title(
+                    context.vault.as_deref(),
+                    &vault_id,
+                    &item_id,
+                    &canonical_item_title,
+                )?;
                 println!("Renamed item {resolved_title} to {canonical_item_title}");
             }
         }

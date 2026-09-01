@@ -2553,6 +2553,52 @@ fn test_desktop_sdk_account_from_list_requires_exactly_one_account() {
 }
 
 #[test]
+fn test_set_sdk_item_text_field_updates_existing_without_dropping_other_data() {
+    let mut item = serde_json::json!({
+        "id": "item-1",
+        "title": "service",
+        "category": "ApiCredentials",
+        "fields": [
+            {"id": "token", "title": "TOKEN", "fieldType": "Concealed", "value": "sensitive-canary"},
+            {"id": "github_repositories", "title": "github_repositories", "fieldType": "Text", "value": "old/repo", "extra": "keep"}
+        ],
+        "extraTopLevel": {"keep": true}
+    });
+    set_sdk_item_text_field(&mut item, "github_repositories", "owner/repo\nother/repo").unwrap();
+    assert_eq!(item["fields"][0]["value"], "sensitive-canary");
+    assert_eq!(item["fields"][1]["value"], "owner/repo\nother/repo");
+    assert_eq!(item["fields"][1]["extra"], "keep");
+    assert_eq!(item["extraTopLevel"]["keep"], true);
+}
+
+#[test]
+fn test_set_sdk_item_text_field_appends_compatible_text_field() {
+    let mut item = serde_json::json!({"fields": []});
+    set_sdk_item_text_field(&mut item, "github_repositories", "owner/repo").unwrap();
+    assert_eq!(
+        item["fields"][0],
+        serde_json::json!({
+            "id": "github_repositories",
+            "title": "github_repositories",
+            "fieldType": "Text",
+            "value": "owner/repo"
+        })
+    );
+}
+
+#[test]
+fn test_sdk_item_mutators_fail_closed_without_echoing_payloads() {
+    let mut malformed = serde_json::json!({"fields": "sensitive-canary"});
+    let error = set_sdk_item_text_field(&mut malformed, "github_repositories", "new").unwrap_err();
+    assert!(!error.to_string().contains("sensitive-canary"));
+
+    let mut item = serde_json::json!({"title": "old", "opaque": "keep"});
+    set_sdk_item_title(&mut item, "new").unwrap();
+    assert_eq!(item["title"], "new");
+    assert_eq!(item["opaque"], "keep");
+}
+
+#[test]
 fn test_sdk_item_get_maps_sdk_field_titles_to_opz_labels() {
     let vault = ItemVault {
         id: "vault-1".to_string(),
