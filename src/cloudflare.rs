@@ -427,11 +427,28 @@ struct StoredCredential {
     references: Vec<String>,
 }
 
+type CloudflareSdkCreate = (String, String, serde_json::Value, String, Vec<String>);
+type CloudflareSdkUpdate = (String, serde_json::Value, String, Vec<String>);
+
 fn create_cloudflare_item(
     vault: Option<&str>,
     item_title: &str,
     prepared: &PreparedCredential,
 ) -> Result<StoredCredential> {
+    if let Some(Ok((account, vault_id, params, section_id, field_ids))) =
+        prepare_cloudflare_sdk_create(vault, item_title, prepared)
+    {
+        // Create is not safely retryable after submission: a timeout can mean
+        // the item exists but the response was lost. Do not fall back to CLI.
+        let item = sdk_bridge_call(
+            &account,
+            "items_create",
+            serde_json::json!({"params": params}),
+        )
+        .context("create Cloudflare credential through isolated 1Password Desktop SDK")?;
+        return build_sdk_stored_credential(item, &vault_id, section_id, field_ids);
+    }
+
     let (template, section_id, field_ids) = build_create_template(item_title, prepared);
     let mut args = vec!["item".to_string(), "create".to_string()];
     if let Some(vault) = vault {
@@ -450,6 +467,16 @@ fn update_cloudflare_item(
     vault_id: &str,
     prepared: &PreparedCredential,
 ) -> Result<StoredCredential> {
+    if let Some(Ok((account, item, section_id, field_ids))) =
+        prepare_cloudflare_sdk_update(item_id, vault_id, prepared)
+    {
+        // As with create, once a mutation is submitted we fail closed rather
+        // than switching transports with an uncertain write outcome.
+        let item = sdk_bridge_call(&account, "items_put", serde_json::json!({"item": item}))
+            .context("update Cloudflare credential through isolated 1Password Desktop SDK")?;
+        return build_sdk_stored_credential(item, vault_id, section_id, field_ids);
+    }
+
     let mut get_args = vec!["item", "get", item_id, "--format", "json"];
     if let Some(vault) = vault {
         get_args.push("--vault");
@@ -486,6 +513,212 @@ fn update_cloudflare_item(
             .collect();
     }
     Ok(stored)
+}
+
+fn prepare_cloudflare_sdk_create(
+    vault: Option<&str>,
+    item_title: &str,
+    prepared: &PreparedCredential,
+) -> Option<Result<CloudflareSdkCreate>> {
+    if !desktop_sdk_enabled() {
+        return None;
+    }
+    let vault_spec = vault?;
+    let account = desktop_sdk_account()?;
+    Some((|| {
+        let vaults = sdk_vaults(&account)?;
+        let selected = select_sdk_vaults(&vaults, Some(vault_spec))?;
+        let [selected] = selected.as_slice() else {
+            return Err(anyhow!(
+                "Desktop SDK Cloudflare create requires exactly one vault"
+            ));
+        };
+        let (params, section_id, field_ids) =
+            build_cloudflare_sdk_create_params(item_title, prepared, &selected.id);
+        Ok((account, selected.id.clone(), params, section_id, field_ids))
+    })())
+}
+
+fn build_cloudflare_sdk_create_params(
+    item_title: &str,
+    prepared: &PreparedCredential,
+    vault_id: &str,
+) -> (serde_json::Value, String, Vec<String>) {
+    let section_id = stable_id(&prepared.section_label, "cloudflare");
+    let field_ids = unique_field_ids(&prepared.fields);
+    let fields = prepared
+        .fields
+        .iter()
+        .zip(&field_ids)
+        .map(|(field, field_id)| {
+            serde_json::json!({
+                "id": field_id,
+                "title": field.label,
+                "sectionId": section_id,
+                "fieldType": "Concealed",
+                "value": field.value,
+            })
+        })
+        .collect::<Vec<_>>();
+    (
+        serde_json::json!({
+            "category": "ApiCredentials",
+            "vaultId": vault_id,
+            "title": item_title,
+            "sections": [{"id": section_id, "title": prepared.section_label}],
+            "fields": fields,
+        }),
+        section_id,
+        field_ids,
+    )
+}
+
+fn prepare_cloudflare_sdk_update(
+    item_id: &str,
+    vault_id: &str,
+    prepared: &PreparedCredential,
+) -> Option<Result<CloudflareSdkUpdate>> {
+    if !desktop_sdk_enabled() {
+        return None;
+    }
+    let account = desktop_sdk_account()?;
+    Some((|| {
+        let mut item = sdk_bridge_call(
+            &account,
+            "items_get",
+            serde_json::json!({"vault_id": vault_id, "item_id": item_id}),
+        )?;
+        validate_cloudflare_sdk_item_category(&item)?;
+        let (section_id, field_ids) = merge_prepared_sdk_fields(&mut item, prepared)?;
+        Ok((account, item, section_id, field_ids))
+    })())
+}
+
+fn validate_cloudflare_sdk_item_category(item: &serde_json::Value) -> Result<()> {
+    if item.get("category").and_then(serde_json::Value::as_str) != Some("ApiCredentials") {
+        return Err(anyhow!(
+            "Refusing to edit non-ApiCredentials item through the Desktop SDK"
+        ));
+    }
+    Ok(())
+}
+
+fn merge_prepared_sdk_fields(
+    item: &mut serde_json::Value,
+    prepared: &PreparedCredential,
+) -> Result<(String, Vec<String>)> {
+    let object = item
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("Desktop SDK item was not an object"))?;
+    let sections = object
+        .entry("sections")
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or_else(|| anyhow!("Desktop SDK item sections were not an array"))?;
+    let section_id = sections
+        .iter()
+        .find_map(|section| {
+            let title = section.get("title").and_then(serde_json::Value::as_str)?;
+            title
+                .eq_ignore_ascii_case(&prepared.section_label)
+                .then(|| section.get("id").and_then(serde_json::Value::as_str))
+                .flatten()
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| {
+            let base = stable_id(&prepared.section_label, "cloudflare");
+            let mut id = base.clone();
+            let mut suffix = 2usize;
+            while sections.iter().any(|section| {
+                section.get("id").and_then(serde_json::Value::as_str) == Some(id.as_str())
+            }) {
+                id = format!("{base}_{suffix}");
+                suffix += 1;
+            }
+            sections.push(serde_json::json!({"id": id, "title": prepared.section_label}));
+            id
+        });
+
+    let fields = object
+        .entry("fields")
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or_else(|| anyhow!("Desktop SDK item fields were not an array"))?;
+    let mut field_ids = Vec::with_capacity(prepared.fields.len());
+    for destination in &prepared.fields {
+        let existing_index = fields.iter().position(|field| {
+            field
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|title| title.eq_ignore_ascii_case(&destination.label))
+                && field.get("sectionId").and_then(serde_json::Value::as_str)
+                    == Some(section_id.as_str())
+        });
+        if let Some(index) = existing_index {
+            let field = fields[index]
+                .as_object_mut()
+                .ok_or_else(|| anyhow!("Desktop SDK item field was not an object"))?;
+            let field_id = field
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| stable_id(&destination.label, "field"));
+            field.insert("id".into(), serde_json::Value::String(field_id.clone()));
+            field.insert(
+                "title".into(),
+                serde_json::Value::String(destination.label.clone()),
+            );
+            field.insert(
+                "sectionId".into(),
+                serde_json::Value::String(section_id.clone()),
+            );
+            field.insert(
+                "fieldType".into(),
+                serde_json::Value::String("Concealed".into()),
+            );
+            field.insert(
+                "value".into(),
+                serde_json::Value::String(destination.value.clone()),
+            );
+            field_ids.push(field_id);
+        } else {
+            let mut field_id = stable_id(&destination.label, "field");
+            let mut suffix = 2usize;
+            while fields.iter().any(|field| {
+                field.get("id").and_then(serde_json::Value::as_str) == Some(field_id.as_str())
+            }) {
+                field_id = format!("{}_{}", stable_id(&destination.label, "field"), suffix);
+                suffix += 1;
+            }
+            fields.push(serde_json::json!({
+                "id": field_id,
+                "title": destination.label,
+                "sectionId": section_id,
+                "fieldType": "Concealed",
+                "value": destination.value,
+            }));
+            field_ids.push(field_id);
+        }
+    }
+    Ok((section_id, field_ids))
+}
+
+fn build_sdk_stored_credential(
+    item: serde_json::Value,
+    vault_id: &str,
+    section_id: String,
+    field_ids: Vec<String>,
+) -> Result<StoredCredential> {
+    let item_id = item
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow!("Desktop SDK item response did not include id"))?;
+    Ok(StoredCredential {
+        references: field_ids
+            .into_iter()
+            .map(|field_id| format!("op://{vault_id}/{item_id}/{section_id}/{field_id}"))
+            .collect(),
+    })
 }
 
 fn build_create_template(
@@ -861,5 +1094,65 @@ mod tests {
         assert_eq!(field_ids, ["api_token"]);
         assert_eq!(item["fields"][0]["value"], "new");
         assert_eq!(item["fields"][1]["value"], "keep");
+    }
+    #[test]
+    fn sdk_create_params_use_official_item_shape_and_concealed_fields() {
+        let prepared = PreparedCredential {
+            section_label: "Cloudflare".to_string(),
+            fields: vec![DestinationField {
+                label: "CLOUDFLARE_API_TOKEN".to_string(),
+                value: "canary-secret".to_string(),
+            }],
+        };
+        let (params, section_id, field_ids) =
+            build_cloudflare_sdk_create_params("worker", &prepared, "vault-1");
+        assert_eq!(params["category"], "ApiCredentials");
+        assert_eq!(params["vaultId"], "vault-1");
+        assert_eq!(params["sections"][0]["id"], section_id);
+        assert_eq!(params["sections"][0]["title"], "Cloudflare");
+        assert_eq!(params["fields"][0]["id"], field_ids[0]);
+        assert_eq!(params["fields"][0]["title"], "CLOUDFLARE_API_TOKEN");
+        assert_eq!(params["fields"][0]["sectionId"], section_id);
+        assert_eq!(params["fields"][0]["fieldType"], "Concealed");
+        assert_eq!(params["fields"][0]["value"], "canary-secret");
+    }
+
+    #[test]
+    fn sdk_update_preserves_unrelated_fields_and_replaces_matching_field() {
+        let mut item = serde_json::json!({
+            "id": "item-id",
+            "category": "ApiCredentials",
+            "vaultId": "vault-id",
+            "opaque": {"keep": true},
+            "sections": [{"id":"cloudflare","title":"Cloudflare"}],
+            "fields": [
+                {"id":"api_token","title":"CLOUDFLARE_API_TOKEN","sectionId":"cloudflare","fieldType":"Concealed","value":"old"},
+                {"id":"other","title":"other","fieldType":"Text","value":"keep","details":{"opaque":true}}
+            ]
+        });
+        let prepared = PreparedCredential {
+            section_label: "Cloudflare".to_string(),
+            fields: vec![DestinationField {
+                label: "CLOUDFLARE_API_TOKEN".to_string(),
+                value: "new".to_string(),
+            }],
+        };
+        validate_cloudflare_sdk_item_category(&item).unwrap();
+        let (_, field_ids) = merge_prepared_sdk_fields(&mut item, &prepared).unwrap();
+        assert_eq!(field_ids, ["api_token"]);
+        assert_eq!(item["fields"][0]["value"], "new");
+        assert_eq!(item["fields"][1]["value"], "keep");
+        assert_eq!(item["fields"][1]["details"]["opaque"], true);
+        assert_eq!(item["opaque"]["keep"], true);
+    }
+
+    #[test]
+    fn sdk_cloudflare_category_guard_does_not_echo_item_content() {
+        let item = serde_json::json!({
+            "category": "Login",
+            "fields": [{"value":"canary-secret"}]
+        });
+        let error = validate_cloudflare_sdk_item_category(&item).unwrap_err();
+        assert!(!error.to_string().contains("canary-secret"));
     }
 }
