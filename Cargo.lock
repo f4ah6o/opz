@@ -251,9 +251,9 @@ checksum = "42f5e15c9953c5e4ccceeb2e7382a716482c34515315f7b03532b8b4e8393d2d"
 
 [[package]]
 name = "onepassword-sdk-unofficial"
-version = "0.1.1"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c9e00091f5d8371b004a1d97db75b77619e0590345528a88e11d619d5ca59970"
+checksum = "af981486a1a988258a963a3f9f3e76fa7f822ea9e114d485c15b22f6072eeccc"
 dependencies = [
  "base64",
  "libc",

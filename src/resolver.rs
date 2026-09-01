@@ -821,10 +821,36 @@ pub(crate) fn invalidate_item_list_cache_best_effort() {
 
 pub(crate) fn item_get(item_id: &str) -> Result<ItemGet> {
     instrumentation::with_span_result("load_inputs.item_get", vec![], || {
+        if let Some(Ok(item)) = try_item_get_sdk(item_id) {
+            return Ok(item);
+        }
         let v = op_json(&["item", "get", item_id, "--format", "json"])?;
         let item: ItemGet = serde_json::from_value(v)?;
         Ok(item)
     })
+}
+
+fn try_item_get_sdk(item_id: &str) -> Option<Result<ItemGet>> {
+    if !desktop_sdk_enabled() {
+        return None;
+    }
+    let account = desktop_sdk_account()?;
+    let vault_id = item_list_cached(None)
+        .ok()?
+        .into_iter()
+        .find(|entry| entry.id == item_id)?
+        .vault?
+        .id;
+    Some((|| {
+        let auth = onepassword_sdk_unofficial::DesktopAuth::new(account)?;
+        let mut client = onepassword_sdk_unofficial::Client::builder(auth)
+            .integration_name("opz")
+            .integration_version(env!("CARGO_PKG_VERSION"))
+            .build()?;
+        let value = client.items().get(&vault_id, item_id)?;
+        let item: ItemGet = serde_json::from_value(value)?;
+        Ok(item)
+    })())
 }
 
 pub(crate) fn item_get_with_vault(vault: Option<&str>, item: &str) -> Result<ItemGet> {
