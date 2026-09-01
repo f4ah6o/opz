@@ -30,6 +30,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
+name = "base64"
+version = "0.22.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+
+[[package]]
 name = "bit-set"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -244,11 +250,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "42f5e15c9953c5e4ccceeb2e7382a716482c34515315f7b03532b8b4e8393d2d"
 
 [[package]]
+name = "onepassword-sdk-unofficial"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c9e00091f5d8371b004a1d97db75b77619e0590345528a88e11d619d5ca59970"
+dependencies = [
+ "base64",
+ "libc",
+ "serde_json",
+]
+
+[[package]]
 name = "opz"
 version = "2026.8.2"
 dependencies = [
  "anyhow",
  "clap",
+ "onepassword-sdk-unofficial",
  "proptest",
  "regex",
  "serde",
