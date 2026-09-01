@@ -424,12 +424,14 @@ opz cloudflare-secret --name worker-app --env production my-service shared-secre
 3. When item titles are omitted, `opz` reads git remotes and tries exact item titles such as `owner/repo` directly. The legacy `github_repositories` scan is only used when `OPZ_AUTODETECT_LEGACY_SCAN=1`.
 4. After the item is selected, `opz` fetches it and builds `op://<vault_id>/<item_id>/<field>` references for fields with valid env labels.
 5. If `--env-file` is set, `opz` writes references to that file and preserves unrelated existing lines. The usual path is file-free `opz run`; env files are for tools that require `op://` references.
-6. Secret values are resolved with `op run --env-file <temp> -- sh -c 'env -0'`, with `op read` per reference as a fallback for non-timeout failures.
+6. Secret values are resolved in one batch through `onepassword-sdk-unofficial` and 1Password Desktop App authorization when a single account can be selected (`OP_ACCOUNT` takes precedence). If the desktop SDK is unavailable, `opz` falls back to `op run --env-file <temp> -- sh -c 'env -0'`, then to `op read` per reference for non-timeout failures. Set `OPZ_ONEPASSWORD_SDK=off` to disable the unofficial SDK path.
 7. `opz` runs the command with resolved values in its environment and passes argv unchanged. Any shell expansion happens only inside a shell the user explicitly launches as the trusted child.
 
 `gen` stops after writing references. `show` fetches items and prints valid labels without resolving secret values.
 
-Secret-resolution `op` calls time out after 30 seconds by default. Set `OPZ_OP_TIMEOUT_SECONDS=<seconds>` to allow slower 1Password CLI operations. If batch resolution times out, `opz` stops immediately instead of retrying once per secret.
+The desktop SDK batches all references from a command into a single `resolve_all` call (up to the SDK limit of 100 references). `op` fallback calls time out after 30 seconds by default. Set `OPZ_OP_TIMEOUT_SECONDS=<seconds>` to allow slower 1Password CLI operations. If CLI batch resolution times out, `opz` stops immediately instead of retrying once per secret.
+
+Item discovery and item metadata reads still use the official `op` CLI. The unofficial SDK currently replaces only the secret-value resolution stage; this keeps the migration narrow while `onepassword-sdk-unofficial` grows item/vault APIs.
 
 ## `op` Command Usage
 

@@ -167,6 +167,10 @@ pub(crate) fn resolve_env_vars(env_lines: &[String]) -> Result<HashMap<String, S
         return Ok(HashMap::new());
     }
 
+    if let Some(Ok(env_vars)) = try_resolve_env_vars_sdk(&references) {
+        return Ok(env_vars);
+    }
+
     match resolve_env_vars_batch(&references) {
         Ok(env_vars) => return Ok(env_vars),
         Err(err) if !should_fallback_to_op_read(&err) => {
@@ -187,6 +191,83 @@ pub(crate) fn resolve_env_vars(env_lines: &[String]) -> Result<HashMap<String, S
     }
 
     Ok(env_vars)
+}
+
+fn try_resolve_env_vars_sdk(
+    references: &[(String, String)],
+) -> Option<Result<HashMap<String, SecretValue>>> {
+    if !desktop_sdk_enabled() {
+        return None;
+    }
+    let account = desktop_sdk_account()?;
+    Some(instrumentation::with_span_result(
+        "load_inputs.desktop_sdk_batch_resolve",
+        vec![KeyValue::new(
+            "env.reference_count",
+            references.len() as i64,
+        )],
+        || {
+            let auth = onepassword_sdk_unofficial::DesktopAuth::new(account)
+                .context("configure 1Password desktop SDK authentication")?;
+            let mut client = onepassword_sdk_unofficial::Client::builder(auth)
+                .integration_name("opz")
+                .integration_version(env!("CARGO_PKG_VERSION"))
+                .build()
+                .context("initialize 1Password desktop SDK client")?;
+            let secret_references = references
+                .iter()
+                .map(|(_, reference)| reference.as_str())
+                .collect::<Vec<_>>();
+            let values = client
+                .secrets()
+                .resolve_all(&secret_references)
+                .context("resolve secret references with 1Password desktop SDK")?;
+            if values.len() != references.len() {
+                return Err(anyhow!(
+                    "desktop SDK resolution was incomplete ({}/{})",
+                    values.len(),
+                    references.len()
+                ));
+            }
+            Ok(references
+                .iter()
+                .zip(values)
+                .map(|((key, _), value)| (key.clone(), SecretValue::new(value)))
+                .collect())
+        },
+    ))
+}
+
+fn desktop_sdk_enabled() -> bool {
+    if env::var_os("OPZ_TEST_SCENARIO").is_some() {
+        return false;
+    }
+    !env::var("OPZ_ONEPASSWORD_SDK")
+        .map(|value| matches!(value.as_str(), "0" | "false" | "FALSE" | "off" | "OFF"))
+        .unwrap_or(false)
+}
+
+fn desktop_sdk_account() -> Option<String> {
+    if let Ok(account) = env::var("OP_ACCOUNT") {
+        let account = account.trim();
+        if !account.is_empty() {
+            return Some(account.to_string());
+        }
+    }
+    let accounts = op_json(&["account", "list", "--format", "json"]).ok()?;
+    desktop_sdk_account_from_list(&accounts)
+}
+
+pub(crate) fn desktop_sdk_account_from_list(accounts: &serde_json::Value) -> Option<String> {
+    let accounts = accounts.as_array()?;
+    let [account] = accounts.as_slice() else {
+        return None;
+    };
+    account
+        .get("account_uuid")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }
 
 pub(crate) fn resolve_env_vars_batch(

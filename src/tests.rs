@@ -2527,3 +2527,27 @@ proptest! {
         prop_assert_eq!(actual, expected);
     }
 }
+
+#[test]
+fn test_desktop_sdk_account_from_list_requires_exactly_one_account() {
+    let one = serde_json::json!([{
+        "account_uuid": "A1",
+        "user_uuid": "U1",
+        "email": "user@example.test",
+        "url": "example.1password.com"
+    }]);
+    assert_eq!(desktop_sdk_account_from_list(&one).as_deref(), Some("A1"));
+
+    assert_eq!(desktop_sdk_account_from_list(&serde_json::json!([])), None);
+    assert_eq!(
+        desktop_sdk_account_from_list(&serde_json::json!([
+            {"account_uuid": "A1"},
+            {"account_uuid": "A2"}
+        ])),
+        None
+    );
+    assert_eq!(
+        desktop_sdk_account_from_list(&serde_json::json!([{"url": "example.1password.com"}])),
+        None
+    );
+}
