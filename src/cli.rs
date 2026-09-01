@@ -38,6 +38,9 @@ impl From<&Cli> for ItemContext {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum Cmd {
+    #[command(name = "__sdk-bridge", hide = true)]
+    SdkBridge,
+
     /// Find items by keyword (title contains)
     Find { query: String },
 
@@ -340,6 +343,7 @@ pub(crate) fn run_cli(args: &[OsString]) -> Result<()> {
     }
 
     match &cli.cmd {
+        Some(Cmd::SdkBridge) => run_sdk_bridge_child(),
         Some(Cmd::Find { query }) => {
             let items = instrumentation::with_span_result("load_inputs", vec![], || {
                 item_list_cached(cli.vault.as_deref())

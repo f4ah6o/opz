@@ -1,13 +1,13 @@
 use crate::*;
 
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(Clone, Deserialize, Serialize, Debug)]
 pub(crate) struct ItemListEntry {
     pub(crate) id: String,
     pub(crate) title: String,
     #[serde(default)]
     pub(crate) vault: Option<ItemVault>,
 }
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(Clone, Deserialize, Serialize, Debug)]
 pub(crate) struct ItemVault {
     pub(crate) id: String,
     pub(crate) name: String,

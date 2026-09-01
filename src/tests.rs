@@ -2551,3 +2551,68 @@ fn test_desktop_sdk_account_from_list_requires_exactly_one_account() {
         None
     );
 }
+
+#[test]
+fn test_sdk_item_get_maps_sdk_field_titles_to_opz_labels() {
+    let vault = ItemVault {
+        id: "vault-1".to_string(),
+        name: "Personal".to_string(),
+    };
+    let value = serde_json::json!({
+        "id": "item-1",
+        "title": "service",
+        "fields": [
+            {"id": "f1", "title": "API_KEY", "fieldType": "Concealed", "value": "canary"},
+            {"id": "f2", "title": "EMPTY", "fieldType": "String", "value": ""}
+        ]
+    });
+    let item = sdk_item_get(&value, &vault).unwrap();
+    assert_eq!(item.id.as_deref(), Some("item-1"));
+    assert_eq!(item.title.as_deref(), Some("service"));
+    assert_eq!(
+        item.vault.as_ref().map(|vault| vault.id.as_str()),
+        Some("vault-1")
+    );
+    assert_eq!(item.fields.len(), 2);
+    assert_eq!(item.fields[0].label.as_deref(), Some("API_KEY"));
+    assert_eq!(
+        item.fields[0]
+            .value
+            .as_ref()
+            .and_then(serde_json::Value::as_str),
+        Some("canary")
+    );
+}
+
+#[test]
+fn test_select_sdk_vaults_accepts_id_or_name_and_rejects_ambiguity() {
+    let vaults = vec![
+        ItemVault {
+            id: "v1".into(),
+            name: "Personal".into(),
+        },
+        ItemVault {
+            id: "v2".into(),
+            name: "Work".into(),
+        },
+    ];
+    assert_eq!(select_sdk_vaults(&vaults, Some("v1")).unwrap()[0].id, "v1");
+    assert_eq!(
+        select_sdk_vaults(&vaults, Some("Work")).unwrap()[0].id,
+        "v2"
+    );
+    assert_eq!(select_sdk_vaults(&vaults, None).unwrap().len(), 2);
+    assert!(select_sdk_vaults(&vaults, Some("missing")).is_err());
+
+    let ambiguous = vec![
+        ItemVault {
+            id: "v1".into(),
+            name: "Same".into(),
+        },
+        ItemVault {
+            id: "v2".into(),
+            name: "Same".into(),
+        },
+    ];
+    assert!(select_sdk_vaults(&ambiguous, Some("Same")).is_err());
+}
