@@ -272,7 +272,7 @@ pub(crate) fn desktop_sdk_account_from_list(accounts: &serde_json::Value) -> Opt
         .map(str::to_owned)
 }
 
-fn sdk_vaults(account: &str) -> Result<Vec<ItemVault>> {
+pub(crate) fn sdk_vaults(account: &str) -> Result<Vec<ItemVault>> {
     let response = sdk_bridge_call(account, "vaults_list", serde_json::json!({}))?;
     response
         .as_array()

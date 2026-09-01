@@ -267,6 +267,13 @@ fn run_bridge_operation(
                 .ok_or_else(|| anyhow!("item was missing"))?;
             Ok(client.items().put(item)?)
         }
+        "items_create" => {
+            let params = parameters
+                .get("params")
+                .cloned()
+                .ok_or_else(|| anyhow!("item create params were missing"))?;
+            Ok(client.items().create(params)?)
+        }
         "secrets_resolve_all" => {
             let references = parameters
                 .get("references")
