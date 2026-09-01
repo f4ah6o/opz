@@ -233,7 +233,7 @@ fn try_resolve_env_vars_sdk(
     ))
 }
 
-fn desktop_sdk_enabled() -> bool {
+pub(crate) fn desktop_sdk_enabled() -> bool {
     if env::var_os("OPZ_TEST_SCENARIO").is_some() {
         return false;
     }
@@ -244,7 +244,7 @@ fn desktop_sdk_enabled() -> bool {
 
 static DESKTOP_SDK_ACCOUNT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
-fn desktop_sdk_account() -> Option<String> {
+pub(crate) fn desktop_sdk_account() -> Option<String> {
     if let Ok(account) = env::var("OP_ACCOUNT") {
         let account = account.trim();
         if !account.is_empty() {

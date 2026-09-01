@@ -260,6 +260,13 @@ fn run_bridge_operation(
                 .collect::<Result<Vec<_>>>()?;
             Ok(client.items().get_all(vault_id, &item_ids)?)
         }
+        "items_put" => {
+            let item = parameters
+                .get("item")
+                .cloned()
+                .ok_or_else(|| anyhow!("item was missing"))?;
+            Ok(client.items().put(item)?)
+        }
         "secrets_resolve_all" => {
             let references = parameters
                 .get("references")

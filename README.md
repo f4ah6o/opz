@@ -425,7 +425,8 @@ opz cloudflare-secret --name worker-app --env production my-service shared-secre
 4. SDK item fields are adapted from the SDK schema (`title`/`value`) to the CLI-compatible internal model (`label`/`value`), then `opz` builds `op://<vault_id>/<item_id>/<field>` references for valid env labels.
 5. If `--env-file` is set, `opz` writes references to that file and preserves unrelated existing lines. The usual path is file-free `opz run`; env files are for tools that require `op://` references.
 6. Secret values are resolved in one batch through `onepassword-sdk-unofficial` and 1Password Desktop App authorization when a single account can be selected (`OP_ACCOUNT` takes precedence). If the desktop SDK is unavailable, `opz` falls back to `op run --env-file <temp> -- sh -c 'env -0'`, then to `op read` per reference for non-timeout failures. Set `OPZ_ONEPASSWORD_SDK=off` to disable all unofficial SDK paths.
-7. `opz` runs the command with resolved values in its environment and passes argv unchanged. Any shell expansion happens only inside a shell the user explicitly launches as the trusted child.
+7. Existing-item metadata updates used by `github-repo` and migration rename prefer `ItemsGet` + `ItemsPut`, mutating only the target field/title in the raw SDK item; SDK failures fall back to the existing `op item edit` path.
+8. `opz` runs the command with resolved values in its environment and passes argv unchanged. Any shell expansion happens only inside a shell the user explicitly launches as the trusted child.
 
 `gen` stops after writing references. `show` fetches items and prints valid labels without resolving secret values.
 
@@ -451,10 +452,11 @@ sequenceDiagram
     Note over opz: Build op:// references
     opz->>sdk: SecretsResolveAll
     sdk-->>opz: resolved values
+    Note over opz: Metadata/title edits use ItemsGet + ItemsPut
     Note over opz,op: Any SDK stage may fall back to the existing op CLI path
 ```
 
-Security: `opz` delegates secret access and authentication to the 1Password Desktop SDK when available and otherwise to the official `op` CLI. The 60-second caches store item-list and repository metadata only, never secret values.
+Security: `opz` delegates secret access and authentication to the 1Password Desktop SDK when available and otherwise to the official `op` CLI. SDK item updates preserve the complete fetched item and change only the requested metadata field/title before `ItemsPut`; no item payloads are logged. The 60-second caches store item-list and repository metadata only, never secret values.
 
 ## Requirements
 

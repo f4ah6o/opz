@@ -191,7 +191,7 @@ pub(crate) fn update_github_repositories_metadata(
         ],
         || {
             for item_title in items {
-                let (item_id, _, resolved_title, item) =
+                let (item_id, vault_id, resolved_title, item) =
                     find_item(context.vault.as_deref(), item_title)?;
                 let merged_repos = merge_github_repository_lists(
                     &item_github_repositories(&item),
@@ -207,8 +207,9 @@ pub(crate) fn update_github_repositories_metadata(
                     continue;
                 }
 
-                run_op_item_edit_github_repositories(
+                run_item_edit_github_repositories(
                     context.vault.as_deref(),
+                    &vault_id,
                     &item_id,
                     &merged_repos,
                 )?;
@@ -280,6 +281,98 @@ pub(crate) fn build_op_item_edit_github_repositories_args(
         repositories.join("\n")
     ));
     args
+}
+
+pub(crate) fn set_sdk_item_text_field(
+    item: &mut serde_json::Value,
+    field_name: &str,
+    value: &str,
+) -> Result<()> {
+    let fields = item
+        .get_mut("fields")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or_else(|| anyhow!("desktop SDK item fields were malformed"))?;
+    if let Some(field) = fields.iter_mut().find(|field| {
+        field.get("title").and_then(serde_json::Value::as_str) == Some(field_name)
+            || field.get("id").and_then(serde_json::Value::as_str) == Some(field_name)
+    }) {
+        let object = field
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("desktop SDK item field was malformed"))?;
+        object.insert(
+            "value".to_string(),
+            serde_json::Value::String(value.to_string()),
+        );
+        return Ok(());
+    }
+    fields.push(serde_json::json!({
+        "id": field_name,
+        "title": field_name,
+        "fieldType": "Text",
+        "value": value,
+    }));
+    Ok(())
+}
+
+pub(crate) fn set_sdk_item_title(item: &mut serde_json::Value, title: &str) -> Result<()> {
+    let object = item
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("desktop SDK item was malformed"))?;
+    object.insert(
+        "title".to_string(),
+        serde_json::Value::String(title.to_string()),
+    );
+    Ok(())
+}
+
+fn try_sdk_item_edit(
+    vault_id: &str,
+    item_id: &str,
+    mutate: impl FnOnce(&mut serde_json::Value) -> Result<()>,
+) -> Option<Result<()>> {
+    if !desktop_sdk_enabled() {
+        return None;
+    }
+    let account = desktop_sdk_account()?;
+    Some((|| {
+        let mut item = sdk_bridge_call(
+            &account,
+            "items_get",
+            serde_json::json!({"vault_id": vault_id, "item_id": item_id}),
+        )?;
+        mutate(&mut item)?;
+        sdk_bridge_call(&account, "items_put", serde_json::json!({"item": item}))?;
+        Ok(())
+    })())
+}
+
+pub(crate) fn run_item_edit_github_repositories(
+    vault: Option<&str>,
+    vault_id: &str,
+    item_id: &str,
+    repositories: &[String],
+) -> Result<()> {
+    let value = repositories.join("\n");
+    if let Some(Ok(())) = try_sdk_item_edit(vault_id, item_id, |item| {
+        set_sdk_item_text_field(item, GITHUB_REPOSITORIES_LABEL, &value)
+    }) {
+        return Ok(());
+    }
+    run_op_item_edit_github_repositories(vault, item_id, repositories)
+}
+
+pub(crate) fn run_item_edit_title(
+    vault: Option<&str>,
+    vault_id: &str,
+    item_id: &str,
+    title: &str,
+) -> Result<()> {
+    if let Some(Ok(())) =
+        try_sdk_item_edit(vault_id, item_id, |item| set_sdk_item_title(item, title))
+    {
+        return Ok(());
+    }
+    run_op_item_edit_title(vault, item_id, title)
 }
 
 pub(crate) fn run_op_item_edit_github_repositories(
