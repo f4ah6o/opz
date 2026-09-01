@@ -419,9 +419,9 @@ opz cloudflare-secret --name worker-app --env production my-service shared-secre
 
 ## How It Works
 
-1. When the Desktop SDK is available, `opz` lists vaults and item metadata through `VaultsList` + `ItemsList`; exact-title matches are fetched with `ItemsGet`. The official `op` CLI remains the fallback.
-2. Item-list metadata is cached for 60 seconds and reused for title-contains fuzzy matching and item-ID-to-vault resolution.
-3. When item titles are omitted, `opz` reads git remotes and tries exact item titles such as `owner/repo`. The legacy `github_repositories` scan is only used when `OPZ_AUTODETECT_LEGACY_SCAN=1`; its Desktop SDK path batches item reads with `ItemsGetAll` in groups of up to 100 per vault.
+1. When the Desktop SDK is available, `opz` lists vaults and item metadata through `VaultsList` + `ItemsList`; one exact-title item is fetched with `ItemsGet`, while multiple exact-title items are grouped by vault and fetched with `ItemsGetAll` in batches of up to 100. The official `op` CLI remains the fallback.
+2. Item-list metadata is cached for 60 seconds and reused for exact-title lookup, title-contains fuzzy matching, and item-ID-to-vault resolution.
+3. When item titles are omitted, `opz` reads git remotes and tries exact item titles such as `owner/repo`. The legacy `github_repositories` scan is only used when `OPZ_AUTODETECT_LEGACY_SCAN=1`; it uses the same vault-batched Desktop SDK item reads.
 4. SDK item fields are adapted from the SDK schema (`title`/`value`) to the CLI-compatible internal model (`label`/`value`), then `opz` builds `op://<vault_id>/<item_id>/<field>` references for valid env labels.
 5. If `--env-file` is set, `opz` writes references to that file and preserves unrelated existing lines. The usual path is file-free `opz run`; env files are for tools that require `op://` references.
 6. Secret values are resolved in one batch through `onepassword-sdk-unofficial` and 1Password Desktop App authorization when a single account can be selected (`OP_ACCOUNT` takes precedence). If the desktop SDK is unavailable, `opz` falls back to `op run --env-file <temp> -- sh -c 'env -0'`, then to `op read` per reference for non-timeout failures. Set `OPZ_ONEPASSWORD_SDK=off` to disable all unofficial SDK paths.
@@ -431,7 +431,7 @@ opz cloudflare-secret --name worker-app --env production my-service shared-secre
 
 The desktop SDK batches all references from a command into a single `resolve_all` call (up to the SDK limit of 100 references). `op` fallback calls time out after 30 seconds by default. Set `OPZ_OP_TIMEOUT_SECONDS=<seconds>` to allow slower 1Password CLI operations. If CLI batch resolution times out, `opz` stops immediately instead of retrying once per secret.
 
-Desktop SDK calls run inside an isolated, persistent `opz` child process so a blocked Desktop SDK authorization/IPC call cannot hang the parent indefinitely. The parent kills the bridge after 10 seconds by default, disables SDK use for the rest of that invocation, and falls back to the existing `op` CLI path; set `OPZ_SDK_TIMEOUT_SECONDS=<seconds>` to tune this boundary. Authorization, platform support, ambiguous vault selection, malformed/incomplete SDK responses, and other SDK failures use the same fallback. If `OP_ACCOUNT` is unset, `opz` uses `op account list` only to select the account when exactly one account is configured.
+Desktop SDK calls run inside an isolated, persistent `opz` child process so a blocked Desktop SDK authorization/IPC call cannot hang the parent indefinitely. The parent kills the bridge after 10 seconds by default, disables SDK use for the rest of that invocation, and falls back to the existing `op` CLI path; set `OPZ_SDK_TIMEOUT_SECONDS=<seconds>` to tune this boundary. Authorization, platform support, ambiguous vault selection, malformed/incomplete SDK responses, and other SDK failures use the same fallback. If `OP_ACCOUNT` is unset, `opz` uses `op account list` only to select the account when exactly one account is configured, and caches that successful selection for the rest of the process so repeated SDK stages do not respawn the CLI.
 
 ## 1Password Read Path
 
@@ -446,7 +446,7 @@ sequenceDiagram
     Note over opz: User runs: opz example-item -- command
     opz->>sdk: VaultsList + ItemsList
     sdk-->>opz: vault/item metadata
-    opz->>sdk: ItemsGet (or ItemsGetAll for batch scans)
+    opz->>sdk: ItemsGet or vault-grouped ItemsGetAll
     sdk-->>opz: decrypted item fields
     Note over opz: Build op:// references
     opz->>sdk: SecretsResolveAll
@@ -458,7 +458,7 @@ Security: `opz` delegates secret access and authentication to the 1Password Desk
 
 ## Requirements
 
-Install and authenticate [1Password CLI](https://developer.1password.com/docs/cli/) (`op`) before using secret-backed commands.
+For the Desktop SDK fast path, sign in to the 1Password desktop app and enable SDK integration. Set `OP_ACCOUNT` to avoid CLI-based account discovery entirely. Otherwise `opz` can use `op account list` when exactly one CLI account is configured. Install and authenticate [1Password CLI](https://developer.1password.com/docs/cli/) (`op`) for fallback paths and CLI-backed write operations.
 
 `github-secret` needs GitHub CLI (`gh`). `cloudflare-secret` needs Wrangler (`wrangler`). `migrate` and `note` need Git (`git`) when they read repository remotes.
 

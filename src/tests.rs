@@ -2585,6 +2585,39 @@ fn test_sdk_item_get_maps_sdk_field_titles_to_opz_labels() {
 }
 
 #[test]
+fn test_select_exact_item_entries_preserves_order_and_requires_uniqueness() {
+    let vault = ItemVault {
+        id: "v1".into(),
+        name: "Personal".into(),
+    };
+    let entries = vec![
+        ItemListEntry {
+            id: "i1".into(),
+            title: "alpha".into(),
+            vault: Some(vault.clone()),
+        },
+        ItemListEntry {
+            id: "i2".into(),
+            title: "beta".into(),
+            vault: Some(vault.clone()),
+        },
+    ];
+    let selected =
+        select_exact_item_entries(&entries, &["beta".to_string(), "alpha".to_string()]).unwrap();
+    assert_eq!(selected[0].id, "i2");
+    assert_eq!(selected[1].id, "i1");
+    assert!(select_exact_item_entries(&entries, &["missing".to_string()]).is_err());
+
+    let mut ambiguous = entries;
+    ambiguous.push(ItemListEntry {
+        id: "i3".into(),
+        title: "alpha".into(),
+        vault: Some(vault),
+    });
+    assert!(select_exact_item_entries(&ambiguous, &["alpha".to_string()]).is_err());
+}
+
+#[test]
 fn test_select_sdk_vaults_accepts_id_or_name_and_rejects_ambiguity() {
     let vaults = vec![
         ItemVault {
