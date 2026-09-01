@@ -78,7 +78,7 @@ pub(crate) fn create_api_credential_item_from_env(
         )
     });
     instrumentation::with_span_result("write_outputs", vec![], || {
-        run_op_item_create(&args, &template)?;
+        run_item_create(context.vault.as_deref(), &args, &template)?;
         invalidate_item_list_cache_best_effort();
         Ok(())
     })
@@ -163,7 +163,7 @@ pub(crate) fn create_secure_notes_from_file(context: &ItemContext, file_path: &P
         for item_title in item_titles {
             let args = build_create_item_args(context.vault.as_deref());
             let template = build_secure_note_template(&item_title, &body);
-            run_op_item_create(&args, &template)?;
+            run_item_create(context.vault.as_deref(), &args, &template)?;
         }
         invalidate_item_list_cache_best_effort();
         Ok(())
@@ -445,6 +445,98 @@ pub(crate) fn build_secure_note_template(item_title: &str, body: &str) -> ItemCr
             value: body.to_string(),
             purpose: Some("NOTES".to_string()),
         }],
+    }
+}
+
+pub(crate) fn sdk_item_create_params(
+    template: &ItemCreateTemplate,
+    vault_id: &str,
+) -> Result<serde_json::Value> {
+    let (category, notes, fields) = match template.category.as_str() {
+        "API_CREDENTIAL" => {
+            let fields = template
+                .fields
+                .iter()
+                .map(|field| {
+                    serde_json::json!({
+                        "id": field.id,
+                        "title": field.label,
+                        "fieldType": "Text",
+                        "value": field.value,
+                    })
+                })
+                .collect::<Vec<_>>();
+            ("ApiCredentials", None, fields)
+        }
+        "SECURE_NOTE" => {
+            let notes = template
+                .fields
+                .iter()
+                .find(|field| field.purpose.as_deref() == Some("NOTES"))
+                .map(|field| field.value.clone())
+                .unwrap_or_default();
+            ("SecureNote", Some(notes), Vec::new())
+        }
+        _ => {
+            return Err(anyhow!(
+                "item category is not supported by the Desktop SDK create path"
+            ))
+        }
+    };
+
+    let mut params = serde_json::json!({
+        "category": category,
+        "vaultId": vault_id,
+        "title": template.title,
+    });
+    if !fields.is_empty() {
+        params["fields"] = serde_json::Value::Array(fields);
+    }
+    if let Some(notes) = notes {
+        params["notes"] = serde_json::Value::String(notes);
+    }
+    Ok(params)
+}
+
+fn prepare_sdk_item_create(
+    vault: Option<&str>,
+    template: &ItemCreateTemplate,
+) -> Option<Result<(String, serde_json::Value)>> {
+    if !desktop_sdk_enabled() {
+        return None;
+    }
+    let vault_spec = vault?;
+    let account = desktop_sdk_account()?;
+    Some((|| {
+        let vaults = sdk_vaults(&account)?;
+        let selected = select_sdk_vaults(&vaults, Some(vault_spec))?;
+        let [selected] = selected.as_slice() else {
+            return Err(anyhow!("Desktop SDK create requires exactly one vault"));
+        };
+        let params = sdk_item_create_params(template, &selected.id)?;
+        Ok((account, params))
+    })())
+}
+
+pub(crate) fn run_item_create(
+    vault: Option<&str>,
+    args: &[String],
+    template: &ItemCreateTemplate,
+) -> Result<()> {
+    match prepare_sdk_item_create(vault, template) {
+        Some(Ok((account, params))) => {
+            // Creating is not safely retryable: once the mutation is submitted, a
+            // timeout could mean the item was created but the response was lost.
+            // Never fall back to `op item create` after this call starts.
+            sdk_bridge_call(
+                &account,
+                "items_create",
+                serde_json::json!({"params": params}),
+            )
+            .context("create item through isolated 1Password Desktop SDK")?;
+            Ok(())
+        }
+        Some(Err(_)) | None => run_op_item_create(args, template),
     }
 }
 

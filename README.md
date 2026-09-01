@@ -426,7 +426,8 @@ opz cloudflare-secret --name worker-app --env production my-service shared-secre
 5. If `--env-file` is set, `opz` writes references to that file and preserves unrelated existing lines. The usual path is file-free `opz run`; env files are for tools that require `op://` references.
 6. Secret values are resolved in one batch through `onepassword-sdk-unofficial` and 1Password Desktop App authorization when a single account can be selected (`OP_ACCOUNT` takes precedence). If the desktop SDK is unavailable, `opz` falls back to `op run --env-file <temp> -- sh -c 'env -0'`, then to `op read` per reference for non-timeout failures. Set `OPZ_ONEPASSWORD_SDK=off` to disable all unofficial SDK paths.
 7. Existing-item metadata updates used by `github-repo` and migration rename prefer `ItemsGet` + `ItemsPut`, mutating only the target field/title in the raw SDK item; SDK failures fall back to the existing `op item edit` path.
-8. `opz` runs the command with resolved values in its environment and passes argv unchanged. Any shell expansion happens only inside a shell the user explicitly launches as the trusted child.
+8. Item creation prefers `ItemsCreate` only when `--vault` resolves to exactly one SDK vault. Preflight failures safely fall back to `op item create`; after an SDK create request is submitted, failures are fail-closed rather than retried through the CLI because the mutation may already have succeeded and retrying could create a duplicate. Vault-default creation still uses the CLI.
+9. `opz` runs the command with resolved values in its environment and passes argv unchanged. Any shell expansion happens only inside a shell the user explicitly launches as the trusted child.
 
 `gen` stops after writing references. `show` fetches items and prints valid labels without resolving secret values.
 

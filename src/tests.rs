@@ -2695,3 +2695,45 @@ fn test_select_sdk_vaults_accepts_id_or_name_and_rejects_ambiguity() {
     ];
     assert!(select_sdk_vaults(&ambiguous, Some("Same")).is_err());
 }
+
+#[test]
+fn test_sdk_item_create_params_maps_api_credentials_without_echoing_shape_errors() {
+    let template = ItemCreateTemplate {
+        title: "service".into(),
+        category: "API_CREDENTIAL".into(),
+        fields: vec![ItemCreateField {
+            id: "API_KEY".into(),
+            field_type: "STRING".into(),
+            label: "API_KEY".into(),
+            value: "canary-secret".into(),
+            purpose: None,
+        }],
+    };
+    let params = sdk_item_create_params(&template, "vault-1").unwrap();
+    assert_eq!(params["category"], "ApiCredentials");
+    assert_eq!(params["vaultId"], "vault-1");
+    assert_eq!(params["title"], "service");
+    assert_eq!(params["fields"][0]["id"], "API_KEY");
+    assert_eq!(params["fields"][0]["title"], "API_KEY");
+    assert_eq!(params["fields"][0]["fieldType"], "Text");
+    assert_eq!(params["fields"][0]["value"], "canary-secret");
+
+    let unsupported = ItemCreateTemplate {
+        title: "secret-title".into(),
+        category: "UNKNOWN".into(),
+        fields: vec![],
+    };
+    let error = sdk_item_create_params(&unsupported, "vault-1").unwrap_err();
+    assert!(!error.to_string().contains("secret-title"));
+}
+
+#[test]
+fn test_sdk_item_create_params_maps_secure_note_to_notes() {
+    let template = build_secure_note_template("repo", "```env\nTOKEN=canary\n```");
+    let params = sdk_item_create_params(&template, "vault-2").unwrap();
+    assert_eq!(params["category"], "SecureNote");
+    assert_eq!(params["vaultId"], "vault-2");
+    assert_eq!(params["title"], "repo");
+    assert_eq!(params["notes"], "```env\nTOKEN=canary\n```");
+    assert!(params.get("fields").is_none());
+}
