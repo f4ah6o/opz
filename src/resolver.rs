@@ -2,6 +2,7 @@ use crate::*;
 
 /// Sections of `(item title, env lines)` collected per requested item.
 pub(crate) type ItemSections = Vec<(String, Vec<String>)>;
+type ResolvedItem = (String, String, String, ItemGet);
 
 pub(crate) fn collect_item_env_sections(
     context: &ItemContext,
@@ -207,21 +208,17 @@ fn try_resolve_env_vars_sdk(
             references.len() as i64,
         )],
         || {
-            let auth = onepassword_sdk_unofficial::DesktopAuth::new(account)
-                .context("configure 1Password desktop SDK authentication")?;
-            let mut client = onepassword_sdk_unofficial::Client::builder(auth)
-                .integration_name("opz")
-                .integration_version(env!("CARGO_PKG_VERSION"))
-                .build()
-                .context("initialize 1Password desktop SDK client")?;
             let secret_references = references
                 .iter()
                 .map(|(_, reference)| reference.as_str())
                 .collect::<Vec<_>>();
-            let values = client
-                .secrets()
-                .resolve_all(&secret_references)
-                .context("resolve secret references with 1Password desktop SDK")?;
+            let response = sdk_bridge_call(
+                &account,
+                "secrets_resolve_all",
+                serde_json::json!({"references": secret_references}),
+            )?;
+            let values: Vec<String> = serde_json::from_value(response)
+                .context("parse isolated Desktop SDK secret response")?;
             if values.len() != references.len() {
                 return Err(anyhow!(
                     "desktop SDK resolution was incomplete ({}/{})",
@@ -268,6 +265,245 @@ pub(crate) fn desktop_sdk_account_from_list(accounts: &serde_json::Value) -> Opt
         .and_then(serde_json::Value::as_str)
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
+}
+
+fn sdk_vaults(account: &str) -> Result<Vec<ItemVault>> {
+    let response = sdk_bridge_call(account, "vaults_list", serde_json::json!({}))?;
+    response
+        .as_array()
+        .ok_or_else(|| anyhow!("isolated Desktop SDK vault response was not an array"))?
+        .iter()
+        .map(|vault| {
+            let id = vault
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow!("desktop SDK vault response omitted id"))?;
+            let name = vault
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow!("desktop SDK vault response omitted title"))?;
+            Ok(ItemVault {
+                id: id.to_owned(),
+                name: name.to_owned(),
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn select_sdk_vaults(
+    vaults: &[ItemVault],
+    vault: Option<&str>,
+) -> Result<Vec<ItemVault>> {
+    let Some(spec) = vault else {
+        return Ok(vaults.to_vec());
+    };
+    let matches = vaults
+        .iter()
+        .filter(|candidate| candidate.id == spec || candidate.name == spec)
+        .cloned()
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [selected] => Ok(vec![selected.clone()]),
+        [] => Err(anyhow!("desktop SDK did not find vault `{spec}`")),
+        _ => Err(anyhow!("desktop SDK vault name `{spec}` is ambiguous")),
+    }
+}
+
+fn sdk_item_list_entry(value: &serde_json::Value, vault: &ItemVault) -> Result<ItemListEntry> {
+    let id = value
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("desktop SDK item overview omitted id"))?;
+    let title = value
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow!("desktop SDK item overview omitted title"))?;
+    Ok(ItemListEntry {
+        id: id.to_owned(),
+        title: title.to_owned(),
+        vault: Some(vault.clone()),
+    })
+}
+
+pub(crate) fn sdk_item_get(value: &serde_json::Value, vault: &ItemVault) -> Result<ItemGet> {
+    let fields = value
+        .get("fields")
+        .and_then(serde_json::Value::as_array)
+        .map(|fields| {
+            fields
+                .iter()
+                .map(|field| ItemField {
+                    label: field
+                        .get("title")
+                        .or_else(|| field.get("label"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                    value: field.get("value").cloned(),
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Ok(ItemGet {
+        id: value
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        title: value
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        fields,
+        vault: Some(vault.clone()),
+    })
+}
+
+fn try_item_list_sdk(vault: Option<&str>) -> Option<Result<Vec<ItemListEntry>>> {
+    if !desktop_sdk_enabled() {
+        return None;
+    }
+    let account = desktop_sdk_account()?;
+    Some((|| {
+        let vaults = sdk_vaults(&account)?;
+        let selected = select_sdk_vaults(&vaults, vault)?;
+        let mut entries = Vec::new();
+        for selected_vault in selected {
+            let items = sdk_bridge_call(
+                &account,
+                "items_list",
+                serde_json::json!({"vault_id": selected_vault.id}),
+            )?;
+            let items = items
+                .as_array()
+                .ok_or_else(|| anyhow!("isolated Desktop SDK item list was not an array"))?;
+            entries.extend(
+                items
+                    .iter()
+                    .map(|item| sdk_item_list_entry(item, &selected_vault))
+                    .collect::<Result<Vec<_>>>()?,
+            );
+        }
+        Ok(entries)
+    })())
+}
+
+fn try_find_item_exact_sdk(
+    vault: Option<&str>,
+    item_title: &str,
+) -> Option<Result<Option<ResolvedItem>>> {
+    if !desktop_sdk_enabled() {
+        return None;
+    }
+    let account = desktop_sdk_account()?;
+    Some((|| {
+        let vaults = sdk_vaults(&account)?;
+        let selected = select_sdk_vaults(&vaults, vault)?;
+        let mut matches = Vec::new();
+        for selected_vault in selected {
+            let items = sdk_bridge_call(
+                &account,
+                "items_list",
+                serde_json::json!({"vault_id": selected_vault.id}),
+            )?;
+            let items = items
+                .as_array()
+                .ok_or_else(|| anyhow!("isolated Desktop SDK item list was not an array"))?;
+            for overview in items.iter().filter(|overview| {
+                overview.get("title").and_then(serde_json::Value::as_str) == Some(item_title)
+            }) {
+                matches.push((
+                    selected_vault.clone(),
+                    sdk_item_list_entry(overview, &selected_vault)?,
+                ));
+            }
+        }
+        let [(selected_vault, entry)] = matches.as_slice() else {
+            return if matches.is_empty() {
+                Ok(None)
+            } else {
+                Err(anyhow!(
+                    "desktop SDK found multiple exact items titled `{item_title}`"
+                ))
+            };
+        };
+        let value = sdk_bridge_call(
+            &account,
+            "items_get",
+            serde_json::json!({"vault_id": selected_vault.id, "item_id": entry.id}),
+        )?;
+        let item = sdk_item_get(&value, selected_vault)?;
+        Ok(Some((
+            entry.id.clone(),
+            selected_vault.id.clone(),
+            entry.title.clone(),
+            item,
+        )))
+    })())
+}
+
+fn try_github_repository_index_sdk(
+    vault: Option<&str>,
+) -> Option<Result<Vec<ItemGithubRepositories>>> {
+    if !desktop_sdk_enabled() {
+        return None;
+    }
+    let account = desktop_sdk_account()?;
+    Some((|| {
+        let vaults = sdk_vaults(&account)?;
+        let selected = select_sdk_vaults(&vaults, vault)?;
+        let mut index = Vec::new();
+        for selected_vault in selected {
+            let overviews = sdk_bridge_call(
+                &account,
+                "items_list",
+                serde_json::json!({"vault_id": selected_vault.id}),
+            )?;
+            let overviews = overviews
+                .as_array()
+                .ok_or_else(|| anyhow!("isolated Desktop SDK item list was not an array"))?;
+            for chunk in overviews.chunks(100) {
+                let ids = chunk
+                    .iter()
+                    .map(|item| {
+                        item.get("id")
+                            .and_then(serde_json::Value::as_str)
+                            .ok_or_else(|| anyhow!("desktop SDK item overview omitted id"))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                if ids.is_empty() {
+                    continue;
+                }
+                let response = sdk_bridge_call(
+                    &account,
+                    "items_get_all",
+                    serde_json::json!({"vault_id": selected_vault.id, "item_ids": ids}),
+                )?;
+                let responses = response
+                    .get("individualResponses")
+                    .and_then(serde_json::Value::as_array)
+                    .ok_or_else(|| anyhow!("desktop SDK item batch response was malformed"))?;
+                if responses.len() != ids.len() {
+                    return Err(anyhow!("desktop SDK item batch response was incomplete"));
+                }
+                for response in responses {
+                    let content = response
+                        .get("content")
+                        .ok_or_else(|| anyhow!("desktop SDK item batch contained an error"))?;
+                    let item = sdk_item_get(content, &selected_vault)?;
+                    let repositories = item_github_repositories(&item);
+                    if !repositories.is_empty() {
+                        index.push(ItemGithubRepositories {
+                            item_title: item.title.clone().unwrap_or_default(),
+                            repositories,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(index)
+    })())
 }
 
 pub(crate) fn resolve_env_vars_batch(
@@ -473,6 +709,9 @@ pub(crate) fn find_item_exact(
     vault: Option<&str>,
     item_title: &str,
 ) -> Result<(String, String, String, ItemGet)> {
+    if let Some(Ok(Some(item))) = try_find_item_exact_sdk(vault, item_title) {
+        return Ok(item);
+    }
     let item = item_get_with_vault(vault, item_title)?;
     let item_id = item
         .id
@@ -569,19 +808,20 @@ pub(crate) fn item_list_cached(vault: Option<&str>) -> Result<Vec<ItemListEntry>
                 }
             }
 
-            let mut args = vec!["item", "list", "--format", "json"];
-            if let Some(v) = vault {
-                // `op item list --vault <name>` が使える環境想定（未対応なら削る）
-                args.push("--vault");
-                args.push(v);
-            }
-
-            let items =
+            let items = if let Some(Ok(items)) = try_item_list_sdk(vault) {
+                items
+            } else {
+                let mut args = vec!["item", "list", "--format", "json"];
+                if let Some(v) = vault {
+                    args.push("--vault");
+                    args.push(v);
+                }
                 instrumentation::with_span_result("load_inputs.item_list_fetch", vec![], || {
                     let v = op_json(&args)?;
                     let items: Vec<ItemListEntry> = serde_json::from_value(v)?;
                     Ok(items)
-                })?;
+                })?
+            };
             instrumentation::with_span_result(
                 "load_inputs.item_list_cache_write",
                 vec![KeyValue::new(
@@ -628,20 +868,25 @@ pub(crate) fn item_github_repository_index_cached(
                 }
             }
 
-            let item_entries = item_list_cached(vault)?;
-            let mut index = Vec::new();
-            for entry in item_entries {
-                let item = item_get(&entry.id).with_context(|| {
-                    format!("failed to inspect item `{}` for auto-detect", entry.title)
-                })?;
-                let repositories = item_github_repositories(&item);
-                if !repositories.is_empty() {
-                    index.push(ItemGithubRepositories {
-                        item_title: entry.title,
-                        repositories,
-                    });
+            let index = if let Some(Ok(index)) = try_github_repository_index_sdk(vault) {
+                index
+            } else {
+                let item_entries = item_list_cached(vault)?;
+                let mut index = Vec::new();
+                for entry in item_entries {
+                    let item = item_get(&entry.id).with_context(|| {
+                        format!("failed to inspect item `{}` for auto-detect", entry.title)
+                    })?;
+                    let repositories = item_github_repositories(&item);
+                    if !repositories.is_empty() {
+                        index.push(ItemGithubRepositories {
+                            item_title: entry.title,
+                            repositories,
+                        });
+                    }
                 }
-            }
+                index
+            };
 
             let cache_parent = cache_path.parent().ok_or_else(|| {
                 anyhow!(
@@ -835,21 +1080,18 @@ fn try_item_get_sdk(item_id: &str) -> Option<Result<ItemGet>> {
         return None;
     }
     let account = desktop_sdk_account()?;
-    let vault_id = item_list_cached(None)
+    let vault = item_list_cached(None)
         .ok()?
         .into_iter()
         .find(|entry| entry.id == item_id)?
-        .vault?
-        .id;
+        .vault?;
     Some((|| {
-        let auth = onepassword_sdk_unofficial::DesktopAuth::new(account)?;
-        let mut client = onepassword_sdk_unofficial::Client::builder(auth)
-            .integration_name("opz")
-            .integration_version(env!("CARGO_PKG_VERSION"))
-            .build()?;
-        let value = client.items().get(&vault_id, item_id)?;
-        let item: ItemGet = serde_json::from_value(value)?;
-        Ok(item)
+        let value = sdk_bridge_call(
+            &account,
+            "items_get",
+            serde_json::json!({"vault_id": vault.id, "item_id": item_id}),
+        )?;
+        sdk_item_get(&value, &vault)
     })())
 }
 

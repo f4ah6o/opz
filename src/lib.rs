@@ -7,6 +7,8 @@ mod doctor;
 pub(crate) use doctor::*;
 mod cloudflare;
 pub(crate) use cloudflare::*;
+mod sdk_bridge;
+pub(crate) use sdk_bridge::*;
 mod resolver;
 pub(crate) use resolver::*;
 mod migration;
