@@ -8,11 +8,10 @@ pub(crate) fn collect_item_env_sections(
     context: &ItemContext,
     items: &[String],
 ) -> Result<ItemSections> {
-    let mut sections = Vec::with_capacity(items.len());
+    let resolved = find_items(context.vault.as_deref(), items)?;
+    let mut sections = Vec::with_capacity(resolved.len());
 
-    for item_title in items {
-        let (item_id, vault_id, resolved_title, item) =
-            find_item(context.vault.as_deref(), item_title)?;
+    for (item_id, vault_id, resolved_title, item) in resolved {
         let env_lines = item_to_env_lines(&item, &vault_id, &item_id)?;
         sections.push((resolved_title, env_lines));
     }
@@ -24,12 +23,11 @@ pub(crate) fn collect_item_env_sections_with_github_repos(
     context: &ItemContext,
     items: &[String],
 ) -> Result<(ItemSections, Vec<ItemGithubRepositories>)> {
-    let mut sections = Vec::with_capacity(items.len());
-    let mut repositories = Vec::with_capacity(items.len());
+    let resolved = find_items(context.vault.as_deref(), items)?;
+    let mut sections = Vec::with_capacity(resolved.len());
+    let mut repositories = Vec::with_capacity(resolved.len());
 
-    for item_title in items {
-        let (item_id, vault_id, resolved_title, item) =
-            find_item(context.vault.as_deref(), item_title)?;
+    for (item_id, vault_id, resolved_title, item) in resolved {
         let env_lines = item_to_env_lines(&item, &vault_id, &item_id)?;
         let github_repositories = item_github_repositories(&item);
         sections.push((resolved_title.clone(), env_lines));
@@ -46,10 +44,10 @@ pub(crate) fn collect_item_label_sections(
     context: &ItemContext,
     items: &[String],
 ) -> Result<ItemSections> {
-    let mut sections = Vec::with_capacity(items.len());
+    let resolved = find_items(context.vault.as_deref(), items)?;
+    let mut sections = Vec::with_capacity(resolved.len());
 
-    for item_title in items {
-        let (_, _, resolved_title, item) = find_item(context.vault.as_deref(), item_title)?;
+    for (_, _, resolved_title, item) in resolved {
         let labels = item_to_valid_labels(&item)?;
         sections.push((resolved_title, labels));
     }
@@ -244,6 +242,8 @@ fn desktop_sdk_enabled() -> bool {
         .unwrap_or(false)
 }
 
+static DESKTOP_SDK_ACCOUNT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 fn desktop_sdk_account() -> Option<String> {
     if let Ok(account) = env::var("OP_ACCOUNT") {
         let account = account.trim();
@@ -251,8 +251,13 @@ fn desktop_sdk_account() -> Option<String> {
             return Some(account.to_string());
         }
     }
+    if let Some(account) = DESKTOP_SDK_ACCOUNT.get() {
+        return Some(account.clone());
+    }
     let accounts = op_json(&["account", "list", "--format", "json"]).ok()?;
-    desktop_sdk_account_from_list(&accounts)
+    let account = desktop_sdk_account_from_list(&accounts)?;
+    let _ = DESKTOP_SDK_ACCOUNT.set(account.clone());
+    Some(account)
 }
 
 pub(crate) fn desktop_sdk_account_from_list(accounts: &serde_json::Value) -> Option<String> {
@@ -398,28 +403,11 @@ fn try_find_item_exact_sdk(
     }
     let account = desktop_sdk_account()?;
     Some((|| {
-        let vaults = sdk_vaults(&account)?;
-        let selected = select_sdk_vaults(&vaults, vault)?;
-        let mut matches = Vec::new();
-        for selected_vault in selected {
-            let items = sdk_bridge_call(
-                &account,
-                "items_list",
-                serde_json::json!({"vault_id": selected_vault.id}),
-            )?;
-            let items = items
-                .as_array()
-                .ok_or_else(|| anyhow!("isolated Desktop SDK item list was not an array"))?;
-            for overview in items.iter().filter(|overview| {
-                overview.get("title").and_then(serde_json::Value::as_str) == Some(item_title)
-            }) {
-                matches.push((
-                    selected_vault.clone(),
-                    sdk_item_list_entry(overview, &selected_vault)?,
-                ));
-            }
-        }
-        let [(selected_vault, entry)] = matches.as_slice() else {
+        let matches = item_list_cached(vault)?
+            .into_iter()
+            .filter(|entry| entry.title == item_title)
+            .collect::<Vec<_>>();
+        let [entry] = matches.as_slice() else {
             return if matches.is_empty() {
                 Ok(None)
             } else {
@@ -428,6 +416,10 @@ fn try_find_item_exact_sdk(
                 ))
             };
         };
+        let selected_vault = entry
+            .vault
+            .as_ref()
+            .ok_or_else(|| anyhow!("desktop SDK item overview omitted vault metadata"))?;
         let value = sdk_bridge_call(
             &account,
             "items_get",
@@ -642,6 +634,113 @@ pub(crate) fn show_output_string(sections: &[(String, Vec<String>)], with_item: 
         }
     }
     out
+}
+
+fn find_items(vault: Option<&str>, item_titles: &[String]) -> Result<Vec<ResolvedItem>> {
+    if item_titles.len() > 1 {
+        if let Some(Ok(items)) = try_find_items_exact_sdk(vault, item_titles) {
+            return Ok(items);
+        }
+    }
+    item_titles
+        .iter()
+        .map(|item_title| find_item(vault, item_title))
+        .collect()
+}
+
+fn try_find_items_exact_sdk(
+    vault: Option<&str>,
+    item_titles: &[String],
+) -> Option<Result<Vec<ResolvedItem>>> {
+    if !desktop_sdk_enabled() {
+        return None;
+    }
+    let account = desktop_sdk_account()?;
+    Some((|| {
+        let entries = item_list_cached(vault)?;
+        let selected = select_exact_item_entries(&entries, item_titles)?;
+        let mut groups: Vec<(ItemVault, Vec<usize>)> = Vec::new();
+        for (index, entry) in selected.iter().enumerate() {
+            let item_vault = entry
+                .vault
+                .clone()
+                .ok_or_else(|| anyhow!("desktop SDK item overview omitted vault metadata"))?;
+            if let Some((_, indices)) = groups
+                .iter_mut()
+                .find(|(candidate, _)| candidate.id == item_vault.id)
+            {
+                indices.push(index);
+            } else {
+                groups.push((item_vault, vec![index]));
+            }
+        }
+
+        let mut resolved: Vec<Option<ResolvedItem>> = std::iter::repeat_with(|| None)
+            .take(selected.len())
+            .collect();
+        for (item_vault, indices) in groups {
+            for chunk in indices.chunks(100) {
+                let item_ids = chunk
+                    .iter()
+                    .map(|index| selected[*index].id.as_str())
+                    .collect::<Vec<_>>();
+                let response = sdk_bridge_call(
+                    &account,
+                    "items_get_all",
+                    serde_json::json!({"vault_id": item_vault.id, "item_ids": item_ids}),
+                )?;
+                let responses = response
+                    .get("individualResponses")
+                    .and_then(serde_json::Value::as_array)
+                    .ok_or_else(|| anyhow!("desktop SDK item batch response was malformed"))?;
+                if responses.len() != chunk.len() {
+                    return Err(anyhow!("desktop SDK item batch response was incomplete"));
+                }
+                for (index, response) in chunk.iter().copied().zip(responses) {
+                    let content = response
+                        .get("content")
+                        .ok_or_else(|| anyhow!("desktop SDK item batch contained an error"))?;
+                    let entry = &selected[index];
+                    let item = sdk_item_get(content, &item_vault)?;
+                    resolved[index] = Some((
+                        entry.id.clone(),
+                        item_vault.id.clone(),
+                        entry.title.clone(),
+                        item,
+                    ));
+                }
+            }
+        }
+        resolved
+            .into_iter()
+            .map(|item| item.ok_or_else(|| anyhow!("desktop SDK item batch was incomplete")))
+            .collect()
+    })())
+}
+
+pub(crate) fn select_exact_item_entries(
+    entries: &[ItemListEntry],
+    item_titles: &[String],
+) -> Result<Vec<ItemListEntry>> {
+    item_titles
+        .iter()
+        .map(|item_title| {
+            let matches = entries
+                .iter()
+                .filter(|entry| entry.title == *item_title)
+                .cloned()
+                .collect::<Vec<_>>();
+            match matches.as_slice() {
+                [entry] => Ok(entry.clone()),
+                [] => Err(anyhow!(
+                    "desktop SDK batch lookup requires exact item title `{item_title}`"
+                )),
+                _ => Err(anyhow!(
+                    "desktop SDK found multiple exact items titled `{item_title}`"
+                )),
+            }
+        })
+        .collect()
 }
 
 /// Find and match an item by title.
