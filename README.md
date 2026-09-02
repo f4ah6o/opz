@@ -64,7 +64,7 @@ Check 1Password CLI status and external command dependencies:
 opz doctor
 ```
 
-`doctor` exits non-zero when required `op` checks fail. Missing optional tools such as the 1Password MCP server, `gh`, `wrangler`, `git`, `sh`, or `secretlint` are reported as warnings. It also checks for plaintext `.env`-style credential files and, when `secretlint` is available, runs it against those files.
+`doctor` exits non-zero when required `op` checks fail. Missing optional tools such as the 1Password MCP server, `gh`, `wrangler`, `git`, `sh`, or `secretlint` are reported as warnings. It also probes the 1Password Desktop SDK read path, checks for plaintext `.env`-style credential files, and, when `secretlint` is available, runs it against those files. If the Desktop SDK is unavailable, enable **Settings → Developer → Integrate with the 1Password SDKs → Integrate with other apps** in the 1Password desktop app.
 
 ### Show Item Labels
 
@@ -434,7 +434,7 @@ opz cloudflare-secret --name worker-app --env production my-service shared-secre
 
 The desktop SDK batches all references from a command into a single `resolve_all` call (up to the SDK limit of 100 references). `op` fallback calls time out after 30 seconds by default. Set `OPZ_OP_TIMEOUT_SECONDS=<seconds>` to allow slower 1Password CLI operations. If CLI batch resolution times out, `opz` stops immediately instead of retrying once per secret.
 
-Desktop SDK calls run inside an isolated, persistent `opz` child process so a blocked Desktop SDK authorization/IPC call cannot hang the parent indefinitely. The parent kills the bridge after 10 seconds by default, disables SDK use for the rest of that invocation, and falls back to the existing `op` CLI path; set `OPZ_SDK_TIMEOUT_SECONDS=<seconds>` to tune this boundary. Authorization, platform support, ambiguous vault selection, malformed/incomplete SDK responses, and other SDK failures use the same fallback. If `OP_ACCOUNT` is unset, `opz` uses `op account list` only to select the account when exactly one account is configured, and caches that successful selection for the rest of the process so repeated SDK stages do not respawn the CLI.
+Desktop SDK calls run inside an isolated, persistent `opz` child process so a blocked Desktop SDK authorization/IPC call cannot hang the parent indefinitely. The parent kills the bridge after 10 seconds by default, disables SDK use for the rest of that invocation, and falls back to the existing `op` CLI path; set `OPZ_SDK_TIMEOUT_SECONDS=<seconds>` to tune this boundary. Authorization, platform support, ambiguous vault selection, malformed/incomplete SDK responses, and other SDK failures use the same fallback. When an SDK attempt fails before a safe CLI fallback, `opz` writes one diagnostic hint to stderr per invocation; it never includes raw SDK failure details. If `OP_ACCOUNT` is unset, `opz` uses `op account list` only to select the account when exactly one account is configured, and caches that successful selection for the rest of the process so repeated SDK stages do not respawn the CLI.
 
 ## 1Password Read Path
 
@@ -462,7 +462,7 @@ Security: `opz` delegates secret access and authentication to the 1Password Desk
 
 ## Requirements
 
-For the Desktop SDK fast path, sign in to the 1Password desktop app and enable SDK integration. Set `OP_ACCOUNT` to avoid CLI-based account discovery entirely. Otherwise `opz` can use `op account list` when exactly one CLI account is configured. Install and authenticate [1Password CLI](https://developer.1password.com/docs/cli/) (`op`) for fallback paths and CLI-backed write operations.
+For the Desktop SDK fast path, sign in to the 1Password desktop app and enable **Settings → Developer → Integrate with the 1Password SDKs → Integrate with other apps**. Run `opz doctor` to verify the read path. Set `OP_ACCOUNT` to avoid CLI-based account discovery entirely. Otherwise `opz` can use `op account list` when exactly one CLI account is configured. Install and authenticate [1Password CLI](https://developer.1password.com/docs/cli/) (`op`) for fallback paths and CLI-backed write operations.
 
 `github-secret` needs GitHub CLI (`gh`). `cloudflare-secret` needs Wrangler (`wrangler`). `migrate` and `note` need Git (`git`) when they read repository remotes.
 

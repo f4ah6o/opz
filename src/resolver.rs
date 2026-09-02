@@ -4,6 +4,26 @@ use crate::*;
 pub(crate) type ItemSections = Vec<(String, Vec<String>)>;
 type ResolvedItem = (String, String, String, ItemGet);
 
+pub(crate) const DESKTOP_SDK_ENABLE_GUIDANCE: &str =
+    "enable: Settings → Developer → Integrate with the 1Password SDKs → Integrate with other apps";
+const DESKTOP_SDK_FALLBACK_WARNING: &str =
+    "warn: 1Password Desktop SDK unavailable; using op CLI fallback.";
+static DESKTOP_SDK_FALLBACK_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn desktop_sdk_fallback_warning_message() -> String {
+    format!("{DESKTOP_SDK_FALLBACK_WARNING} {DESKTOP_SDK_ENABLE_GUIDANCE}")
+}
+
+pub(crate) fn warn_desktop_sdk_fallback_once() {
+    if env::var_os("OPZ_TEST_SCENARIO").is_some() {
+        return;
+    }
+    if !DESKTOP_SDK_FALLBACK_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("{}", desktop_sdk_fallback_warning_message());
+    }
+}
+
 pub(crate) fn collect_item_env_sections(
     context: &ItemContext,
     items: &[String],
@@ -166,8 +186,10 @@ pub(crate) fn resolve_env_vars(env_lines: &[String]) -> Result<HashMap<String, S
         return Ok(HashMap::new());
     }
 
-    if let Some(Ok(env_vars)) = try_resolve_env_vars_sdk(&references) {
-        return Ok(env_vars);
+    match try_resolve_env_vars_sdk(&references) {
+        Some(Ok(env_vars)) => return Ok(env_vars),
+        Some(Err(_)) => warn_desktop_sdk_fallback_once(),
+        None => {}
     }
 
     match resolve_env_vars_batch(&references) {
@@ -237,7 +259,11 @@ pub(crate) fn desktop_sdk_enabled() -> bool {
     if env::var_os("OPZ_TEST_SCENARIO").is_some() {
         return false;
     }
-    !env::var("OPZ_ONEPASSWORD_SDK")
+    !desktop_sdk_explicitly_disabled()
+}
+
+pub(crate) fn desktop_sdk_explicitly_disabled() -> bool {
+    env::var("OPZ_ONEPASSWORD_SDK")
         .map(|value| matches!(value.as_str(), "0" | "false" | "FALSE" | "off" | "OFF"))
         .unwrap_or(false)
 }
@@ -638,8 +664,10 @@ pub(crate) fn show_output_string(sections: &[(String, Vec<String>)], with_item: 
 
 fn find_items(vault: Option<&str>, item_titles: &[String]) -> Result<Vec<ResolvedItem>> {
     if item_titles.len() > 1 {
-        if let Some(Ok(items)) = try_find_items_exact_sdk(vault, item_titles) {
-            return Ok(items);
+        match try_find_items_exact_sdk(vault, item_titles) {
+            Some(Ok(items)) => return Ok(items),
+            Some(Err(_)) => warn_desktop_sdk_fallback_once(),
+            None => {}
         }
     }
     item_titles
@@ -808,8 +836,10 @@ pub(crate) fn find_item_exact(
     vault: Option<&str>,
     item_title: &str,
 ) -> Result<(String, String, String, ItemGet)> {
-    if let Some(Ok(Some(item))) = try_find_item_exact_sdk(vault, item_title) {
-        return Ok(item);
+    match try_find_item_exact_sdk(vault, item_title) {
+        Some(Ok(Some(item))) => return Ok(item),
+        Some(Ok(None)) | None => {}
+        Some(Err(_)) => warn_desktop_sdk_fallback_once(),
     }
     let item = item_get_with_vault(vault, item_title)?;
     let item_id = item
@@ -907,19 +937,27 @@ pub(crate) fn item_list_cached(vault: Option<&str>) -> Result<Vec<ItemListEntry>
                 }
             }
 
-            let items = if let Some(Ok(items)) = try_item_list_sdk(vault) {
-                items
-            } else {
-                let mut args = vec!["item", "list", "--format", "json"];
-                if let Some(v) = vault {
-                    args.push("--vault");
-                    args.push(v);
+            let items = match try_item_list_sdk(vault) {
+                Some(Ok(items)) => items,
+                sdk_result => {
+                    if matches!(sdk_result, Some(Err(_))) {
+                        warn_desktop_sdk_fallback_once();
+                    }
+                    let mut args = vec!["item", "list", "--format", "json"];
+                    if let Some(v) = vault {
+                        args.push("--vault");
+                        args.push(v);
+                    }
+                    instrumentation::with_span_result(
+                        "load_inputs.item_list_fetch",
+                        vec![],
+                        || {
+                            let v = op_json(&args)?;
+                            let items: Vec<ItemListEntry> = serde_json::from_value(v)?;
+                            Ok(items)
+                        },
+                    )?
                 }
-                instrumentation::with_span_result("load_inputs.item_list_fetch", vec![], || {
-                    let v = op_json(&args)?;
-                    let items: Vec<ItemListEntry> = serde_json::from_value(v)?;
-                    Ok(items)
-                })?
             };
             instrumentation::with_span_result(
                 "load_inputs.item_list_cache_write",
@@ -967,24 +1005,28 @@ pub(crate) fn item_github_repository_index_cached(
                 }
             }
 
-            let index = if let Some(Ok(index)) = try_github_repository_index_sdk(vault) {
-                index
-            } else {
-                let item_entries = item_list_cached(vault)?;
-                let mut index = Vec::new();
-                for entry in item_entries {
-                    let item = item_get(&entry.id).with_context(|| {
-                        format!("failed to inspect item `{}` for auto-detect", entry.title)
-                    })?;
-                    let repositories = item_github_repositories(&item);
-                    if !repositories.is_empty() {
-                        index.push(ItemGithubRepositories {
-                            item_title: entry.title,
-                            repositories,
-                        });
+            let index = match try_github_repository_index_sdk(vault) {
+                Some(Ok(index)) => index,
+                sdk_result => {
+                    if matches!(sdk_result, Some(Err(_))) {
+                        warn_desktop_sdk_fallback_once();
                     }
+                    let item_entries = item_list_cached(vault)?;
+                    let mut index = Vec::new();
+                    for entry in item_entries {
+                        let item = item_get(&entry.id).with_context(|| {
+                            format!("failed to inspect item `{}` for auto-detect", entry.title)
+                        })?;
+                        let repositories = item_github_repositories(&item);
+                        if !repositories.is_empty() {
+                            index.push(ItemGithubRepositories {
+                                item_title: entry.title,
+                                repositories,
+                            });
+                        }
+                    }
+                    index
                 }
-                index
             };
 
             let cache_parent = cache_path.parent().ok_or_else(|| {
@@ -1165,8 +1207,10 @@ pub(crate) fn invalidate_item_list_cache_best_effort() {
 
 pub(crate) fn item_get(item_id: &str) -> Result<ItemGet> {
     instrumentation::with_span_result("load_inputs.item_get", vec![], || {
-        if let Some(Ok(item)) = try_item_get_sdk(item_id) {
-            return Ok(item);
+        match try_item_get_sdk(item_id) {
+            Some(Ok(item)) => return Ok(item),
+            Some(Err(_)) => warn_desktop_sdk_fallback_once(),
+            None => {}
         }
         let v = op_json(&["item", "get", item_id, "--format", "json"])?;
         let item: ItemGet = serde_json::from_value(v)?;

@@ -541,7 +541,37 @@ fn doctor_uses_fake_tools_and_keeps_stdout_stderr_separate() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("ok    op auth: user@example.test (A1)"));
     assert!(stdout.contains("warn  gh: not found in PATH"));
+    assert!(stdout.contains("warn  1Password Desktop SDK: not probed under hermetic test scenario"));
     assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn doctor_reports_explicit_desktop_sdk_disable() {
+    let harness = Harness::new(
+        vec![
+            step("op", &["--version"], "2.30.0\n"),
+            step(
+                "op",
+                &["whoami", "--format", "json"],
+                r#"{"email":"user@example.test","account_uuid":"A1"}"#,
+            ),
+            step(
+                "op",
+                &["account", "list", "--format", "json"],
+                r#"[{"url":"example.1password.com"}]"#,
+            ),
+            step("op", &["run", "--help"], "Usage: op run --environments"),
+        ],
+        &["op"],
+    );
+    let mut command = harness.command();
+    command
+        .env("PATH", &harness.bin)
+        .env("OPZ_ONEPASSWORD_SDK", "off");
+    let output = command.arg("doctor").output().unwrap();
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("warn  1Password Desktop SDK: disabled by OPZ_ONEPASSWORD_SDK=off"));
 }
 
 #[test]

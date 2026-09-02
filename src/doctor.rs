@@ -100,6 +100,7 @@ pub(crate) fn collect_doctor_checks() -> Vec<DoctorCheck> {
                 &["--version"],
                 "needed by doctor plaintext credential scan",
             ));
+            checks.push(check_desktop_sdk());
             checks.push(check_onepassword_mcp_server());
             checks.push(check_credential_files());
             return checks;
@@ -130,10 +131,45 @@ pub(crate) fn collect_doctor_checks() -> Vec<DoctorCheck> {
         &["--version"],
         "needed by doctor plaintext credential scan",
     ));
+    checks.push(check_desktop_sdk());
     checks.push(check_onepassword_mcp_server());
     checks.push(check_credential_files());
 
     checks
+}
+
+pub(crate) fn check_desktop_sdk() -> DoctorCheck {
+    if desktop_sdk_explicitly_disabled() {
+        return DoctorCheck::warn(
+            "1Password Desktop SDK",
+            "disabled by OPZ_ONEPASSWORD_SDK=off",
+        );
+    }
+    if env::var_os("OPZ_TEST_SCENARIO").is_some() {
+        return DoctorCheck::warn(
+            "1Password Desktop SDK",
+            "not probed under hermetic test scenario",
+        );
+    }
+
+    let Some(account) = desktop_sdk_account() else {
+        return DoctorCheck::warn(
+            "1Password Desktop SDK",
+            "unavailable; configure exactly one 1Password account or set OP_ACCOUNT",
+        );
+    };
+
+    match sdk_vaults(&account) {
+        Ok(_) => DoctorCheck::ok("1Password Desktop SDK", "connected", false),
+        Err(_) => desktop_sdk_unavailable_check(),
+    }
+}
+
+pub(crate) fn desktop_sdk_unavailable_check() -> DoctorCheck {
+    DoctorCheck::warn(
+        "1Password Desktop SDK",
+        format!("unavailable; {DESKTOP_SDK_ENABLE_GUIDANCE}"),
+    )
 }
 
 pub(crate) fn check_op_run_environments_support() -> DoctorCheck {

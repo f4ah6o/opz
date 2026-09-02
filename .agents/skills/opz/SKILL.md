@@ -40,7 +40,7 @@ opz show --with-item <ITEM>...
 
 ### `doctor`
 
-Check `op` authentication, the 1Password MCP server command, external command dependencies, and plaintext `.env`-style credential files. Required `op` failures exit non-zero; missing optional tools, missing MCP server, and credential-file findings are warnings.
+Check `op` authentication, the 1Password Desktop SDK read path, the 1Password MCP server command, external command dependencies, and plaintext `.env`-style credential files. Required `op` failures exit non-zero; Desktop SDK failures, missing optional tools, missing MCP server, and credential-file findings are warnings. When the Desktop SDK is unavailable, enable **Settings → Developer → Integrate with the 1Password SDKs → Integrate with other apps**.
 
 ```bash
 opz doctor
@@ -179,7 +179,7 @@ opz skills
 ## Behavior Notes
 
 - When multiple items define the same env key, later items win.
-- `doctor` checks `op` as required and reports the 1Password MCP server command, `gh`, `wrangler`, `git`, `sh`, `secretlint`, and plaintext `.env`-style files as optional warnings.
+- `doctor` checks `op` as required and probes the 1Password Desktop SDK read path. SDK failures are optional warnings with the **Settings → Developer → Integrate with the 1Password SDKs → Integrate with other apps** enable path. It also reports the 1Password MCP server command, `gh`, `wrangler`, `git`, `sh`, `secretlint`, and plaintext `.env`-style files as optional warnings.
 - `github-secret` also uses later-item-wins and passes values to `gh secret set` through stdin.
 - `github-secret` rejects names starting with `GITHUB_` and blocks writes when item `github_repositories` metadata does not include the target repo.
 - `github-repo` migrates existing items by merging repository metadata into `github_repositories`.

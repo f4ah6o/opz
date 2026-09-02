@@ -59,7 +59,7 @@ opz find github
 opz doctor
 ```
 
-`doctor` は必須の `op` チェックが失敗した場合だけ非 0 で終了します。1Password MCP server、`gh`、`wrangler`、`git`、`sh`、`secretlint` など任意ツールの欠落は警告として表示します。平文の `.env` 系 credential ファイルもチェックし、`secretlint` が使える場合はそのファイルに対して実行します。
+`doctor` は必須の `op` チェックが失敗した場合だけ非 0 で終了します。1Password MCP server、`gh`、`wrangler`、`git`、`sh`、`secretlint` など任意ツールの欠落は警告として表示します。1Password Desktop SDK の read path も probe し、利用できない場合は **Settings → Developer → Integrate with the 1Password SDKs → Integrate with other apps** を有効にするよう案内します。平文の `.env` 系 credential ファイルもチェックし、`secretlint` が使える場合はそのファイルに対して実行します。
 
 ### アイテムラベル表示
 
@@ -455,6 +455,8 @@ sequenceDiagram
 セキュリティ: `opz` は secret へのアクセスと認証を `op` CLI に任せます。60 秒キャッシュするのは item list と repository metadata だけで、secret 値は保存しません。
 
 ## 要件
+
+Desktop SDK fast path を使う場合は、1Password desktop app で **Settings → Developer → Integrate with the 1Password SDKs → Integrate with other apps** を有効にし、`opz doctor` で接続を確認します。SDK が利用できず `op` CLI へ安全に fallback する場合、`opz` は同一 invocation で一度だけ stderr に設定導線を表示し、raw SDK error は出力しません。
 
 [1Password CLI](https://developer.1password.com/docs/cli/) (`op`) をインストールし、認証してから secret-backed command を使います。
 

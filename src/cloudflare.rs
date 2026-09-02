@@ -435,18 +435,20 @@ fn create_cloudflare_item(
     item_title: &str,
     prepared: &PreparedCredential,
 ) -> Result<StoredCredential> {
-    if let Some(Ok((account, vault_id, params, section_id, field_ids))) =
-        prepare_cloudflare_sdk_create(vault, item_title, prepared)
-    {
-        // Create is not safely retryable after submission: a timeout can mean
-        // the item exists but the response was lost. Do not fall back to CLI.
-        let item = sdk_bridge_call(
-            &account,
-            "items_create",
-            serde_json::json!({"params": params}),
-        )
-        .context("create Cloudflare credential through isolated 1Password Desktop SDK")?;
-        return build_sdk_stored_credential(item, &vault_id, section_id, field_ids);
+    match prepare_cloudflare_sdk_create(vault, item_title, prepared) {
+        Some(Ok((account, vault_id, params, section_id, field_ids))) => {
+            // Create is not safely retryable after submission: a timeout can mean
+            // the item exists but the response was lost. Do not fall back to CLI.
+            let item = sdk_bridge_call(
+                &account,
+                "items_create",
+                serde_json::json!({"params": params}),
+            )
+            .context("create Cloudflare credential through isolated 1Password Desktop SDK")?;
+            return build_sdk_stored_credential(item, &vault_id, section_id, field_ids);
+        }
+        Some(Err(_)) => warn_desktop_sdk_fallback_once(),
+        None => {}
     }
 
     let (template, section_id, field_ids) = build_create_template(item_title, prepared);
@@ -467,14 +469,16 @@ fn update_cloudflare_item(
     vault_id: &str,
     prepared: &PreparedCredential,
 ) -> Result<StoredCredential> {
-    if let Some(Ok((account, item, section_id, field_ids))) =
-        prepare_cloudflare_sdk_update(item_id, vault_id, prepared)
-    {
-        // As with create, once a mutation is submitted we fail closed rather
-        // than switching transports with an uncertain write outcome.
-        let item = sdk_bridge_call(&account, "items_put", serde_json::json!({"item": item}))
-            .context("update Cloudflare credential through isolated 1Password Desktop SDK")?;
-        return build_sdk_stored_credential(item, vault_id, section_id, field_ids);
+    match prepare_cloudflare_sdk_update(item_id, vault_id, prepared) {
+        Some(Ok((account, item, section_id, field_ids))) => {
+            // As with create, once a mutation is submitted we fail closed rather
+            // than switching transports with an uncertain write outcome.
+            let item = sdk_bridge_call(&account, "items_put", serde_json::json!({"item": item}))
+                .context("update Cloudflare credential through isolated 1Password Desktop SDK")?;
+            return build_sdk_stored_credential(item, vault_id, section_id, field_ids);
+        }
+        Some(Err(_)) => warn_desktop_sdk_fallback_once(),
+        None => {}
     }
 
     let mut get_args = vec!["item", "get", item_id, "--format", "json"];

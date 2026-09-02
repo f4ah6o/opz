@@ -353,10 +353,12 @@ pub(crate) fn run_item_edit_github_repositories(
     repositories: &[String],
 ) -> Result<()> {
     let value = repositories.join("\n");
-    if let Some(Ok(())) = try_sdk_item_edit(vault_id, item_id, |item| {
+    match try_sdk_item_edit(vault_id, item_id, |item| {
         set_sdk_item_text_field(item, GITHUB_REPOSITORIES_LABEL, &value)
     }) {
-        return Ok(());
+        Some(Ok(())) => return Ok(()),
+        Some(Err(_)) => warn_desktop_sdk_fallback_once(),
+        None => {}
     }
     run_op_item_edit_github_repositories(vault, item_id, repositories)
 }
@@ -367,10 +369,10 @@ pub(crate) fn run_item_edit_title(
     item_id: &str,
     title: &str,
 ) -> Result<()> {
-    if let Some(Ok(())) =
-        try_sdk_item_edit(vault_id, item_id, |item| set_sdk_item_title(item, title))
-    {
-        return Ok(());
+    match try_sdk_item_edit(vault_id, item_id, |item| set_sdk_item_title(item, title)) {
+        Some(Ok(())) => return Ok(()),
+        Some(Err(_)) => warn_desktop_sdk_fallback_once(),
+        None => {}
     }
     run_op_item_edit_title(vault, item_id, title)
 }
@@ -536,7 +538,11 @@ pub(crate) fn run_item_create(
             .context("create item through isolated 1Password Desktop SDK")?;
             Ok(())
         }
-        Some(Err(_)) | None => run_op_item_create(args, template),
+        Some(Err(_)) => {
+            warn_desktop_sdk_fallback_once();
+            run_op_item_create(args, template)
+        }
+        None => run_op_item_create(args, template),
     }
 }
 

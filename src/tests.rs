@@ -1688,6 +1688,23 @@ fn test_render_doctor_checks() {
 }
 
 #[test]
+fn test_desktop_sdk_diagnostics_are_actionable_and_redacted() {
+    let unavailable = render_doctor_checks(&[desktop_sdk_unavailable_check()]);
+    assert_eq!(
+        unavailable,
+        "warn  1Password Desktop SDK: unavailable; enable: Settings → Developer → Integrate with the 1Password SDKs → Integrate with other apps\n"
+    );
+
+    let fallback = desktop_sdk_fallback_warning_message();
+    assert_eq!(
+        fallback,
+        "warn: 1Password Desktop SDK unavailable; using op CLI fallback. enable: Settings → Developer → Integrate with the 1Password SDKs → Integrate with other apps"
+    );
+    assert!(!fallback.contains("authorization"));
+    assert!(!fallback.contains("IPC"));
+}
+
+#[test]
 fn test_doctor_has_required_failure_only_for_required_errors() {
     let warnings_only = vec![
         DoctorCheck::ok("op", "/bin/op (2.0.0)", true),
