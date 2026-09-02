@@ -164,10 +164,14 @@ pub(crate) fn write_env_file(path: &Path, new_lines: &[String]) -> Result<()> {
                 }
             }
 
-            // Append new keys that weren't already in the file
+            // Append new keys that weren't already in the file. When the
+            // incoming batch repeats a key, only its last value is written.
             for line in new_lines {
                 if let Some(key) = parse_env_key(line) {
-                    if !written_keys.contains(key) {
+                    let is_last_value = new_keys
+                        .get(key)
+                        .is_some_and(|latest| *latest == line.as_str());
+                    if is_last_value && written_keys.insert(key.to_string()) {
                         result_lines.push(line.clone());
                     }
                 }

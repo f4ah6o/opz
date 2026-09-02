@@ -363,6 +363,27 @@ fn test_write_env_file_overwrites_duplicates() {
 }
 
 #[test]
+fn test_write_env_file_incoming_duplicate_keys_last_value_wins() {
+    let tmp_dir = TempDir::new().unwrap();
+    let file_path = tmp_dir.path().join(".env");
+    let lines = vec![
+        "API_KEY=first".to_string(),
+        "OTHER=keep".to_string(),
+        "API_KEY=last".to_string(),
+    ];
+
+    write_env_file(&file_path, &lines).unwrap();
+
+    let content = fs::read_to_string(&file_path).unwrap();
+    let api_lines = content
+        .lines()
+        .filter(|line| parse_env_key(line) == Some("API_KEY"))
+        .collect::<Vec<_>>();
+    assert_eq!(api_lines, vec!["API_KEY=last"]);
+    assert!(content.lines().any(|line| line == "OTHER=keep"));
+}
+
+#[test]
 fn test_write_env_file_preserves_comments() {
     let tmp_dir = TempDir::new().unwrap();
     let file_path = tmp_dir.path().join(".env");
@@ -409,6 +430,56 @@ fn test_write_env_file_mixed_overwrite_and_append() {
     assert!(content_lines[1].contains("KEY2=original2"));
     // KEY3 should be appended
     assert!(content_lines[2].contains(r#"KEY3="new3""#));
+}
+
+#[test]
+fn pbt_write_env_file_matches_last_write_wins_model() -> noprop::TestResult {
+    let seed = noprop::seed_from_env_or_time("OPZ_NOPROP_SEED")?;
+    let keys = ["ALPHA", "BETA", "GAMMA", "DELTA", "EPSILON"];
+    let mut runner = noprop::Runner::new(seed);
+
+    runner.run(64, |ctx| {
+        let tmp_dir = TempDir::new()?;
+        let file_path = tmp_dir.path().join(".env");
+        fs::write(&file_path, "# preserved by opz\n")?;
+        let mut model = HashMap::<String, String>::new();
+
+        for _ in 0..16 {
+            let batch_len = noprop::sample_with_boundaries(
+                ctx,
+                &[0usize, 1, 8],
+                noprop::Ratio::one_nth(2),
+                |ctx| noprop::sample_usize_in(ctx, 0..=8),
+            );
+            let mut lines = Vec::with_capacity(batch_len);
+            for _ in 0..batch_len {
+                let key = keys[noprop::sample_usize_in(ctx, 0..keys.len())];
+                let value = format!("v{}", noprop::sample_u16(ctx));
+                lines.push(format!("{key}={value}"));
+                model.insert(key.to_string(), value);
+            }
+
+            write_env_file(&file_path, &lines)?;
+            let content = fs::read_to_string(&file_path)?;
+            assert!(content.lines().any(|line| line == "# preserved by opz"));
+
+            let entries = content
+                .lines()
+                .filter_map(parse_env_line_kv)
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect::<Vec<_>>();
+            let actual = entries.iter().cloned().collect::<HashMap<_, _>>();
+            assert_eq!(
+                entries.len(),
+                actual.len(),
+                "write_env_file emitted duplicate keys: {content}"
+            );
+            assert_eq!(actual, model);
+        }
+        Ok(())
+    })?;
+
+    Ok(())
 }
 
 #[cfg(unix)]
